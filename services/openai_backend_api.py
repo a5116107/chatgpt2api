@@ -5,12 +5,13 @@ import os
 import random
 import re
 import time
+
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
@@ -18,8 +19,10 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.runtime_profile_service import runtime_profile_service
 from services.config import config
 from services.proxy_service import proxy_settings
+from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -31,6 +34,11 @@ class InvalidAccessTokenError(RuntimeError):
 
 
 class ImagePollTimeoutError(RuntimeError):
+    pass
+
+
+class ImageContentPolicyError(RuntimeError):
+    """Raised when image generation is blocked by content policy moderation."""
     pass
 
 
@@ -80,12 +88,34 @@ EDITABLE_PSD_EXPORT_FILE_RE = re.compile(r"(?:sandbox:)?(/mnt/data/[^\s\"'\)\]]+
 EDITABLE_PPT_EXPORT_FILE_RE = re.compile(r"(?:sandbox:)?(/mnt/data/[^\s\"'\)\]]+\.(?:pptx?|zip))", re.IGNORECASE)
 FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
 FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
+# 真正的图片文件 ID 格式：file_00000000 + 24位十六进制字符（共32字符）
+REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
 SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
 IMAGE_POLL_SETTLE_SECS = 2.0
 CODEX_RESPONSES_INSTRUCTIONS = (
     "Use the image_generation tool to create exactly one image for the user's request. "
     "Return the generated image result."
 )
+
+# 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
+_CONTENT_POLICY_KEYWORDS = (
+    # 明确的内容政策违规
+    "内容政策", "防护限制", "违反", "moderation", "policy", "blocked",
+    # 拒绝生成类
+    "不能生成", "无法生成", "不能帮助", "无法帮助",
+    # 敏感内容类
+    "裸体", "裸露", "色情", "性内容", "未成年",
+    # 通用拒绝
+    "抱歉，我不能",
+)
+
+
+def _is_content_policy_error(error_msg: str) -> bool:
+    """检查错误消息是否为内容政策违规。"""
+    if not error_msg:
+        return False
+    msg_lower = error_msg.lower()
+    return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
 
 
 @dataclass
@@ -131,30 +161,38 @@ class OpenAIBackendAPI:
         self.access_token = access_token
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
+        if self.account:
+            self.account, self.profile = runtime_profile_service.ensure_account_profile(self.account)
+        else:
+            self.profile = {}
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self.progress_callback: Callable[[str], None] | None = None
+        self.session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
+            upstream=True,
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
+        self.proxy_url = str(self.session_kwargs.get("proxy") or "")
+        self.session = requests.Session(**self.session_kwargs)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
             "Referer": self.base_url + "/",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+            "Accept-Language": self.fp.get("accept-language") or "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Priority": "u=1, i",
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
-            "Sec-Ch-Ua-Arch": '"x86"',
-            "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+            "Sec-Ch-Ua-Arch": self.fp.get("sec-ch-ua-arch") or '"x86"',
+            "Sec-Ch-Ua-Bitness": self.fp.get("sec-ch-ua-bitness") or '"64"',
+            "Sec-Ch-Ua-Full-Version": self.fp.get("sec-ch-ua-full-version") or '"143.0.3650.96"',
+            "Sec-Ch-Ua-Full-Version-List": self.fp.get("sec-ch-ua-full-version-list") or '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
@@ -170,6 +208,33 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def close(self) -> None:
+        """Release network resources held by the curl_cffi session.
+
+        Image generation, account checks and search create short-lived backend
+        instances.  Without an explicit close, idle sockets can accumulate until
+        the container hits its open-file limit; the next unrelated file write
+        (for example runtime_profiles.json.tmp.*) then fails with Errno 24.
+        """
+        session = getattr(self, "session", None)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            pass
+        finally:
+            self.session = None
+
+    def __enter__(self) -> "OpenAIBackendAPI":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -192,7 +257,7 @@ class OpenAIBackendAPI:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
         )
-        fp.setdefault("impersonate", "edge101")
+        fp.setdefault("impersonate", "chrome110")
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
         fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
@@ -216,14 +281,53 @@ class OpenAIBackendAPI:
                 return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None, False
         return 0, None, True
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _raise_on_error(self, response: Any, path: str) -> None:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        body = ""
+        try:
+            body = str(response.json())[:500]
+        except Exception:
+            body = str(getattr(response, "text", "") or "")[:500]
+        report_dynamic_proxy_denial(
+            self.proxy_url,
+            target="chatgpt.com:443",
+            status_code=status_code,
+            reason=f"backend_http_{status_code}",
+            detail={"path": path, "body": body},
+        )
+        if status_code == 401:
+            raise InvalidAccessTokenError(f"token invalidated ({path})")
+        raise RuntimeError(f"{path} failed: HTTP {status_code}")
+
+    def _get_me(self, *, soft_403: bool = False) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
-        if response.status_code != 200:
-            if response.status_code == 401:
-                raise InvalidAccessTokenError(f"{path} failed: HTTP {response.status_code}")
-            raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
-        return response.json()
+        # PATCH_MARKER me_403_soft_heal_r25
+        # Fresh free accounts sometimes return HTTP 403 on /backend-api/me for a few seconds
+        # after token exchange while conversation/init + accounts/check already work.
+        last_status = 0
+        last_body = ""
+        for attempt in range(1, 4):
+            response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+            last_status = int(getattr(response, "status_code", 0) or 0)
+            if last_status == 200:
+                return response.json()
+            try:
+                last_body = str(response.json())[:300]
+            except Exception:
+                last_body = str(getattr(response, "text", "") or "")[:300]
+            if soft_403 and last_status in {403, 429, 500, 502, 503, 504}:
+                import time as _time
+                _time.sleep(0.6 * attempt)
+                continue
+            self._raise_on_error(response, path)
+        if soft_403:
+            logger.debug({
+                "event": "backend_me_soft_fail",
+                "status": last_status,
+                "body": last_body,
+            })
+            return {"_soft_fail": True, "status": last_status, "body": last_body}
+        raise RuntimeError(f"{path} failed: HTTP {last_status}")
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
@@ -239,50 +343,93 @@ class OpenAIBackendAPI:
             timeout=20,
         )
         if response.status_code != 200:
-            if response.status_code == 401:
-                raise InvalidAccessTokenError(f"{path} failed: HTTP {response.status_code}")
-            raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+            self._raise_on_error(response, path)
         return response.json()
 
     def _get_default_account(self) -> Dict[str, Any]:
-        route = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + route + "?timezone_offset_min=-480", headers=self._headers(route),
+        path = "/backend-api/accounts/check/v4-2023-04-27"
+        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
                                     timeout=20)
         if response.status_code != 200:
-            if response.status_code == 401:
-                raise InvalidAccessTokenError(f"{route} failed: HTTP {response.status_code}")
-            raise RuntimeError(f"/backend-api/accounts/check failed: HTTP {response.status_code}")
+            self._raise_on_error(response, path)
         payload = response.json()
-        logger.debug({"event": "backend_user_info_account_payload", "account_payload": payload})
-        return ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
+        default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
+        logger.debug({
+            "event": "backend_user_info_account_payload",
+            "plan_type": default_account.get("plan_type"),
+            "account_user_role": default_account.get("account_user_role"),
+            "account_id": default_account.get("account_id"),
+            "is_deactivated": default_account.get("is_deactivated"),
+            "has_active_subscription": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("has_active_subscription"),
+            "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
+        })
+        return default_account
 
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        logger.debug({"event": "backend_user_info_start"})
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+        # curl_cffi Session owns a single libcurl handle and is not safe for
+        # concurrent use.  Reusing it from three worker threads can produce
+        # partial/empty response bodies that then fail JSON decoding.
+        # Prefer conversation/init + accounts/check first; /me is optional soft path.
+        # PATCH_MARKER me_403_soft_heal_r25
+        me_error = None
+        me_payload: Dict[str, Any] = {}
+        try:
+            me_payload = self._get_me(soft_403=True) or {}
+            if isinstance(me_payload, dict) and me_payload.get("_soft_fail"):
+                me_error = f"/backend-api/me soft fail status={me_payload.get('status')}"
+                me_payload = {}
+        except Exception as exc:
+            me_error = str(exc)
+            me_payload = {}
+            logger.debug({"event": "backend_me_optional_failed", "error": me_error[:200]})
+        init_payload = self._get_conversation_init()
+        default_account = self._get_default_account()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        # When /me is soft-failing right after register, do not hard-limit the account.
+        # Prefer conversation/init quota; if still unknown/zero for free, keep normal + provisional.
+        # PATCH_MARKER me_403_soft_heal_r25
+        if me_error and plan_type.lower() in {"", "free", "unknown", "null", "none"}:
+            if int(quota or 0) <= 0:
+                quota = 5
+                image_quota_unknown = False
+        status = "正常"
+        if int(quota or 0) == 0 and not image_quota_unknown:
+            status = "限流"
+        if image_quota_unknown and plan_type.lower() != "free":
+            status = "正常"
         result = {
-            "email": me_payload.get("email"),
-            "user_id": me_payload.get("id"),
             "type": plan_type,
             "quota": quota,
             "image_quota_unknown": image_quota_unknown,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常"),
+            "status": status,
         }
+        # PATCH_MARKER preserve_register_email_r26
+        # Soft /me may omit identity. Never write email/user_id=None over registration values.
+        email = me_payload.get("email") if isinstance(me_payload, dict) else None
+        user_id = me_payload.get("id") if isinstance(me_payload, dict) else None
+        if str(email or "").strip():
+            result["email"] = str(email).strip()
+        if str(user_id or "").strip():
+            result["user_id"] = str(user_id).strip()
+        # PATCH_MARKER sticky_userinfo_clear_r26
+        # Soft /me failures must not permanently sticky-penalize selection after init/accounts work.
+        # Only keep a soft note when we still have provisional/unknown free quota; otherwise clear.
+        if me_error and int(quota or 0) <= 0 and plan_type.lower() in {"", "free", "unknown", "null", "none"}:
+            result["last_refresh_error"] = str(me_error)[:200]
+        else:
+            result["last_refresh_error"] = None
+            result["last_refresh_error_at"] = None
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),
@@ -782,7 +929,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=60,
+            timeout=(10, 45),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -828,7 +975,6 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         upload_meta = response.json()
-        time.sleep(0.5)
         response = self.session.put(
             upload_meta["upload_url"],
             headers={
@@ -942,6 +1088,94 @@ class OpenAIBackendAPI:
                                     timeout=60)
         ensure_ok(response, path)
         return response.json()
+
+    def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
+        """列出最近的对话列表，按更新时间倒序。
+
+        当 SSE 流太短导致 conversation_id 丢失时，可以通过此方法
+        查找最近创建的对话来恢复 conversation_id。
+        """
+        path = f"/backend-api/conversations?offset=0&limit={limit}&order=updated&conversation_filter=all"
+        try:
+            response = self.session.get(
+                self.base_url + path,
+                headers=self._headers(path, {"Accept": "application/json"}),
+                timeout=timeout_secs,
+            )
+            ensure_ok(response, path)
+            data = response.json()
+            return data.get("items") or data.get("conversations") or []
+        except Exception as exc:
+            logger.debug({"event": "list_conversations_failed", "error": str(exc)})
+            return []
+
+    def find_conversation_by_prompt(self, prompt: str, started_at: float, timeout_secs: float = 10.0) -> str:
+        """根据 prompt 和开始时间，从最近对话列表中查找匹配的 conversation_id。
+
+        当 SSE 流太短导致 conversation_id 丢失时，使用此方法恢复。
+        通过对比 prompt 关键词和时间戳来匹配最可能的对话。
+
+        参数：
+            prompt: 用户输入的 prompt 文本
+            started_at: 请求开始的时间戳（epoch seconds）
+            timeout_secs: 请求超时秒数
+
+        返回：
+            匹配的 conversation_id，如果未找到返回空字符串
+        """
+        items = self._list_recent_conversations(limit=10, timeout_secs=timeout_secs)
+        if not items:
+            return ""
+        # 筛选在 started_at 之前或附近创建的对话（最多往前 5 分钟）
+        # ChatGPT 的 updated_at 通常晚于实际请求时间
+        prompt_lower = str(prompt or "").lower().strip()
+        best_match = ""
+        best_score = 0.0
+        for item in items:
+            # item 可能是完整的 conversation 对象或摘要
+            conv_id = str(item.get("id") or item.get("conversation_id") or "")
+            if not conv_id:
+                continue
+            # 检查时间范围：对话的 updated_at 应该在请求开始时间之后（或附近）
+            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            if updated_at and started_at and (updated_at < started_at - 30 or updated_at > started_at + 600):
+                continue
+            # 匹配 prompt 关键词
+            title = str(item.get("title") or "").lower()
+            # 计算匹配分数
+            score = 0.0
+            if prompt_lower and title:
+                # 简单的关键词匹配
+                prompt_words = set(prompt_lower.split())
+                title_words = set(title.split())
+                common = prompt_words & title_words
+                if common:
+                    score = len(common) / max(len(prompt_words), 1)
+            # 图生图通常标题为 "Image" 开头
+            if title.startswith("image"):
+                score += 0.3
+            if score > best_score:
+                best_score = score
+                best_match = conv_id
+        if best_match and best_score > 0.1:
+            logger.info({
+                "event": "conversation_prompt_match_found",
+                "conversation_id": best_match,
+                "match_score": round(best_score, 2),
+            })
+            return best_match
+        # 如果没有标题匹配，返回最新的对话（时间最近的）
+        for item in items:
+            conv_id = str(item.get("id") or item.get("conversation_id") or "")
+            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            if conv_id and updated_at and started_at and updated_at >= started_at - 30:
+                logger.info({
+                    "event": "conversation_latest_match",
+                    "conversation_id": conv_id,
+                    "updated_at": updated_at,
+                })
+                return conv_id
+        return ""
 
     @staticmethod
     def _editable_prompt(fixed_prompt: str, user_prompt_text: str) -> str:
@@ -1822,8 +2056,9 @@ class OpenAIBackendAPI:
 
         def walk(value: Any) -> None:
             if isinstance(value, str):
+                # 只提取真正的图片文件 ID（file_00000000... 格式）和 file-service:// URI
                 cls._add_unique(file_ids, FILE_SERVICE_ID_RE.findall(value))
-                cls._add_unique(file_ids, FILE_ID_RE.findall(value))
+                cls._add_unique(file_ids, REAL_IMAGE_FILE_ID_RE.findall(value))
                 cls._add_unique(sediment_ids, SEDIMENT_ID_RE.findall(value))
                 return
             if isinstance(value, dict):
@@ -1874,6 +2109,40 @@ class OpenAIBackendAPI:
                  "sediment_ids": sediment_ids})
         return sorted(records, key=lambda item: item["create_time"])
 
+    @staticmethod
+    def _find_content_policy_error_in_conversation(data: Dict[str, Any]) -> str:
+        """从对话文档中查找内容政策违规错误消息。
+
+        上游拒绝生成图片时，错误消息会出现在 assistant 消息的文本中。
+        本方法遍历所有 assistant/tool 消息，检查是否包含内容政策违规关键词，
+        如果匹配则返回该消息文本（截断至 500 字符），否则返回空字符串。
+        """
+        mapping = data.get("mapping") or {}
+        for node in mapping.values():
+            message = (node or {}).get("message") or {}
+            author = message.get("author") or {}
+            role = str(author.get("role") or "").strip().lower()
+            if role not in {"assistant", "tool"}:
+                continue
+            content = message.get("content") or {}
+            # 提取消息文本
+            text_parts: list[str] = []
+            if isinstance(content, dict):
+                msg_parts = content.get("parts") or []
+                if isinstance(msg_parts, list):
+                    for part in msg_parts:
+                        if isinstance(part, str) and part.strip():
+                            text_parts.append(part.strip())
+                text_field = str(content.get("text") or "")
+                if text_field.strip():
+                    text_parts.append(text_field.strip())
+            elif isinstance(content, str) and content.strip():
+                text_parts.append(content.strip())
+            msg_text = "\n".join(text_parts)
+            if msg_text and _is_content_policy_error(msg_text):
+                return msg_text[:500]
+        return ""
+
     def _poll_image_results(
             self,
             conversation_id: str,
@@ -1917,8 +2186,8 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             return timeout_secs - (time.time() - start)
 
-        if has_initial_ids:
-            settle_for = min(IMAGE_POLL_SETTLE_SECS, max(0.0, _remaining()))
+        if has_initial_ids and config.image_settle_enabled:
+            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
             if settle_for > 0:
                 time.sleep(settle_for)
         elif initial_wait > 0:
@@ -1950,8 +2219,35 @@ class OpenAIBackendAPI:
             time.sleep(sleep_for)
             return True
 
+        last_task_error = ""
         while _remaining() > 0:
             attempt += 1
+            self._report_progress(f"polling:{attempt}")
+            # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
+            # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
+            last_task_error = ""
+            try:
+                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=15.0)
+                for task in tasks:
+                    is_error, error_msg, metadata = self.check_task_error(task)
+                    if is_error and error_msg:
+                        last_task_error = error_msg
+                        logger.info({
+                            "event": "image_poll_task_error_not_blocking",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "error_msg": error_msg,
+                            "metadata": metadata,
+                        })
+            except Exception as exc:
+                # tasks 查询失败不影响正常轮询流程
+                logger.debug({
+                    "event": "image_poll_task_check_failed",
+                    "conversation_id": conversation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                })
+
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
@@ -1972,18 +2268,45 @@ class OpenAIBackendAPI:
                 for sediment_id in record["sediment_ids"]:
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
+
+            # 检查对话文本中是否包含内容政策违规错误
+            # 当上游拒绝生成图片时，错误消息会出现在对话文档的 assistant 消息中，
+            # 而非 /backend-api/tasks/ 的 task error 结构中。
+            # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
+            if not file_ids and not sediment_ids:
+                policy_msg = self._find_content_policy_error_in_conversation(conversation)
+                if policy_msg:
+                    logger.warning({
+                        "event": "image_poll_conversation_text_policy_violation",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error_msg": policy_msg[:200],
+                    })
+                    raise ImageContentPolicyError(policy_msg)
+
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
+                if not config.image_check_before_hit_enabled:
+                    # 先check再hit 机制关闭：直接返回首次发现的 file_ids
+                    logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
+                                 "file_ids": file_ids, "sediment_ids": sediment_ids})
+                    return file_ids, sediment_ids
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
                 if last_hit_key == hit_key:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
                 last_hit_key = hit_key
+                if not config.image_settle_enabled:
+                    # 二次确认机制关闭：直接返回首次发现的 file_ids
+                    logger.info({"event": "image_poll_hit_settle_disabled", "conversation_id": conversation_id,
+                                 "file_ids": file_ids, "sediment_ids": sediment_ids})
+                    return file_ids, sediment_ids
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
-                             "file_ids": file_ids, "sediment_ids": sediment_ids})
-                wait = min(IMAGE_POLL_SETTLE_SECS, max(0.0, _remaining()))
+                             "file_ids": file_ids, "sediment_ids": sediment_ids,
+                             "settle_secs": config.image_settle_secs})
+                wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
                     time.sleep(wait)
                     continue
@@ -2000,12 +2323,17 @@ class OpenAIBackendAPI:
             "attempts_made": attempt,
             # attempts_made == 0 means the initial_wait consumed the entire budget — no HTTP attempted.
             "initial_wait_exhausted_budget": attempt == 0,
+            "last_task_error": last_task_error if last_task_error else None,
         })
-        raise ImagePollTimeoutError(
+        exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
             f"也可能是账号被限流或生图队列拥堵导致。"
         )
+        if last_task_error:
+            setattr(exc, "task_error", last_task_error)
+        setattr(exc, "conversation_id", conversation_id or "")
+        raise exc
 
     def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
@@ -2024,6 +2352,78 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
+
+    def _query_backend_tasks(
+        self,
+        conversation_id: str = "",
+        task_id: str = "",
+        timeout_secs: float = 30.0,
+    ) -> list[Dict[str, Any]]:
+        """查询 /backend-api/tasks/ 接口获取异步任务状态和错误信息。
+
+        参数：
+        - `conversation_id`：可选。按 conversation_id 过滤任务。
+        - `task_id`：可选。按 task_id 过滤任务。
+        - `timeout_secs`：请求超时秒数。
+
+        返回：
+        - 任务列表，每个任务包含 image_gen_message 等字段。
+        """
+        path = "/backend-api/tasks"
+        response = self.session.get(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "application/json"}),
+            timeout=timeout_secs,
+        )
+        ensure_ok(response, path)
+        data = response.json()
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            return []
+
+        # 按 conversation_id 或 task_id 过滤
+        if conversation_id:
+            tasks = [
+                t for t in tasks
+                if isinstance(t, dict) and (
+                    t.get("conversation_id") == conversation_id
+                    or t.get("original_conversation_id") == conversation_id
+                )
+            ]
+        if task_id:
+            tasks = [t for t in tasks if isinstance(t, dict) and t.get("task_id") == task_id]
+        return tasks
+
+    def check_task_error(self, task: Dict[str, Any]) -> tuple[bool, str, Dict[str, Any]]:
+        """检查单个任务是否包含结构化错误。
+
+        通过以下字段判断（不依赖文本匹配）：
+        - image_gen_message.metadata.is_error == True
+        - image_gen_message.author.role == "assistant" (而非 "tool")
+        - image_gen_message.content.content_type == "text" (而非 "multimodal_text")
+
+        返回：
+        - (is_error, error_msg, metadata)
+        """
+        img_msg = task.get("image_gen_message") or {}
+        if not img_msg:
+            return False, "", {}
+
+        metadata = img_msg.get("metadata") or {}
+        content = img_msg.get("content") or {}
+        author = img_msg.get("author") or {}
+
+        is_error = metadata.get("is_error", False)
+        is_text_only = content.get("content_type") == "text"
+        is_assistant_role = author.get("role") == "assistant"
+
+        # 提取错误文本
+        error_msg = ""
+        if is_error and is_text_only:
+            parts = content.get("parts", [])
+            error_msg = "".join(p for p in parts if isinstance(p, str))
+
+        return is_error, error_msg, metadata
 
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
@@ -2105,25 +2505,44 @@ class OpenAIBackendAPI:
             file_ids: list[str],
             sediment_ids: list[str],
             poll: bool = True,
+            poll_timeout_secs: float | None = None,
     ) -> list[str]:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
+        timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
+        # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
+        if poll and conversation_id and (file_ids or sediment_ids):
+            if not config.image_check_before_hit_enabled and not config.image_settle_enabled:
+                logger.info({
+                    "event": "image_resolve_skip_poll_direct_resolve",
+                    "conversation_id": conversation_id,
+                    "file_ids": file_ids,
+                    "sediment_ids": sediment_ids,
+                })
+                return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",
                 "conversation_id": conversation_id,
                 "initial_file_ids": file_ids,
                 "initial_sediment_ids": sediment_ids,
+                "poll_timeout_secs": timeout,
             })
             try:
                 polled_file_ids, polled_sediment_ids = self._poll_image_results(
                     conversation_id,
-                    config.image_poll_timeout_secs,
+                    timeout,
                     file_ids,
                     sediment_ids,
                 )
-            except ImagePollTimeoutError:
+            except ImagePollTimeoutError as exc:
+                # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
+                # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
+                task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
+                    if task_error:
+                        raise ImageContentPolicyError(task_error) from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -2147,12 +2566,67 @@ class OpenAIBackendAPI:
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        """下载图片内容。
+
+        estuary/content 经代理时偶发长时间无响应。使用 connect/read 分拆超时，
+        并对 TLS/代理瞬时错误做有限次重试，避免客户端先超时、服务端仍占 image_inflight。
+        """
         images = []
+        max_attempts = 3
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            last_err: Exception | None = None
+            content: bytes | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    # connect 20s / read 90s：避免单次下载无限挂死
+                    response = self.session.get(url, timeout=(20, 90))
+                    ensure_ok(response, "image_download")
+                    content = response.content
+                    logger.info({
+                        "event": "image_download_ok",
+                        "attempt": attempt,
+                        "bytes": len(content or b""),
+                        "url_host": str(url).split("/")[2] if "://" in str(url) else "",
+                    })
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    err = str(exc)
+                    logger.warning({
+                        "event": "image_download_retry",
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": err[:240],
+                        "url_host": str(url).split("/")[2] if "://" in str(url) else "",
+                    })
+                    # 非网络类错误不重试
+                    low = err.lower()
+                    retryable = any(
+                        k in low
+                        for k in (
+                            "timeout",
+                            "timed out",
+                            "curl: (28)",
+                            "curl: (56)",
+                            "curl: (35)",
+                            "proxy",
+                            "connect tunnel",
+                            "connection reset",
+                            "connection closed",
+                            "temporarily",
+                            "503",
+                            "502",
+                        )
+                    )
+                    if not retryable or attempt >= max_attempts:
+                        raise
+                    time.sleep(min(1.5 * attempt, 4.0))
+            if content is None:
+                if last_err is not None:
+                    raise last_err
+                raise RuntimeError("image_download failed without content")
+            if content not in images:
+                images.append(content)
         return images
 
     def stream_conversation(
@@ -2173,11 +2647,15 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone)
+        chat_runtime = config.get_chat_runtime_settings()
+        connect_timeout = int(chat_runtime["connect_timeout_secs"])
+        response_timeout = int(chat_runtime["response_timeout_secs"])
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
-            timeout=300,
+            # PATCH_MARKER chat_stream_deadline_r34
+            timeout=(connect_timeout, response_timeout),
             stream=True,
         )
         ensure_ok(response, path)
@@ -2185,6 +2663,14 @@ class OpenAIBackendAPI:
             yield from iter_sse_payloads(response)
         finally:
             response.close()
+
+    def _report_progress(self, step: str) -> None:
+        """Report progress step to the callback if set."""
+        if self.progress_callback:
+            try:
+                self.progress_callback(step)
+            except Exception:
+                pass
 
     def _stream_picture_conversation(
             self,
@@ -2194,11 +2680,25 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        self._report_progress("bootstrapping")
+        logger.debug({"event": "image_bootstrap_begin"})
         self._bootstrap()
+        logger.debug({"event": "image_bootstrap_done"})
+        self._report_progress("getting_token")
+        logger.debug({"event": "image_requirements_begin"})
         requirements = self._get_chat_requirements()
+        logger.debug({"event": "image_requirements_done"})
+        self._report_progress("preparing_conversation")
+        logger.debug({"event": "image_prepare_begin"})
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        logger.debug({"event": "image_prepare_done", "has_conduit": bool(conduit_token)})
+        self._report_progress("starting_generation")
+        logger.debug({"event": "image_start_begin"})
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        logger.debug({"event": "image_start_done", "status": getattr(response, "status_code", None)})
+        self._report_progress("generating")
         try:
             yield from iter_sse_payloads(response)
         finally:
@@ -2206,33 +2706,209 @@ class OpenAIBackendAPI:
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
-        ensure_ok(response, "bootstrap")
+        response = None
+        try:
+            logger.debug({"event": "bootstrap_start", "proxy": bool(self.proxy_url)})
+            response = self.session.get(
+                self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=(10, 25),
+            )
+            ensure_ok(response, "bootstrap")
+            logger.debug({"event": "bootstrap_ok", "status": getattr(response, "status_code", None)})
+        except Exception as primary_error:
+            if self.access_token and not getattr(self, "_direct_bootstrap_fallback_used", False):
+                try:
+                    self._direct_bootstrap_fallback_used = True
+                    session_headers = dict(getattr(self.session, "headers", {}) or {})
+                    fallback_account = dict(self.account or {})
+                    fallback_account.pop("proxy", None)
+                    try:
+                        self.session.close()
+                    except Exception:
+                        pass
+                    self.proxy_url = ""
+                    self.session_kwargs = {"impersonate": self.fp["impersonate"], "verify": False}
+                    self.session = requests.Session(**self.session_kwargs)
+                    self.session.headers.update(session_headers)
+                    self.session.headers["User-Agent"] = self.user_agent
+                    self.session.headers["Origin"] = self.base_url
+                    self.session.headers["Referer"] = self.base_url + "/"
+                    self.session.headers["Accept-Language"] = self.fp.get("accept-language") or "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
+                    self.session.headers["Sec-Ch-Ua"] = self.fp["sec-ch-ua"]
+                    self.session.headers["Sec-Ch-Ua-Mobile"] = self.fp["sec-ch-ua-mobile"]
+                    self.session.headers["Sec-Ch-Ua-Platform"] = self.fp["sec-ch-ua-platform"]
+                    self.session.headers["OAI-Device-Id"] = self.device_id
+                    self.session.headers["OAI-Session-Id"] = self.session_id
+                    self.session.headers["OAI-Language"] = "zh-CN"
+                    self.session.headers["OAI-Client-Version"] = self.client_version
+                    self.session.headers["OAI-Client-Build-Number"] = self.client_build_number
+                    self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                    refresh_bundle = proxy_settings.refresh_clearance(
+                        target_url=self.base_url,
+                        account=fallback_account,
+                        proxy="",
+                        force=True,
+                        upstream=False,
+                    )
+                    if refresh_bundle and refresh_bundle.cookies:
+                        merged_headers = proxy_settings.build_headers(
+                            self._bootstrap_headers(),
+                            target_url=self.base_url,
+                            account=fallback_account,
+                            proxy="",
+                            upstream=False,
+                        )
+                        response = self.session.get(
+                            self.base_url + "/",
+                            headers=merged_headers,
+                            timeout=(10, 25),
+                        )
+                        ensure_ok(response, "bootstrap")
+                    else:
+                        self.session.close()
+                        self.session_kwargs = {"impersonate": self.fp["impersonate"], "verify": False}
+                        self.session = requests.Session(**self.session_kwargs)
+                        self.session.headers.update(session_headers)
+                        self.session.headers["User-Agent"] = self.user_agent
+                        self.session.headers["Origin"] = self.base_url
+                        self.session.headers["Referer"] = self.base_url + "/"
+                        self.session.headers["Accept-Language"] = self.fp.get("accept-language") or "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
+                        self.session.headers["Sec-Ch-Ua"] = self.fp["sec-ch-ua"]
+                        self.session.headers["Sec-Ch-Ua-Mobile"] = self.fp["sec-ch-ua-mobile"]
+                        self.session.headers["Sec-Ch-Ua-Platform"] = self.fp["sec-ch-ua-platform"]
+                        self.session.headers["OAI-Device-Id"] = self.device_id
+                        self.session.headers["OAI-Session-Id"] = self.session_id
+                        self.session.headers["OAI-Language"] = "zh-CN"
+                        self.session.headers["OAI-Client-Version"] = self.client_version
+                        self.session.headers["OAI-Client-Build-Number"] = self.client_build_number
+                        self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                        response = self.session.get(
+                            self.base_url + "/",
+                            headers=self._bootstrap_headers(),
+                            timeout=(10, 25),
+                        )
+                        ensure_ok(response, "bootstrap")
+                except Exception:
+                    raise primary_error
+            else:
+                raise
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
-
     def _get_chat_requirements(self) -> ChatRequirements:
-        """获取当前模式对话所需的 sentinel token。"""
-        path = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
-        context = "auth_chat_requirements" if self.access_token else "noauth_chat_requirements"
-        body = {"p": build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)}
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json=body,
-            timeout=30,
+        """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
+        base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
+
+        def _post_json(path: str, payload: dict, context: str, attempts: int = 3) -> dict:
+            last_err: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    response = self.session.post(
+                        self.base_url + path,
+                        headers=self._headers(path, {"Content-Type": "application/json"}),
+                        json=payload,
+                        timeout=(10, 25),
+                    )
+                    ensure_ok(response, context)
+                    raw = (response.text or "").strip()
+                    if not raw:
+                        raise RuntimeError(f"{context} empty body status={response.status_code}")
+                    try:
+                        data = response.json()
+                    except Exception as exc:
+                        preview = raw[:180].replace(chr(10), " ")
+                        raise RuntimeError(f"{context} non-json body status={response.status_code} preview={preview}") from exc
+                    if not isinstance(data, dict):
+                        raise RuntimeError(f"{context} unexpected payload type={type(data).__name__}")
+                    return data
+                except Exception as exc:
+                    last_err = exc
+                    err = str(exc).lower()
+                    retryable = any(
+                        k in err
+                        for k in (
+                            "empty body",
+                            "non-json",
+                            "timeout",
+                            "timed out",
+                            "curl: (28)",
+                            "curl: (56)",
+                            "curl: (35)",
+                            "proxy",
+                            "connect tunnel",
+                            "connection reset",
+                            "connection closed",
+                            "503",
+                            "502",
+                            "520",
+                            "521",
+                            "522",
+                            "524",
+                        )
+                    )
+                    logger.warning({
+                        "event": "chat_requirements_retry",
+                        "context": context,
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "error": str(exc)[:240],
+                        "retryable": retryable,
+                    })
+                    if not retryable or attempt >= attempts:
+                        raise
+                    time.sleep(min(1.2 * attempt, 3.0))
+            if last_err is not None:
+                raise last_err
+            raise RuntimeError(f"{context} failed")
+
+        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+
+        prepare_path = base + "/prepare"
+        prepare_data = _post_json(prepare_path, {"p": p_token}, "chat_requirements_prepare")
+
+        if (prepare_data.get("arkose") or {}).get("required"):
+            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+
+        proof_token = ""
+        proof_info = prepare_data.get("proofofwork") or {}
+        if proof_info.get("required"):
+            proof_token = build_proof_token(
+                proof_info.get("seed", ""),
+                proof_info.get("difficulty", ""),
+                self.user_agent,
+                script_sources=self.pow_script_sources,
+                data_build=self.pow_data_build,
+            )
+
+        turnstile_token = ""
+        turnstile_info = prepare_data.get("turnstile") or {}
+        if turnstile_info.get("required") and turnstile_info.get("dx"):
+            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+
+        finalize_path = base + "/finalize"
+        data = _post_json(
+            finalize_path,
+            {
+                "prepare_token": prepare_data.get("prepare_token", ""),
+                "proof_token": proof_token,
+                "turnstile_token": turnstile_token,
+            },
+            "chat_requirements_finalize",
         )
-        ensure_ok(response, context)
-        requirements = self._build_requirements(response.json(), "" if self.access_token else body["p"])
-        if not requirements.token:
+
+        token = data.get("token", "")
+        if not token:
             message = "missing auth chat requirements token" if self.access_token else "missing chat requirements token"
-            raise RuntimeError(f"{message}: {requirements.raw_finalize}")
-        return requirements
+            raise RuntimeError(f"{message}: {data}")
+
+        return ChatRequirements(
+            token=token,
+            proof_token=proof_token,
+            turnstile_token=turnstile_token,
+            so_token=data.get("so_token", ""),
+            raw_finalize=data,
+        )
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:

@@ -49,13 +49,6 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
-DEFAULT_CHAT_RUNTIME = {
-    "connect_timeout_secs": 10,
-    "response_timeout_secs": 60,
-    "max_account_rotates": 8,
-    "rotate_on_timeout": True,
-}
-
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -240,31 +233,6 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
     }
 
 
-def _normalize_chat_runtime_settings(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    return {
-        "connect_timeout_secs": _normalize_positive_int(
-            source.get("connect_timeout_secs"),
-            int(DEFAULT_CHAT_RUNTIME["connect_timeout_secs"]),
-            1,
-        ),
-        "response_timeout_secs": _normalize_positive_int(
-            source.get("response_timeout_secs"),
-            int(DEFAULT_CHAT_RUNTIME["response_timeout_secs"]),
-            10,
-        ),
-        "max_account_rotates": _normalize_positive_int(
-            source.get("max_account_rotates"),
-            int(DEFAULT_CHAT_RUNTIME["max_account_rotates"]),
-            0,
-        ),
-        "rotate_on_timeout": _normalize_bool(
-            source.get("rotate_on_timeout"),
-            bool(DEFAULT_CHAT_RUNTIME["rotate_on_timeout"]),
-        ),
-    }
-
-
 def _normalize_status_codes(value: object) -> list[int]:
     items = value if isinstance(value, list) else DEFAULT_PROXY_RUNTIME["reset_session_status_codes"]
     normalized: list[int] = []
@@ -368,23 +336,16 @@ def _normalize_video_settings(value: object) -> dict[str, object]:
     if not isinstance(supported, list) or not supported:
         supported = list(DEFAULT_VIDEO_SETTINGS["supported_providers"])
     supported = [str(item).strip().lower() for item in supported if str(item).strip()]
-    # PATCH_MARKER video_upstream_ready_r33
-    base_url = str(source.get("base_url") or "").strip().rstrip("/")
-    api_key = str(source.get("api_key") or "").strip()
-    upstream_ready = bool(base_url) and provider in {"openai_compatible", "openai", "sora_compatible"}
-    mode = "upstream" if upstream_ready else ("local" if provider in {"local", "mock"} else "fallback_local")
     return {
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_VIDEO_SETTINGS["enabled"])),
         "provider": provider,
         "fallback_provider": fallback,
-        "base_url": base_url,
-        "api_key": api_key,
+        "base_url": str(source.get("base_url") or "").strip().rstrip("/"),
+        "api_key": str(source.get("api_key") or "").strip(),
         "poll_interval_secs": _normalize_positive_int(source.get("poll_interval_secs"), int(DEFAULT_VIDEO_SETTINGS["poll_interval_secs"]), 1),
         "poll_timeout_secs": _normalize_positive_int(source.get("poll_timeout_secs"), int(DEFAULT_VIDEO_SETTINGS["poll_timeout_secs"]), 30),
         "storage_dir": str(source.get("storage_dir") or DEFAULT_VIDEO_SETTINGS["storage_dir"]).strip().strip("/") or "videos",
         "supported_providers": supported,
-        "upstream_ready": upstream_ready,
-        "mode": mode,
     }
 
 
@@ -676,7 +637,6 @@ class ConfigStore:
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
-        data["chat_runtime"] = self.get_chat_runtime_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data["features"] = self.get_feature_flags()
@@ -718,8 +678,6 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
-        if "chat_runtime" in next_data:
-            next_data["chat_runtime"] = _normalize_chat_runtime_settings(next_data.get("chat_runtime"))
         if "third_party_apps" in next_data:
             next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
         if "features" in next_data:
@@ -750,9 +708,6 @@ class ConfigStore:
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
-
-    def get_chat_runtime_settings(self) -> dict[str, object]:
-        return _normalize_chat_runtime_settings(self.data.get("chat_runtime"))
 
     def get_feature_flags(self) -> dict[str, bool]:
         return _normalize_feature_flags(self.data.get("features"))

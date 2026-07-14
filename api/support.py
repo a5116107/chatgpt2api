@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import urllib.request
 from pathlib import Path
 from threading import Event, Thread
 
@@ -8,6 +10,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.proxy_service import test_proxy
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -79,23 +82,102 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
+
+
+def _account_watcher_proxy_status(watcher: dict) -> dict | None:
+    url = str(watcher.get("proxy_status_url") or "").strip()
+    if not url:
+        return None
+    timeout = max(1, int(watcher.get("proxy_ready_timeout_secs") or 8))
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        pool = payload.get("pool") if isinstance(payload, dict) else None
+        if not isinstance(pool, dict):
+            return None
+        return {
+            "available": int(pool.get("available") or 0),
+            "total": int(pool.get("total") or 0),
+            "banned": int(pool.get("banned") or 0),
+            "below_score": int(pool.get("below_score") or 0),
+        }
+    except Exception as exc:
+        print(f"[account-watcher] proxy status unavailable; skip this round error={exc}")
+        return {"available": 0, "total": 0, "banned": 0, "below_score": 0}
+
+def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
+    if not watcher.get("require_proxy_ready"):
+        return {"available": max(1, int(watcher.get("max_batch") or 1))}
+    timeout = max(1, int(watcher.get("proxy_ready_timeout_secs") or 8))
+    result = test_proxy(timeout=float(timeout))
+    if not result.get("ok"):
+        print(
+            "[account-watcher] proxy not ready; skip this round "
+            f"status={result.get('status')} error={result.get('error')} "
+            f"latency_ms={result.get('latency_ms')}"
+        )
+        return None
+    pool_status = _account_watcher_proxy_status(watcher)
+    min_available = max(1, int(watcher.get("min_proxy_available") or 1))
+    available = int((pool_status or {}).get("available") or 0)
+    if available <= 0:
+        print(
+            "[account-watcher] proxy pool unavailable; skip this round "
+            f"available={available} status={pool_status}"
+        )
+        return None
+    if available < min_available:
+        print(
+            "[account-watcher] proxy pool below threshold; continuing with limited batch "
+            f"available={available} min={min_available} status={pool_status}"
+        )
+    return pool_status or {"available": available}
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 
     def worker() -> None:
+        first_round = True
         while not stop_event.is_set():
             try:
-                limited_tokens = account_service.list_limited_tokens()
-                expiring_tokens = account_service.list_expiring_access_tokens()
-                keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *expiring_tokens]))
+                watcher = config.get_account_watcher_settings()
+                if not watcher.get("enabled"):
+                    stop_event.wait(interval_seconds)
+                    first_round = False
+                    continue
+                if first_round:
+                    initial_delay = max(0, int(watcher.get("initial_delay_seconds") or 0))
+                    if initial_delay:
+                        print(f"[account-watcher] initial delay {initial_delay}s before first check")
+                        if stop_event.wait(initial_delay):
+                            break
+                    first_round = False
+                proxy_status = _account_watcher_proxy_ready(watcher)
+                if not proxy_status:
+                    stop_event.wait(interval_seconds)
+                    continue
+                limited_tokens = account_service.list_limited_tokens() if watcher.get("check_limited") else []
+                normal_tokens = account_service.list_normal_tokens() if watcher.get("check_normal") else []
+                expiring_tokens = account_service.list_expiring_access_tokens() if watcher.get("check_expiring") else []
+                keepalive_tokens = account_service.list_refresh_token_keepalive_tokens() if watcher.get("keepalive_refresh_tokens") else []
+                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+                max_batch = max(1, int(watcher.get("max_batch") or 64))
+                if watcher.get("dynamic_batch_by_proxy"):
+                    available = max(1, int((proxy_status or {}).get("available") or 1))
+                    max_batch = min(max_batch, available)
+                if len(tokens) > max_batch:
+                    tokens = tokens[:max_batch]
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+                if len(keepalive_tokens) > max_batch:
+                    keepalive_tokens = keepalive_tokens[:max_batch]
                 if tokens:
                     print(
                         "[account-watcher] checking "
                         f"{len(limited_tokens)} limited accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
+                        f"{len(normal_tokens)} normal accounts, "
+                        f"{len(expiring_tokens)} expiring access tokens; "
+                        f"batch={len(tokens)}/{max_batch}"
                     )
                     account_service.refresh_accounts(tokens)
                 if keepalive_tokens:

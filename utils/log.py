@@ -1,14 +1,30 @@
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 class Logger:
     _DATA_URL_RE = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+")
     _JSON_B64_RE = re.compile(r'("b64_json"\s*:\s*")([A-Za-z0-9+/=]+)(")')
+    _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+    _EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+    _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/-]+)")
+    _SECRET_KEY_PARTS = (
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "auth-key",
+        "signature",
+    )
 
     def __init__(self, name: str = "chatgpt2api") -> None:
         self._logger = logging.getLogger(name)
@@ -31,6 +47,22 @@ class Logger:
         if len(value) <= keep:
             return value
         return value[:keep] + "..."
+
+    @staticmethod
+    def _redact_secret(value: str) -> str:
+        digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"[redacted len={len(value)} sha256={digest}]"
+
+    @staticmethod
+    def _strip_url_query(value: str) -> str:
+        """Keep URL origin/path for diagnostics without logging signed query parameters."""
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return value
+        if not parsed.scheme or not parsed.netloc:
+            return value
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
     def _mask_base64(self, value: str) -> str:
         if value.startswith("data:") and ";base64," in value:
@@ -60,6 +92,12 @@ class Logger:
             lambda match: f'{match.group(1)}{self._mask_base64(match.group(2))}{match.group(3)}',
             sanitized,
         )
+        sanitized = self._URL_RE.sub(lambda match: self._strip_url_query(match.group(0)), sanitized)
+        sanitized = self._EMAIL_RE.sub("[redacted-email]", sanitized)
+        sanitized = self._BEARER_RE.sub(
+            lambda match: f"{match.group(1)}{self._redact_secret(match.group(2))}",
+            sanitized,
+        )
         if sanitized != value:
             return sanitized
         return value
@@ -69,8 +107,12 @@ class Logger:
             sanitized = {}
             for key, item in value.items():
                 lowered_key = key.lower()
-                if isinstance(item, str) and ("token" in lowered_key or lowered_key == "dx"):
-                    sanitized[key] = self._mask_string(item)
+                if isinstance(item, str) and "email" in lowered_key:
+                    sanitized[key] = "[redacted-email]"
+                elif isinstance(item, str) and (
+                    lowered_key == "dx" or any(part in lowered_key for part in self._SECRET_KEY_PARTS)
+                ):
+                    sanitized[key] = self._redact_secret(item)
                 elif isinstance(item, str) and ("base64" in lowered_key or lowered_key == "b64_json"):
                     sanitized[key] = self._mask_base64(item)
                 else:

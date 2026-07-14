@@ -20,6 +20,12 @@ TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
+# A task can legitimately sit in upstream polling for image_poll_timeout_secs,
+# but it must keep heartbeat updates while doing so.  If no heartbeat happens
+# for this long, the worker thread was interrupted or wedged and the UI should
+# not keep spinning forever.
+DEFAULT_STALE_HEARTBEAT_SECS = 180.0
+
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -61,6 +67,14 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _stale_heartbeat_secs() -> float:
+    try:
+        timeout = float(config.image_poll_timeout_secs)
+    except Exception:
+        timeout = 120.0
+    return max(DEFAULT_STALE_HEARTBEAT_SECS, timeout + 60.0)
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -72,13 +86,48 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("conversation_id"):
+        item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
         item["data"] = task.get("data")
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
         item["error"] = task.get("error")
+    if task.get("progress"):
+        item["progress"] = task.get("progress")
+    if task.get("duration_ms") is not None:
+        item["duration_ms"] = task.get("duration_ms")
+    if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
+        if task.get("status") == TASK_STATUS_RUNNING:
+            # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
+            base_ts = task.get("started_ts")
+        else:
+            # QUEUED 状态从 created_ts 开始计时（排队等待中）
+            base_ts = task.get("created_ts") or task.get("updated_ts")
+        if base_ts:
+            item["elapsed_secs"] = round(time.time() - base_ts, 1)
     return item
+
+
+def _sync_unified_task(task_id: str, *, status: str, mode: str = "generate", owner_id: str = "", progress: object = None, error: object = "", duration_ms: int | None = None, **updates: Any) -> None:
+    try:
+        from services.risk_control_service import risk_control_service
+
+        risk_control_service.upsert_task(
+            task_id,
+            type_="image",
+            status=status,
+            progress=progress,
+            source="image_task_service",
+            owner_id=owner_id,
+            error=error,
+            duration_ms=duration_ms,
+            mode=mode,
+            **updates,
+        )
+    except Exception:
+        pass
 
 
 class ImageTaskService:
@@ -137,10 +186,12 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
+        masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             "images": images or [],
+            "mask": masks or [],
             "model": model,
             "n": 1,
             "size": size,
@@ -154,7 +205,7 @@ class ImageTaskService:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
-            if self._cleanup_locked():
+            if self._cleanup_locked() or self._mark_stale_unfinished_locked():
                 self._save_locked()
             items = []
             missing_ids = []
@@ -191,6 +242,7 @@ class ImageTaskService:
         should_start = False
         with self._lock:
             cleaned = self._cleanup_locked()
+            cleaned = self._mark_stale_unfinished_locked() or cleaned
             task = self._tasks.get(key)
             if task is not None:
                 if cleaned:
@@ -206,9 +258,12 @@ class ImageTaskService:
                 "quality": _clean(payload.get("quality"), "auto"),
                 "created_at": now,
                 "updated_at": now,
+                "created_ts": time.time(),
+                "last_heartbeat_ts": time.time(),
             }
             self._tasks[key] = task
             self._save_locked()
+            _sync_unified_task(task_id, status=TASK_STATUS_QUEUED, mode=mode, owner_id=owner, progress="queued")
             should_start = True
 
         if should_start:
@@ -231,9 +286,22 @@ class ImageTaskService:
     ) -> None:
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        task_id = key.rsplit(":", 1)[-1]
+        owner_id = key.split(":", 1)[0]
+        _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress="running")
+        # 创建进度回调，每个步骤完成后更新任务状态
+        def progress_callback(step: str) -> None:
+            now = time.time()
+            updates: dict[str, Any] = {"progress": step, "last_heartbeat_ts": now}
+            if step == "image_stream_resolve_start":
+                updates["started_ts"] = now
+            self._update_task(key, **updates)
+            _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress=step)
+        # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
+        payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handler(payload)
+            result = handler(payload_with_progress)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -249,7 +317,9 @@ class ImageTaskService:
                     setattr(error, "account_email", account_email)
                 raise error
             usage = result.get("usage")
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="")
+            duration_ms = int((time.time() - started) * 1000)
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            _sync_unified_task(task_id, status=TASK_STATUS_SUCCESS, mode=mode, owner_id=owner_id, progress="succeeded", duration_ms=duration_ms)
             self._log_call(
                 identity,
                 mode,
@@ -263,7 +333,12 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[])
+            conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            duration_ms = int((time.time() - started) * 1000)
+            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
+                              duration_ms=duration_ms,
+                              **({"conversation_id": conversation_id} if conversation_id else {}))
+            _sync_unified_task(task_id, status=TASK_STATUS_ERROR, mode=mode, owner_id=owner_id, progress="failed", error=error_message, duration_ms=duration_ms)
             self._log_call(
                 identity,
                 mode,
@@ -323,6 +398,7 @@ class ImageTaskService:
                 return
             task.update(updates)
             task["updated_at"] = _now_iso()
+            task["updated_ts"] = time.time()
             self._save_locked()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
@@ -356,6 +432,11 @@ class ImageTaskService:
                 "quality": _clean(item.get("quality"), "auto"),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
+                "created_ts": item.get("created_ts"),
+                "updated_ts": item.get("updated_ts"),
+                "started_ts": item.get("started_ts"),
+                "last_heartbeat_ts": item.get("last_heartbeat_ts"),
+                "duration_ms": item.get("duration_ms"),
             }
             data = item.get("data")
             if isinstance(data, list):
@@ -382,7 +463,33 @@ class ImageTaskService:
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
                 task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
                 changed = True
+        return changed
+
+    def _mark_stale_unfinished_locked(self) -> bool:
+        now = time.time()
+        stale_after = _stale_heartbeat_secs()
+        changed = False
+        for task in self._tasks.values():
+            if task.get("status") not in UNFINISHED_STATUSES:
+                continue
+            heartbeat = task.get("last_heartbeat_ts") or task.get("updated_ts") or task.get("created_ts") or 0
+            try:
+                heartbeat = float(heartbeat)
+            except Exception:
+                heartbeat = 0.0
+            if heartbeat and now - heartbeat <= stale_after:
+                continue
+            task["status"] = TASK_STATUS_ERROR
+            task["error"] = (
+                f"图片任务超过 {int(stale_after)} 秒没有进度心跳，已自动收口。"
+                "这通常是后台 worker 被重启、中断或上游连接卡住导致。"
+            )
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = now
+            task["duration_ms"] = int(max(0.0, now - float(task.get("created_ts") or now)) * 1000)
+            changed = True
         return changed
 
     def _cleanup_locked(self) -> bool:
@@ -399,6 +506,116 @@ class ImageTaskService:
         for key in removed_keys:
             self._tasks.pop(key, None)
         return bool(removed_keys)
+
+    def resume_poll(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        extra_timeout_secs: float = 30.0,
+    ) -> dict[str, Any]:
+        """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") != TASK_STATUS_ERROR:
+                raise ValueError("task is not in error state")
+            error_msg = _clean(task.get("error"))
+            if "超时" not in error_msg:
+                raise ValueError("task error is not a timeout error")
+            conversation_id = _clean(task.get("conversation_id"))
+            if not conversation_id:
+                raise ValueError("task has no conversation_id")
+            mode = task.get("mode", "generate")
+            model = task.get("model", "gpt-image-2")
+            # 将任务状态重置为 running
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+
+        # 启动新线程继续轮询
+        thread = threading.Thread(
+            target=self._run_resume_poll,
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            name=f"image-resume-{_clean(task_id)[:16]}",
+            daemon=True,
+        )
+        thread.start()
+        return _public_task(task)
+
+    def _run_resume_poll(
+        self,
+        key: str,
+        conversation_id: str,
+        extra_timeout_secs: float,
+        identity: dict[str, object],
+        mode: str,
+        model: str,
+    ) -> None:
+        """后台线程：继续轮询已有 conversation_id 的图片结果。"""
+        started = time.time()
+        try:
+            from services.openai_backend_api import OpenAIBackendAPI
+            from services.protocol.conversation import format_image_result
+
+            backend = OpenAIBackendAPI()
+            try:
+                file_ids, sediment_ids = backend._poll_image_results(
+                    conversation_id,
+                    extra_timeout_secs,
+                )
+                if not file_ids and not sediment_ids:
+                    raise RuntimeError(
+                        f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
+                    )
+
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, file_ids, sediment_ids, poll=False,
+                )
+                if not image_urls:
+                    raise RuntimeError("图片 URL 解析失败")
+
+                image_items = [
+                    {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                    for image_data in backend.download_image_bytes(image_urls)
+                ]
+            finally:
+                backend.close()
+            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
+            with self._lock:
+                task = self._tasks.get(key)
+                quality = _clean(task.get("quality"), "auto") if task else "auto"
+                size = _clean(task.get("size")) if task else None
+            data = format_image_result(
+                image_items,
+                "",  # prompt 已不重要，结果已经拿到了
+                "b64_json",
+                "",
+                int(time.time()),
+            )["data"]
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
+            self._log_call(
+                identity,
+                mode,
+                model,
+                started,
+                "调用完成（续轮询）",
+                status="success",
+                urls=_collect_image_urls(data),
+            )
+        except Exception as exc:
+            error_message = str(exc) or "resume poll failed"
+            duration_ms = int((time.time() - started) * 1000)
+            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            self._log_call(
+                identity,
+                mode,
+                model,
+                started,
+                "调用失败（续轮询）",
+                status="failed",
+                error=error_message,
+            )
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

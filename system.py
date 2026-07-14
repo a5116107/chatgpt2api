@@ -325,39 +325,14 @@ def create_router(app_version: str) -> APIRouter:
         storage = config.get_storage_backend()
         task_sync = await run_in_threadpool(risk_control_service.sync_task_center)
         proxy_runtime = proxy_settings.get_runtime_status()
-        # PATCH_MARKER ops_smoke_enrich_r31
-        disk_free_mb = 0
-        try:
-            import shutil as _shutil
-            disk_free_mb = int(_shutil.disk_usage("/").free / 1024 / 1024)
-        except Exception:
-            disk_free_mb = -1
-        route_stats = {}
-        try:
-            from services.register_service import register_service as _reg
-            route_stats = _reg.route_stats()
-        except Exception as exc:
-            route_stats = {"error": str(exc)}
         return {
             "ok": True,
             "version": app_version,
             "features": config.get_feature_flags(),
-            "chat_runtime": config.get_chat_runtime_settings(),
             "video": config.get_video_settings(),
             "storage": {"backend": storage.get_backend_info(), "health": storage.health_check()},
             "proxy_runtime": proxy_runtime,
             "tasks": task_sync,
-            "disk_free_mb": disk_free_mb,
-            "route_stats": route_stats,
-            "markers": [
-                "ops_cleanup_target_free_r31",
-                "ops_smoke_enrich_r31",
-                "register_route_retire_apply_r31",
-                "chat_revoked_fast_rotate_r33",
-                "video_upstream_ready_r33",
-                "chat_stream_deadline_r34",
-                "chat_timeout_rotate_r34",
-            ],
         }
 
     @router.post("/api/ops/rollback-plan")
@@ -432,7 +407,7 @@ def create_router(app_version: str) -> APIRouter:
         return {"ok": True, "disk": await run_in_threadpool(_disk)}
 
     @router.post("/api/ops/cleanup")
-    async def ops_cleanup(authorization: str | None = Header(default=None), dry_run: bool = False, target_free_mb: int = 0):
+    async def ops_cleanup(authorization: str | None = Header(default=None), dry_run: bool = False):
         # PATCH_MARKER ops_disk_cleanup_r29
         # PATCH_MARKER ops_cleanup_images_logs_r30
         require_admin(authorization)
@@ -485,39 +460,6 @@ def create_router(app_version: str) -> APIRouter:
                 except Exception:
                     images_removed = 0
 
-            # PATCH_MARKER ops_cleanup_target_free_r31
-            # optional free-space reclamation: delete oldest images until target free MB
-            target_free_info = {"enabled": False}
-            try:
-                import shutil as _shutil
-                min_free = int(target_free_mb) if int(target_free_mb or 0) > 0 else int(getattr(app_config, "image_min_free_mb", None) or app_config.data.get("image_min_free_mb") or 500)
-                # if explicit target_free_mb provided, force reclaim even when currently above default threshold
-                force_target = int(target_free_mb or 0) > 0
-                usage_now = _shutil.disk_usage("/")
-                free_now = int(usage_now.free / 1024 / 1024)
-                # honor query/env style via config only; default reclaims to image_min_free_mb when below threshold
-                if force_target or free_now < min_free:
-                    target_free_info = {
-                        "enabled": True,
-                        "before_free_mb": free_now,
-                        "target_free_mb": min_free,
-                    }
-                    if not dry_run:
-                        from services.image_service import delete_to_target
-                        target_free_info["result"] = delete_to_target(min_free, dry_run=False)
-                    else:
-                        from services.image_service import delete_to_target
-                        target_free_info["result"] = delete_to_target(min_free, dry_run=True)
-                else:
-                    target_free_info = {
-                        "enabled": False,
-                        "before_free_mb": free_now,
-                        "target_free_mb": min_free,
-                        "skipped": "free_space_above_threshold",
-                    }
-            except Exception as exc:
-                target_free_info = {"enabled": True, "error": str(exc)}
-
             # logs.jsonl rotate if oversized (>8MB keep last 2MB)
             log_info = {"path": str(DATA_DIR / "logs.jsonl"), "rotated": False, "bytes_before": 0, "bytes_after": 0}
             log_path = DATA_DIR / "logs.jsonl"
@@ -566,7 +508,6 @@ def create_router(app_version: str) -> APIRouter:
                 "freed_bytes": freed,
                 "images_removed": images_removed,
                 "image_retention_days": getattr(app_config, "image_retention_days", None),
-                "target_free": target_free_info,
                 "repair": repair,
                 "items": removed[:80],
                 "root_free_mb": int(usage.free / 1024 / 1024),
