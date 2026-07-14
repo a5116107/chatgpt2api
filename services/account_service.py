@@ -53,7 +53,6 @@ class AccountService:
         self._lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
-        self._index = 0
         self._text_index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
@@ -138,6 +137,21 @@ class AccountService:
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
 
+
+    def _is_soft_sticky_refresh_error(self, value: object) -> bool:
+        # PATCH_MARKER sticky_userinfo_clear_r26
+        # These notes mean "profile hydrate delayed" not "token dead".
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        soft_markers = (
+            "register_userinfo_timeout",
+            "/backend-api/me soft fail",
+            "backend_me_soft_fail",
+            "backend_me_optional_failed",
+            "me soft fail",
+        )
+        return any(m in text for m in soft_markers)
 
     @staticmethod
     def _access_token_hard_dead(account: dict | None) -> bool:
@@ -344,6 +358,29 @@ class AccountService:
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
+        normalized["image_health_samples"] = max(0, int(normalized.get("image_health_samples") or 0))
+        try:
+            normalized["image_success_ema"] = min(1.0, max(0.0, float(normalized.get("image_success_ema", 0.5))))
+        except (TypeError, ValueError):
+            normalized["image_success_ema"] = 0.5
+        try:
+            normalized["image_latency_ema_ms"] = max(0.0, float(normalized.get("image_latency_ema_ms") or 0.0))
+        except (TypeError, ValueError):
+            normalized["image_latency_ema_ms"] = 0.0
+        normalized["image_consecutive_failures"] = max(0, int(normalized.get("image_consecutive_failures") or 0))
+        normalized["image_last_success_at"] = normalized.get("image_last_success_at") or None
+        normalized["image_last_failure_at"] = normalized.get("image_last_failure_at") or None
+        normalized["image_probe_samples"] = max(0, int(normalized.get("image_probe_samples") or 0))
+        try:
+            normalized["image_probe_success_ema"] = min(1.0, max(0.0, float(normalized.get("image_probe_success_ema", 0.5))))
+        except (TypeError, ValueError):
+            normalized["image_probe_success_ema"] = 0.5
+        try:
+            normalized["image_probe_latency_ema_ms"] = max(0.0, float(normalized.get("image_probe_latency_ema_ms") or 0.0))
+        except (TypeError, ValueError):
+            normalized["image_probe_latency_ema_ms"] = 0.0
+        normalized["image_last_probe_at"] = normalized.get("image_last_probe_at") or None
+        normalized["image_last_probe_error"] = normalized.get("image_last_probe_error") or None
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
@@ -698,8 +735,6 @@ class AccountService:
                 new_access_token = result.get("access_token", "")
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
-                new_expires_at = result.get("expires_at")
-
                 # 构建 token_data 供 _apply_refreshed_tokens 使用
                 token_data = {
                     "access_token": new_access_token,
@@ -789,7 +824,6 @@ class AccountService:
                             quiet=True,
                             sync_capabilities=False,
                         )
-                        account = self.get_account(access_token) or {}
                         log_service.add(
                             LOG_TYPE_ACCOUNT,
                             "账号已停用-标记禁用",
@@ -1374,12 +1408,39 @@ class AccountService:
                     "account_deactivated",
                 )
             ) else 0
-            refresh_err = 1 if err_blob.strip() else 0
+            # PATCH_MARKER sticky_userinfo_clear_r26
+            soft_only = self._is_soft_sticky_refresh_error(err_blob) and not token_dead
+            refresh_err = 0 if (not err_blob.strip() or soft_only) else 1
             created = self._parse_time(acc.get("created_at"))
             created_ts = created.timestamp() if created is not None else 0.0
             invalid = int(acc.get("invalid_count") or 0)
+            image_samples = int(acc.get("image_health_samples") or 0)
+            image_success_ema = float(acc.get("image_success_ema") if image_samples else 0.5)
+            image_latency = float(acc.get("image_latency_ema_ms") or 60000.0)
+            consecutive_failures = int(acc.get("image_consecutive_failures") or 0)
+            probe_samples = int(acc.get("image_probe_samples") or 0)
+            probe_success_ema = float(acc.get("image_probe_success_ema") if probe_samples else 0.5)
+            probe_latency = float(acc.get("image_probe_latency_ema_ms") or 10000.0)
+            if probe_samples <= 0:
+                probe_rank = 1
+            elif not str(acc.get("image_last_probe_error") or "").strip():
+                probe_rank = 0
+            else:
+                probe_rank = 2
             # sort ascending: smaller is better
-            return (status_rank, token_dead, refresh_err, invalid, -created_ts)
+            return (
+                status_rank,
+                token_dead,
+                refresh_err,
+                probe_rank,
+                min(consecutive_failures, 3),
+                1.0 - probe_success_ema,
+                1.0 - image_success_ema,
+                probe_latency,
+                image_latency,
+                invalid,
+                -created_ts,
+            )
         tokens.sort(key=_score)
         return tokens
 
@@ -1422,10 +1483,10 @@ class AccountService:
                     )
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
-                    # 新号优先；仍用 index 在前几名里轮转，避免总打同一号
-                    top_n = min(3, len(tokens))
-                    access_token = tokens[self._index % top_n]
-                    self._index += 1
+                    # The score already includes readiness, recent image failures, success EMA,
+                    # and latency. Concurrency filtering naturally falls through to the next
+                    # account when the best candidate has no free slot.
+                    access_token = tokens[0]
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     if not hasattr(self, "_image_inflight_meta"):
                         self._image_inflight_meta = {}
@@ -1506,10 +1567,11 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
-    @staticmethod
-    def _text_candidate_score(account: dict) -> tuple:
+    def _text_candidate_score(self, account: dict) -> tuple:
         status_penalty = 0 if account.get("status") == "正常" else 1
-        refresh_error_penalty = 1 if str(account.get("last_token_refresh_error") or account.get("last_refresh_error") or "").strip() else 0
+        sticky = str(account.get("last_token_refresh_error") or account.get("last_refresh_error") or "").strip()
+        # PATCH_MARKER sticky_userinfo_clear_r26
+        refresh_error_penalty = 0 if (not sticky or self._is_soft_sticky_refresh_error(sticky)) else 1
         invalid_count = int(account.get("invalid_count") or 0)
         fail_count = int(account.get("fail") or 0)
         success_bonus = -int(account.get("success") or 0)
@@ -1559,6 +1621,12 @@ class AccountService:
             next_item = dict(current)
             next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             next_item["success"] = int(next_item.get("success") or 0) + 1
+            # PATCH_MARKER sticky_userinfo_clear_r26
+            for key in ("last_refresh_error", "last_token_refresh_error", "last_error", "note"):
+                if self._is_soft_sticky_refresh_error(next_item.get(key)):
+                    next_item[key] = None
+            if self._is_soft_sticky_refresh_error(current.get("last_refresh_error")):
+                next_item["last_refresh_error_at"] = None
             account = self._normalize_account(next_item)
             if account is None:
                 return
@@ -1879,10 +1947,8 @@ class AccountService:
             }
             if removed:
                 if self._accounts:
-                    self._index %= len(self._accounts)
                     self._text_index %= len(self._accounts)
                 else:
-                    self._index = 0
                     self._text_index = 0
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
@@ -1906,7 +1972,13 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
+            # PATCH_MARKER preserve_register_email_r26
+            # Drop empty identity/type overwrites so soft /me cannot erase registration email.
+            safe_updates = dict(updates or {})
+            for key in ("email", "user_id", "password", "refresh_token", "id_token", "type"):
+                if key in safe_updates and not str(safe_updates.get(key) or "").strip():
+                    safe_updates.pop(key, None)
+            account = self._normalize_account({**current, **safe_updates, "access_token": access_token})
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
@@ -2088,7 +2160,7 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(self, access_token: str, success: bool, duration_ms: int | None = None) -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
@@ -2098,9 +2170,22 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_used_at"] = now_text
+            samples = int(next_item.get("image_health_samples") or 0)
+            previous_success_ema = float(next_item.get("image_success_ema") if samples else 0.5)
+            next_item["image_health_samples"] = samples + 1
+            next_item["image_success_ema"] = round(previous_success_ema * 0.8 + (1.0 if success else 0.0) * 0.2, 6)
+            if duration_ms is not None and duration_ms >= 0:
+                previous_latency = float(next_item.get("image_latency_ema_ms") or 0.0)
+                next_item["image_latency_ema_ms"] = round(
+                    float(duration_ms) if previous_latency <= 0 else previous_latency * 0.8 + float(duration_ms) * 0.2,
+                    2,
+                )
             image_quota_unknown = bool(next_item.get("image_quota_unknown"))
             if success:
+                next_item["image_consecutive_failures"] = 0
+                next_item["image_last_success_at"] = now_text
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 if not image_quota_unknown:
                     next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
@@ -2109,7 +2194,15 @@ class AccountService:
                     next_item["restore_at"] = next_item.get("restore_at") or None
                 elif next_item.get("status") == "限流":
                     next_item["status"] = "正常"
+                # PATCH_MARKER sticky_userinfo_clear_r26
+                for key in ("last_refresh_error", "last_token_refresh_error", "last_error", "note"):
+                    if self._is_soft_sticky_refresh_error(next_item.get(key)):
+                        next_item[key] = None
+                if self._is_soft_sticky_refresh_error(current.get("last_refresh_error")):
+                    next_item["last_refresh_error_at"] = None
             else:
+                next_item["image_consecutive_failures"] = int(next_item.get("image_consecutive_failures") or 0) + 1
+                next_item["image_last_failure_at"] = now_text
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)
             if account is None:
@@ -2124,6 +2217,94 @@ class AccountService:
             self._save_accounts()
             return dict(account)
         return None
+
+    def mark_image_probe_result(
+        self,
+        access_token: str,
+        success: bool,
+        duration_ms: int,
+        error: str = "",
+    ) -> dict | None:
+        if not access_token:
+            return None
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            next_item = dict(current)
+            samples = int(next_item.get("image_probe_samples") or 0)
+            previous_success = float(next_item.get("image_probe_success_ema") if samples else 0.5)
+            previous_latency = float(next_item.get("image_probe_latency_ema_ms") or 0.0)
+            next_item["image_probe_samples"] = samples + 1
+            next_item["image_probe_success_ema"] = round(
+                previous_success * 0.8 + (1.0 if success else 0.0) * 0.2,
+                6,
+            )
+            next_item["image_probe_latency_ema_ms"] = round(
+                float(duration_ms) if previous_latency <= 0 else previous_latency * 0.8 + float(duration_ms) * 0.2,
+                2,
+            )
+            next_item["image_last_probe_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["image_last_probe_error"] = None if success else str(error or "probe failed")[:240]
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+            return dict(account)
+
+    def _list_image_probe_candidate_tokens(self, limit: int) -> list[str]:
+        """Select idle accounts that have never been probed or were probed least recently."""
+        with self._lock:
+            tokens = [
+                token
+                for token in self._list_available_candidate_tokens()
+                if int(self._image_inflight.get(token, 0)) == 0
+            ]
+            stable_order = {token: index for index, token in enumerate(tokens)}
+
+            def probe_due_score(token: str) -> tuple[int, float, int]:
+                account = self._accounts.get(token) or {}
+                last_probe = self._parse_time(account.get("image_last_probe_at"))
+                return (
+                    0 if last_probe is None else 1,
+                    last_probe.timestamp() if last_probe is not None else 0.0,
+                    stable_order[token],
+                )
+
+            tokens.sort(key=probe_due_score)
+            return tokens[:max(1, int(limit))]
+
+    def probe_image_candidates(self, limit: int = 3) -> dict[str, Any]:
+        """Probe chat requirements off the request path and persist image readiness signals."""
+        tokens = self._list_image_probe_candidate_tokens(limit)
+        checked = 0
+        healthy = 0
+        failures: list[dict[str, str]] = []
+        for token in tokens:
+            started = time.monotonic()
+            error = ""
+            try:
+                from services.openai_backend_api import OpenAIBackendAPI
+
+                with OpenAIBackendAPI(token) as backend:
+                    backend.set_image_request_context(
+                        f"probe-{anonymize_token(token).split(':')[-1]}",
+                        time.monotonic() + min(30.0, config.image_request_deadline_secs),
+                    )
+                    backend._bootstrap()
+                    backend._get_chat_requirements()
+                healthy += 1
+                success = True
+            except Exception as exc:
+                success = False
+                error = str(exc)
+                failures.append({"account_hash": anonymize_token(token), "error": error[:160]})
+            duration_ms = int((time.monotonic() - started) * 1000)
+            self.mark_image_probe_result(token, success, duration_ms, error)
+            checked += 1
+        return {"checked": checked, "healthy": healthy, "failures": failures}
 
     def fetch_remote_info(
         self,

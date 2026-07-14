@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Iterator
 
 from services.protocol.conversation import (
@@ -31,6 +32,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,
+        request_id=str(body.get("_request_id") or ""),
+        started_monotonic=float(body.get("_request_started_monotonic") or time.monotonic()),
+        deadline_monotonic=float(body.get("_request_deadline_monotonic") or 0) or None,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

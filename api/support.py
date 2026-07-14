@@ -106,6 +106,12 @@ def _account_watcher_proxy_status(watcher: dict) -> dict | None:
         return {"available": 0, "total": 0, "banned": 0, "below_score": 0}
 
 def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
+    """Proxy readiness for account-watcher.
+
+    Compatible with:
+    1) dynamic-proxy pool: use status URL available for batch sizing
+    2) single-proxy/glider: if status URL is unavailable, continue when test_proxy is ok
+    """
     if not watcher.get("require_proxy_ready"):
         return {"available": max(1, int(watcher.get("max_batch") or 1))}
     timeout = max(1, int(watcher.get("proxy_ready_timeout_secs") or 8))
@@ -120,12 +126,20 @@ def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
     pool_status = _account_watcher_proxy_status(watcher)
     min_available = max(1, int(watcher.get("min_proxy_available") or 1))
     available = int((pool_status or {}).get("available") or 0)
+    # When dynamic-proxy is down/unavailable, keep single-proxy path alive.
     if available <= 0:
+        fallback = max(1, int(watcher.get("max_batch") or 1))
         print(
-            "[account-watcher] proxy pool unavailable; skip this round "
-            f"available={available} status={pool_status}"
+            "[account-watcher] proxy pool status unavailable; continue with single-proxy batch "
+            f"fallback_available={fallback} status={pool_status}"
         )
-        return None
+        return {
+            "available": fallback,
+            "total": fallback,
+            "banned": 0,
+            "below_score": 0,
+            "mode": "single_proxy",
+        }
     if available < min_available:
         print(
             "[account-watcher] proxy pool below threshold; continuing with limited batch "
@@ -190,6 +204,28 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_image_account_probe(stop_event: Event) -> Thread:
+    """Continuously refresh image-account readiness outside user requests."""
+    def worker() -> None:
+        if stop_event.wait(15.0):
+            return
+        while not stop_event.is_set():
+            try:
+                if config.image_account_probe_enabled:
+                    result = account_service.probe_image_candidates(config.image_account_probe_batch_size)
+                    print(
+                        "[image-account-probe] "
+                        f"checked={result['checked']} healthy={result['healthy']} failures={len(result['failures'])}"
+                    )
+            except Exception as exc:
+                print(f"[image-account-probe] fail {exc}")
+            stop_event.wait(config.image_account_probe_interval_secs)
+
+    thread = Thread(target=worker, name="image-account-probe", daemon=True)
     thread.start()
     return thread
 

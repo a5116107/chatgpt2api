@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.log import logger
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -98,6 +100,10 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
         item["duration_ms"] = task.get("duration_ms")
+    if task.get("stage_metrics"):
+        item["stage_metrics"] = task.get("stage_metrics")
+    if task.get("account_hash"):
+        item["account_hash"] = task.get("account_hash")
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
         if task.get("status") == TASK_STATUS_RUNNING:
             # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
@@ -138,13 +144,16 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        heartbeat_interval_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.heartbeat_interval_getter = heartbeat_interval_getter or (lambda: config.image_heartbeat_interval_secs)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -260,6 +269,7 @@ class ImageTaskService:
                 "updated_at": now,
                 "created_ts": time.time(),
                 "last_heartbeat_ts": time.time(),
+                "stage_metrics": {},
             }
             self._tasks[key] = task
             self._save_locked()
@@ -285,20 +295,85 @@ class ImageTaskService:
         model: str,
     ) -> None:
         started = time.time()
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        started_monotonic = time.monotonic()
+        deadline_monotonic = started_monotonic + config.image_request_deadline_secs
+        deadline_ts = started + config.image_request_deadline_secs
+        lease_id = uuid.uuid4().hex
+        stop_heartbeat = threading.Event()
+        if not self._transition_task(
+            key,
+            expected_statuses={TASK_STATUS_QUEUED},
+            status=TASK_STATUS_RUNNING,
+            error="",
+            started_ts=started,
+            last_heartbeat_ts=started,
+            deadline_ts=deadline_ts,
+            lease_expires_ts=deadline_ts + max(5.0, config.image_heartbeat_interval_secs),
+            lease_id=lease_id,
+        ):
+            return
         task_id = key.rsplit(":", 1)[-1]
         owner_id = key.split(":", 1)[0]
+        with self._lock:
+            self._cancel_events[key] = stop_heartbeat
         _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress="running")
-        # 创建进度回调，每个步骤完成后更新任务状态
+        previous_stage_at = started_monotonic
+        stage_metrics: dict[str, dict[str, int]] = {}
+
+        def heartbeat_worker() -> None:
+            try:
+                interval = max(0.05, float(self.heartbeat_interval_getter()))
+            except Exception:
+                interval = 10.0
+            while not stop_heartbeat.wait(interval):
+                if not self._heartbeat_task(key, lease_id):
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_worker,
+            name=f"image-heartbeat-{task_id[:16]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
         def progress_callback(step: str) -> None:
+            nonlocal previous_stage_at
             now = time.time()
-            updates: dict[str, Any] = {"progress": step, "last_heartbeat_ts": now}
-            if step == "image_stream_resolve_start":
-                updates["started_ts"] = now
-            self._update_task(key, **updates)
-            _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress=step)
-        # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+            if step == "__heartbeat__":
+                self._heartbeat_task(key, lease_id)
+                return
+            now_monotonic = time.monotonic()
+            stage_metrics[step] = {
+                "elapsed_ms": int((now_monotonic - started_monotonic) * 1000),
+                "stage_ms": int((now_monotonic - previous_stage_at) * 1000),
+            }
+            previous_stage_at = now_monotonic
+            updates: dict[str, Any] = {
+                "progress": step,
+                "last_heartbeat_ts": now,
+                "stage_metrics": dict(stage_metrics),
+            }
+            if self._transition_task(
+                key,
+                expected_statuses={TASK_STATUS_RUNNING},
+                expected_lease_id=lease_id,
+                **updates,
+            ):
+                _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress=step)
+                logger.info({
+                    "event": "image_task_stage",
+                    "task_id": task_id,
+                    "stage": step,
+                    **stage_metrics[step],
+                })
+
+        payload_with_progress = {
+            **payload,
+            "progress_callback": progress_callback,
+            "_request_id": task_id,
+            "_request_started_monotonic": started_monotonic,
+            "_request_deadline_monotonic": deadline_monotonic,
+        }
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -306,6 +381,7 @@ class ImageTaskService:
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
+            account_hash = _clean(result.get("_account_hash") or result.get("account_hash"))
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
                 if upstream:
@@ -318,7 +394,19 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            if not self._transition_task(
+                key,
+                expected_statuses={TASK_STATUS_RUNNING},
+                expected_lease_id=lease_id,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+                account_hash=account_hash,
+                stage_metrics=dict(stage_metrics),
+            ):
+                return
             _sync_unified_task(task_id, status=TASK_STATUS_SUCCESS, mode=mode, owner_id=owner_id, progress="succeeded", duration_ms=duration_ms)
             self._log_call(
                 identity,
@@ -335,9 +423,18 @@ class ImageTaskService:
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
-                              duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+            if not self._transition_task(
+                key,
+                expected_statuses={TASK_STATUS_RUNNING},
+                expected_lease_id=lease_id,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                stage_metrics=dict(stage_metrics),
+                **({"conversation_id": conversation_id} if conversation_id else {}),
+            ):
+                return
             _sync_unified_task(task_id, status=TASK_STATUS_ERROR, mode=mode, owner_id=owner_id, progress="failed", error=error_message, duration_ms=duration_ms)
             self._log_call(
                 identity,
@@ -350,6 +447,11 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=1.0)
+            with self._lock:
+                self._cancel_events.pop(key, None)
 
     def _log_call(
         self,
@@ -390,6 +492,50 @@ class ImageTaskService:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
             pass
+
+    def _transition_task(
+        self,
+        key: str,
+        *,
+        expected_statuses: set[str],
+        expected_lease_id: str | None = None,
+        **updates: Any,
+    ) -> bool:
+        """Compare-and-set task mutation used by workers and terminal transitions."""
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or task.get("status") not in expected_statuses:
+                return False
+            if expected_lease_id is not None and task.get("lease_id") != expected_lease_id:
+                return False
+            task.update(updates)
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = time.time()
+            self._save_locked()
+            return True
+
+    def _heartbeat_task(self, key: str, lease_id: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(key)
+            if (
+                task is None
+                or task.get("status") != TASK_STATUS_RUNNING
+                or task.get("lease_id") != lease_id
+            ):
+                return False
+            now = time.time()
+            deadline_ts = float(task.get("deadline_ts") or now)
+            if now >= deadline_ts:
+                return False
+            task["last_heartbeat_ts"] = now
+            task["lease_expires_ts"] = min(
+                deadline_ts + max(5.0, config.image_heartbeat_interval_secs),
+                now + max(15.0, config.image_heartbeat_interval_secs * 2.0),
+            )
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = now
+            self._save_locked()
+            return True
 
     def _update_task(self, key: str, **updates: Any) -> None:
         with self._lock:
@@ -436,6 +582,13 @@ class ImageTaskService:
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
                 "last_heartbeat_ts": item.get("last_heartbeat_ts"),
+                "lease_id": _clean(item.get("lease_id")),
+                "lease_expires_ts": item.get("lease_expires_ts"),
+                "deadline_ts": item.get("deadline_ts"),
+                "progress": item.get("progress"),
+                "stage_metrics": item.get("stage_metrics") if isinstance(item.get("stage_metrics"), dict) else {},
+                "account_hash": _clean(item.get("account_hash")),
+                "conversation_id": _clean(item.get("conversation_id")),
                 "duration_ms": item.get("duration_ms"),
             }
             data = item.get("data")
@@ -479,16 +632,25 @@ class ImageTaskService:
                 heartbeat = float(heartbeat)
             except Exception:
                 heartbeat = 0.0
-            if heartbeat and now - heartbeat <= stale_after:
+            try:
+                lease_expires = float(task.get("lease_expires_ts") or 0.0)
+            except Exception:
+                lease_expires = 0.0
+            lease_expired = bool(lease_expires and now > lease_expires)
+            heartbeat_stale = not heartbeat or now - heartbeat > stale_after
+            if not lease_expired and not heartbeat_stale:
                 continue
             task["status"] = TASK_STATUS_ERROR
             task["error"] = (
-                f"图片任务超过 {int(stale_after)} 秒没有进度心跳，已自动收口。"
-                "这通常是后台 worker 被重启、中断或上游连接卡住导致。"
+                "图片任务 worker 租约已过期，任务已按终态收口。"
+                "后台迟到结果将被 CAS 拒绝，避免覆盖该终态。"
             )
             task["updated_at"] = _now_iso()
             task["updated_ts"] = now
             task["duration_ms"] = int(max(0.0, now - float(task.get("created_ts") or now)) * 1000)
+            cancel_event = self._cancel_events.get(_task_key(_clean(task.get("owner_id")), _clean(task.get("id"))))
+            if cancel_event is not None:
+                cancel_event.set()
             changed = True
         return changed
 
@@ -581,11 +743,6 @@ class ImageTaskService:
                 ]
             finally:
                 backend.close()
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了

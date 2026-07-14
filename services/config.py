@@ -518,21 +518,98 @@ class ConfigStore:
             return 120
 
     @property
+    def image_request_deadline_secs(self) -> float:
+        """Hard wall-clock budget for one image request, including retries and download."""
+        try:
+            return max(15.0, float(self.data.get("image_request_deadline_secs", 90.0)))
+        except (TypeError, ValueError):
+            return 90.0
+
+    @property
+    def image_sse_idle_timeout_secs(self) -> float:
+        try:
+            return max(5.0, float(self.data.get("image_sse_idle_timeout_secs", 20.0)))
+        except (TypeError, ValueError):
+            return 20.0
+
+    @property
+    def image_stream_close_timeout_secs(self) -> float:
+        """Maximum wait per stream cleanup thread after an image result is available."""
+        try:
+            return min(5.0, max(0.05, float(self.data.get("image_stream_close_timeout_secs", 0.5))))
+        except (TypeError, ValueError):
+            return 0.5
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
-            return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
+            return max(0.5, float(self.data.get("image_poll_interval_secs", 2.0)))
+        except (TypeError, ValueError):
+            return 2.0
+
+    @property
+    def image_poll_initial_wait_secs(self) -> float:
+        """Short commit grace before the first conversation poll."""
+        try:
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 2.5)))
+        except (TypeError, ValueError):
+            return 2.5
+
+    @property
+    def image_poll_fast_window_secs(self) -> float:
+        try:
+            return max(0.0, float(self.data.get("image_poll_fast_window_secs", 30.0)))
+        except (TypeError, ValueError):
+            return 30.0
+
+    @property
+    def image_poll_slow_interval_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_poll_slow_interval_secs", 5.0)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    @property
+    def image_tasks_check_every(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_tasks_check_every", 4)))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
+    def image_tasks_timeout_secs(self) -> float:
+        try:
+            return max(0.5, float(self.data.get("image_tasks_timeout_secs", 2.0)))
+        except (TypeError, ValueError):
+            return 2.0
+
+    @property
+    def image_heartbeat_interval_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_heartbeat_interval_secs", 10.0)))
         except (TypeError, ValueError):
             return 10.0
 
     @property
-    def image_poll_initial_wait_secs(self) -> float:
-        """Image generation upstream takes ~30s; polling immediately wastes requests
-        and trips a transient 429. Default 10s gives the conversation document time
-        to commit before the first poll."""
+    def image_account_probe_enabled(self) -> bool:
+        value = self.data.get("image_account_probe_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_account_probe_interval_secs(self) -> float:
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 10.0)))
+            return max(60.0, float(self.data.get("image_account_probe_interval_secs", 300.0)))
         except (TypeError, ValueError):
-            return 10.0
+            return 300.0
+
+    @property
+    def image_account_probe_batch_size(self) -> int:
+        try:
+            return max(1, min(20, int(self.data.get("image_account_probe_batch_size", 3))))
+        except (TypeError, ValueError):
+            return 3
 
     @property
     def image_account_concurrency(self) -> int:
@@ -662,8 +739,19 @@ class ConfigStore:
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_request_deadline_secs"] = self.image_request_deadline_secs
+        data["image_sse_idle_timeout_secs"] = self.image_sse_idle_timeout_secs
+        data["image_stream_close_timeout_secs"] = self.image_stream_close_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
+        data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs
+        data["image_tasks_check_every"] = self.image_tasks_check_every
+        data["image_tasks_timeout_secs"] = self.image_tasks_timeout_secs
+        data["image_heartbeat_interval_secs"] = self.image_heartbeat_interval_secs
+        data["image_account_probe_enabled"] = self.image_account_probe_enabled
+        data["image_account_probe_interval_secs"] = self.image_account_probe_interval_secs
+        data["image_account_probe_batch_size"] = self.image_account_probe_batch_size
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts

@@ -16,6 +16,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    anonymize_token,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -386,6 +387,9 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    request_id: str = ""
+    started_monotonic: float = field(default_factory=time.monotonic)
+    deadline_monotonic: float | None = None
 
 
 @dataclass
@@ -411,8 +415,8 @@ class ImageOutput:
     upstream_event_type: str = ""
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
+    account_hash: str = ""
     conversation_id: str = ""
-
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
             "object": "image.generation.chunk",
@@ -426,6 +430,8 @@ class ImageOutput:
         }
         if self.account_email:
             chunk["_account_email"] = self.account_email
+        if self.account_hash:
+            chunk["_account_hash"] = self.account_hash
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
         if self.kind == "message":
@@ -443,6 +449,23 @@ class ImageOutput:
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
         return chunk
+
+
+def _image_request_remaining(request: ConversationRequest) -> float:
+    if request.deadline_monotonic is None:
+        request.deadline_monotonic = request.started_monotonic + config.image_request_deadline_secs
+    return max(0.0, request.deadline_monotonic - time.monotonic())
+
+
+def _sleep_with_image_deadline(request: ConversationRequest, seconds: float) -> None:
+    remaining = _image_request_remaining(request)
+    if remaining <= 0:
+        raise ImagePollTimeoutError("image request deadline exceeded")
+    sleep_for = min(max(0.0, seconds), remaining)
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+    if sleep_for < seconds or _image_request_remaining(request) <= 0:
+        raise ImagePollTimeoutError("image request deadline exceeded")
 
 
 def assistant_message_text(message: dict[str, Any]) -> str:
@@ -929,6 +952,9 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    if request.deadline_monotonic is None:
+        request.deadline_monotonic = request.started_monotonic + config.image_request_deadline_secs
+    backend.set_image_request_context(request.request_id, request.deadline_monotonic)
     last: dict[str, Any] = {}
     for event in conversation_events(
             backend,
@@ -1025,8 +1051,13 @@ def stream_image_outputs(
     # （如 {"size":"1792x1024","n":1}）标记为 is_error，而实际上图片正在异步生成中。
     # 此时应继续轮询图片。
     detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
+    if last.get("blocked") and not file_ids and not sediment_ids and conversation_id:
+        detailed_error = _get_detailed_error_from_tasks(
+            backend,
+            conversation_id,
+            timeout_secs=min(config.image_tasks_timeout_secs, max(0.5, request.deadline_monotonic - time.monotonic())),
+            wait_secs=0.0,
+        )
         if detailed_error and not should_poll_for_image and not is_text_reply:
             logger.info({
                 "event": "image_task_error_before_poll",
@@ -1045,15 +1076,10 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
-    if is_text_reply and conversation_id:
-        # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
-        logger.info({
-            "event": "image_text_reply_extended_poll",
-            "conversation_id": conversation_id,
-            "poll_timeout_secs": poll_timeout,
-        })
+    poll_timeout = min(
+        float(config.image_poll_timeout_secs),
+        max(0.1, request.deadline_monotonic - time.monotonic()),
+    )
 
     try:
         image_urls = backend.resolve_conversation_image_urls(
@@ -1172,7 +1198,7 @@ def stream_image_outputs(
                             "poll_attempt": poll_attempt,
                             "backoff_secs": backoff,
                         })
-                        time.sleep(backoff)
+                        _sleep_with_image_deadline(request, backoff)
                         continue
                     # 超时错误或重试次数用尽，停止重试
                     break
@@ -1247,7 +1273,7 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            time.sleep(retry_wait_secs)
+            _sleep_with_image_deadline(request, retry_wait_secs)
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,
@@ -1284,7 +1310,7 @@ def stream_image_outputs(
                         "poll_attempt": poll_attempt,
                         "backoff_secs": backoff,
                     })
-                    time.sleep(backoff)
+                    _sleep_with_image_deadline(request, backoff)
                     continue
                 # 超时错误或重试次数用尽，停止重试
                 break
@@ -1404,8 +1430,13 @@ def _generate_single_image(
     emitted_for_token = False
     returned_message = False
     returned_result = False
+    if request.deadline_monotonic is None:
+        request.deadline_monotonic = request.started_monotonic + config.image_request_deadline_secs
 
     while True:
+        if _image_request_remaining(request) <= 0:
+            raise ImagePollTimeoutError("image request deadline exceeded")
+        attempt_started = time.monotonic()
         try:
             # reset per attempt so previous progress/message state cannot poison tls_transient
             emitted_for_token = False
@@ -1443,9 +1474,11 @@ def _generate_single_image(
 
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        account_hash = anonymize_token(token)
         logger.debug({
             "event": "image_account_lookup",
-            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
+            "request_id": request.request_id,
+            "account_hash": account_hash,
             "account_email": account_email,
             "account_found": bool(account),
             "index": index,
@@ -1454,6 +1487,7 @@ def _generate_single_image(
         slot_settled = False
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend.set_image_request_context(request.request_id, request.deadline_monotonic)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1461,6 +1495,8 @@ def _generate_single_image(
             for output in stream_fn(backend, request, index, total):
                 if account_email and not output.account_email:
                     output.account_email = account_email
+                if not output.account_hash:
+                    output.account_hash = account_hash
                 if output.kind == "message" and request.message_as_error:
                     raise ImageGenerationError(
                         output.text or "Image generation was rejected by upstream policy.",
@@ -1477,10 +1513,12 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False); slot_settled = True
+                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                slot_settled = True
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False); slot_settled = True
+                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                slot_settled = True
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1492,11 +1530,13 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
-            account_service.mark_image_result(token, True); slot_settled = True
+            account_service.mark_image_result(token, True, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            slot_settled = True
             _record_runtime_success(backend)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False); slot_settled = True
+            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            slot_settled = True
             _record_runtime_risk(backend, str(exc), status_code=_exception_status_code(exc), code="image_poll_timeout", scope="account", raw={"phase": "image_stream", "index": index})
             if account_email:
                 setattr(exc, "account_email", account_email)
@@ -1523,7 +1563,8 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False); slot_settled = True
+            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            slot_settled = True
             _record_runtime_risk(backend, str(exc), status_code=400, code="policy_rejected", scope="request", raw={"phase": "image_stream", "index": index})
             logger.warning({
                 "event": "image_stream_content_policy_error",
@@ -1561,7 +1602,7 @@ def _generate_single_image(
                             "error": error_text[:200],
                             "via": "ImageGenerationError",
                         })
-                        time.sleep(min(2.0 * tls_retry_count, 10.0))
+                        _sleep_with_image_deadline(request, min(2.0 * tls_retry_count, 10.0))
                         continue
                 if is_connection_timeout_error(error_text):
                     conn_timeout_retry_count += 1
@@ -1577,7 +1618,7 @@ def _generate_single_image(
                             "error": error_text[:200],
                             "via": "ImageGenerationError",
                         })
-                        time.sleep(wait_secs)
+                        _sleep_with_image_deadline(request, wait_secs)
                         continue
                 if is_chat_requirements_transient_error(error_text):
                     requirements_rotate_count += 1
@@ -1593,9 +1634,10 @@ def _generate_single_image(
                         "via": "ImageGenerationError",
                     })
                     if requirements_rotate_count <= MAX_REQUIREMENTS_ROTATES:
-                        time.sleep(min(1.0 * requirements_rotate_count, 3.0))
+                        _sleep_with_image_deadline(request, min(1.0 * requirements_rotate_count, 3.0))
                         continue
-            account_service.mark_image_result(token, False); slot_settled = True
+            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            slot_settled = True
             _record_runtime_risk(backend, str(exc), status_code=_exception_status_code(exc), raw={"phase": "image_stream", "index": index, "kind": "image_generation_error"})
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
@@ -1649,7 +1691,8 @@ def _generate_single_image(
             tls_transient = (not returned_result) and tls_hit
             conn_timeout = (not returned_result) and timeout_hit
             if not (requirements_transient or tls_transient or conn_timeout):
-                account_service.mark_image_result(token, False); slot_settled = True
+                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                slot_settled = True
                 _record_runtime_risk(backend, last_error, status_code=_exception_status_code(exc), raw={"phase": "image_stream", "index": index, "kind": "exception"})
             else:
                 # 仅释放槽位，不记 fail/不写 runtime risk 到账号
@@ -1719,7 +1762,7 @@ def _generate_single_image(
                         "index": index,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    _sleep_with_image_deadline(request, min(2.0 * tls_retry_count, 10.0))
                     continue
             # sentinel/chat-requirements 空包/非 JSON（代理抖动）：换号继续，不把整次请求直接打死
             if requirements_transient:
@@ -1736,7 +1779,7 @@ def _generate_single_image(
                     "error": last_error[:240],
                 })
                 if requirements_rotate_count <= MAX_REQUIREMENTS_ROTATES:
-                    time.sleep(min(1.0 * requirements_rotate_count, 3.0))
+                    _sleep_with_image_deadline(request, min(1.0 * requirements_rotate_count, 3.0))
                     continue
                 raise ImageGenerationError(
                     "chat requirements unstable via proxy; retry later",
@@ -1759,7 +1802,7 @@ def _generate_single_image(
                         "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
+                    _sleep_with_image_deadline(request, wait_secs)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
@@ -1873,10 +1916,13 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    account_hash = ""
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.account_hash and not account_hash:
+            account_hash = output.account_hash
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1891,4 +1937,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if account_hash:
+        result["_account_hash"] = account_hash
     return result
