@@ -610,6 +610,14 @@ class ConfigStore:
             return 10.0
 
     @property
+    def image_invalid_token_rotate_limit(self) -> int:
+        """Maximum revoked image accounts skipped before failing one request."""
+        try:
+            return min(64, max(1, int(self.data.get("image_invalid_token_rotate_limit", 24))))
+        except (TypeError, ValueError):
+            return 24
+
+    @property
     def image_poll_progress_persist_interval_secs(self) -> float:
         """Minimum interval between durable polling-progress updates."""
         try:
@@ -835,6 +843,7 @@ class ConfigStore:
         data["image_poll_rate_limit_failover_threshold"] = self.image_poll_rate_limit_failover_threshold
         data["image_poll_rate_limit_retry_delay_secs"] = self.image_poll_rate_limit_retry_delay_secs
         data["image_poll_rate_limit_failover_min_elapsed_secs"] = self.image_poll_rate_limit_failover_min_elapsed_secs
+        data["image_invalid_token_rotate_limit"] = self.image_invalid_token_rotate_limit
         data["image_poll_progress_persist_interval_secs"] = self.image_poll_progress_persist_interval_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs

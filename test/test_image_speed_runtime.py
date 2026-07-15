@@ -80,6 +80,7 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_poll_rate_limit_failover_threshold, 2)
             self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 1.0)
             self.assertEqual(config.image_poll_rate_limit_failover_min_elapsed_secs, 10.0)
+            self.assertEqual(config.image_invalid_token_rotate_limit, 24)
             self.assertEqual(config.image_poll_progress_persist_interval_secs, 2.0)
             self.assertEqual(config.image_png_compress_level, 1)
 
@@ -96,13 +97,16 @@ class ImagePollingTests(unittest.TestCase):
             "image_poll_rate_limit_failover_threshold": 99,
             "image_poll_rate_limit_retry_delay_secs": 99,
             "image_poll_rate_limit_failover_min_elapsed_secs": 99,
+            "image_invalid_token_rotate_limit": 99,
         }, clear=True):
             self.assertEqual(config.image_poll_rate_limit_failover_threshold, 10)
             self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 10.0)
             self.assertEqual(config.image_poll_rate_limit_failover_min_elapsed_secs, 60.0)
+            self.assertEqual(config.image_invalid_token_rotate_limit, 64)
             self.assertEqual(config.get()["image_poll_rate_limit_failover_threshold"], 10)
             self.assertEqual(config.get()["image_poll_rate_limit_retry_delay_secs"], 10.0)
             self.assertEqual(config.get()["image_poll_rate_limit_failover_min_elapsed_secs"], 60.0)
+            self.assertEqual(config.get()["image_invalid_token_rotate_limit"], 64)
 
     def test_transient_conversation_404_is_retried_without_aborting_polling(self) -> None:
         backend = self.backend()
@@ -484,6 +488,70 @@ class ImageRaceTests(unittest.TestCase):
 
 
 class ImageAccountFailoverTests(unittest.TestCase):
+    def test_revoked_tokens_continue_to_a_healthy_account_within_configured_limit(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            response_format="url",
+            started_monotonic=started,
+            deadline_monotonic=started + 120.0,
+        )
+        revoked = [f"token-{index}" for index in range(1, 9)]
+        candidates = [*revoked, "token-healthy"]
+        removed: list[str] = []
+
+        def select_token(**kwargs) -> str:
+            excluded = set(kwargs.get("excluded_tokens") or set())
+            return next(token for token in candidates if token not in excluded)
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, *_args) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def stream(backend, _attempt_request, _index, _total):
+            if backend.access_token in revoked:
+                raise RuntimeError("Encountered invalidated oauth token for user")
+            yield conversation_module.ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                data=[{"url": "https://example.test/image.png"}],
+            )
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", side_effect=select_token),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                side_effect=lambda token: {"access_token": token, "email": f"{token}@example.test", "type": "free"},
+            ),
+            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(
+                conversation_module.account_service,
+                "remove_invalid_token",
+                side_effect=lambda token, _event: removed.append(token),
+            ),
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=stream),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+            mock.patch.object(conversation_module, "_record_runtime_success"),
+            mock.patch.dict(config.data, {"image_invalid_token_rotate_limit": 8}),
+        ):
+            outputs = conversation_module._generate_single_image(request, 1, 1)
+
+        self.assertEqual(outputs[-1].kind, "result")
+        self.assertEqual(removed, revoked)
+
     def test_poll_timeout_excludes_account_and_uses_per_attempt_deadline(self) -> None:
         started = time.monotonic()
         request = conversation_module.ConversationRequest(
