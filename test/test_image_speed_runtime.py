@@ -79,6 +79,7 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_poll_request_timeout_secs, 2.0)
             self.assertEqual(config.image_poll_rate_limit_failover_threshold, 2)
             self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 1.0)
+            self.assertEqual(config.image_poll_rate_limit_failover_min_elapsed_secs, 10.0)
             self.assertEqual(config.image_poll_progress_persist_interval_secs, 2.0)
             self.assertEqual(config.image_png_compress_level, 1)
 
@@ -94,11 +95,14 @@ class ImagePollingTests(unittest.TestCase):
         with mock.patch.dict(config.data, {
             "image_poll_rate_limit_failover_threshold": 99,
             "image_poll_rate_limit_retry_delay_secs": 99,
+            "image_poll_rate_limit_failover_min_elapsed_secs": 99,
         }, clear=True):
             self.assertEqual(config.image_poll_rate_limit_failover_threshold, 10)
             self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 10.0)
+            self.assertEqual(config.image_poll_rate_limit_failover_min_elapsed_secs, 60.0)
             self.assertEqual(config.get()["image_poll_rate_limit_failover_threshold"], 10)
             self.assertEqual(config.get()["image_poll_rate_limit_retry_delay_secs"], 10.0)
+            self.assertEqual(config.get()["image_poll_rate_limit_failover_min_elapsed_secs"], 60.0)
 
     def test_transient_conversation_404_is_retried_without_aborting_polling(self) -> None:
         backend = self.backend()
@@ -133,6 +137,7 @@ class ImagePollingTests(unittest.TestCase):
             mock.patch.dict(config.data, {
                 "image_poll_rate_limit_failover_threshold": 2,
                 "image_poll_rate_limit_retry_delay_secs": 0.25,
+                "image_poll_rate_limit_failover_min_elapsed_secs": 0,
             }),
         ):
             file_ids, _ = backend._poll_image_results(
@@ -157,6 +162,7 @@ class ImagePollingTests(unittest.TestCase):
             mock.patch.dict(config.data, {
                 "image_poll_rate_limit_failover_threshold": 2,
                 "image_poll_rate_limit_retry_delay_secs": 0.25,
+                "image_poll_rate_limit_failover_min_elapsed_secs": 0,
             }),
         ):
             with self.assertRaises(ImagePollRateLimitError) as raised:
@@ -406,6 +412,12 @@ class PollBackend:
         self.closed = True
 
 
+class RateLimitedPollBackend(PollBackend):
+    def _poll_image_results(self, *_args, **_kwargs):
+        time.sleep(0.02)
+        raise ImagePollRateLimitError("switch account after repeated 429 responses")
+
+
 class ImageRaceTests(unittest.TestCase):
     def test_poll_wins_stalled_sse_and_reader_is_released(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
@@ -429,6 +441,25 @@ class ImageRaceTests(unittest.TestCase):
         self.assertIn("conversation_ready", stages)
         self.assertIn("result_pointer_ready", stages)
         self.assertFalse(any(t.name == "image-sse-reader-race-test" for t in threading.enumerate()))
+
+    def test_rate_limit_failover_aborts_stalled_sse_immediately(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.image_request_id = "rate-limit-race-test"
+        backend.image_deadline_monotonic = time.monotonic() + 2
+        backend.progress_callback = None
+        poll_backend = RateLimitedPollBackend()
+        backend._clone_for_image_poll = mock.Mock(return_value=poll_backend)
+        response = BlockingResponse()
+
+        started = time.monotonic()
+        with self.assertRaises(ImagePollRateLimitError):
+            list(backend._iter_image_sse_race(response))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(response.closed.is_set())
+        self.assertTrue(poll_backend.closed)
+        self.assertFalse(any(t.name == "image-sse-reader-rate-limit-race-test" for t in threading.enumerate()))
 
     def test_slow_response_close_does_not_delay_a_poll_winner(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)

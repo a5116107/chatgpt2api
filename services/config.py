@@ -599,6 +599,17 @@ class ConfigStore:
             return 1.0
 
     @property
+    def image_poll_rate_limit_failover_min_elapsed_secs(self) -> float:
+        """Minimum poll age before repeated 429s may abandon a still-viable SSE stream."""
+        try:
+            return min(
+                60.0,
+                max(0.0, float(self.data.get("image_poll_rate_limit_failover_min_elapsed_secs", 10.0))),
+            )
+        except (TypeError, ValueError):
+            return 10.0
+
+    @property
     def image_poll_progress_persist_interval_secs(self) -> float:
         """Minimum interval between durable polling-progress updates."""
         try:
@@ -811,6 +822,7 @@ class ConfigStore:
         data["image_poll_request_timeout_secs"] = self.image_poll_request_timeout_secs
         data["image_poll_rate_limit_failover_threshold"] = self.image_poll_rate_limit_failover_threshold
         data["image_poll_rate_limit_retry_delay_secs"] = self.image_poll_rate_limit_retry_delay_secs
+        data["image_poll_rate_limit_failover_min_elapsed_secs"] = self.image_poll_rate_limit_failover_min_elapsed_secs
         data["image_poll_progress_persist_interval_secs"] = self.image_poll_progress_persist_interval_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs

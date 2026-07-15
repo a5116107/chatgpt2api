@@ -52,6 +52,7 @@
   "image_poll_request_timeout_secs": 2.0,
   "image_poll_rate_limit_failover_threshold": 2,
   "image_poll_rate_limit_retry_delay_secs": 1.0,
+  "image_poll_rate_limit_failover_min_elapsed_secs": 10.0,
   "image_poll_progress_persist_interval_secs": 2.0,
   "image_png_compress_level": 1,
   "image_storage": {

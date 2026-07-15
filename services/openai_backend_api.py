@@ -2238,6 +2238,7 @@ class OpenAIBackendAPI:
         request_timeout = float(config.image_poll_request_timeout_secs)
         rate_limit_threshold = int(config.image_poll_rate_limit_failover_threshold)
         rate_limit_retry_delay = float(config.image_poll_rate_limit_retry_delay_secs)
+        rate_limit_failover_min_elapsed = float(config.image_poll_rate_limit_failover_min_elapsed_secs)
         rate_limit_streak = 0
         file_ids: list[str] = []
         sediment_ids: list[str] = []
@@ -2318,7 +2319,12 @@ class OpenAIBackendAPI:
                 if exc.status_code in (404, 429, 500, 502, 503, 504):
                     if exc.status_code == 429:
                         rate_limit_streak += 1
-                        if self.image_rate_limit_failover_enabled and rate_limit_streak >= rate_limit_threshold:
+                        poll_elapsed = time.monotonic() - start
+                        if (
+                            self.image_rate_limit_failover_enabled
+                            and rate_limit_streak >= rate_limit_threshold
+                            and poll_elapsed >= rate_limit_failover_min_elapsed
+                        ):
                             logger.warning({
                                 "event": "image_poll_rate_limit_failover",
                                 "request_id": self.image_request_id,
@@ -2326,6 +2332,8 @@ class OpenAIBackendAPI:
                                 "attempt": attempt,
                                 "consecutive_429s": rate_limit_streak,
                                 "threshold": rate_limit_threshold,
+                                "elapsed_secs": round(poll_elapsed, 3),
+                                "minimum_elapsed_secs": rate_limit_failover_min_elapsed,
                             })
                             error = ImagePollRateLimitError(
                                 f"image polling received {rate_limit_streak} consecutive 429 responses"
@@ -2984,7 +2992,15 @@ class OpenAIBackendAPI:
                     yield "[DONE]"
                     return
                 if poll_kind == "error":
-                    if isinstance(poll_value, ImageContentPolicyError):
+                    if isinstance(poll_value, (ImageContentPolicyError, ImagePollRateLimitError)):
+                        logger.warning({
+                            "event": "image_result_race_aborted",
+                            "request_id": self.image_request_id,
+                            "conversation_id": conversation_id,
+                            "reason": "rate_limit_failover"
+                            if isinstance(poll_value, ImagePollRateLimitError)
+                            else "content_policy",
+                        })
                         raise poll_value
                     sse_error = poll_value
 
