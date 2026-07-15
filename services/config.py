@@ -657,6 +657,18 @@ class ConfigStore:
             return 1
 
     @property
+    def image_fetch_direct_hosts(self) -> list[str]:
+        """Exact image URL hosts that bypass the upstream proxy, for example the app's own CDN."""
+        raw = self.data.get("image_fetch_direct_hosts", [])
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        hosts: list[str] = []
+        for value in values:
+            host = str(value or "").strip().lower().rstrip(".")
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    @property
     def image_heartbeat_interval_secs(self) -> float:
         try:
             return max(1.0, float(self.data.get("image_heartbeat_interval_secs", 10.0)))
@@ -829,6 +841,7 @@ class ConfigStore:
         data["image_tasks_check_every"] = self.image_tasks_check_every
         data["image_tasks_timeout_secs"] = self.image_tasks_timeout_secs
         data["image_png_compress_level"] = self.image_png_compress_level
+        data["image_fetch_direct_hosts"] = self.image_fetch_direct_hosts
         data["image_heartbeat_interval_secs"] = self.image_heartbeat_interval_secs
         data["image_account_probe_enabled"] = self.image_account_probe_enabled
         data["image_account_probe_interval_secs"] = self.image_account_probe_interval_secs

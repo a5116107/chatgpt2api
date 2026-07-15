@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from services.config import config
 from services.proxy_service import proxy_settings
 
 ImageInput = tuple[bytes, str, str]
@@ -263,13 +264,19 @@ def _download_image_url(url: str) -> ImageInput:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    hostname = str(parsed.hostname or "").strip().lower().rstrip(".")
+    session_kwargs = (
+        {}
+        if hostname and hostname in set(config.image_fetch_direct_hosts)
+        else proxy_settings.build_session_kwargs()
+    )
     try:
         response = requests.get(
             source,
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
             allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
+            **session_kwargs,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc

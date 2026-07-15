@@ -55,6 +55,7 @@
   "image_poll_rate_limit_failover_min_elapsed_secs": 10.0,
   "image_poll_progress_persist_interval_secs": 2.0,
   "image_png_compress_level": 1,
+  "image_fetch_direct_hosts": [],
   "image_storage": {
     "enabled": false,
     "mode": "local",

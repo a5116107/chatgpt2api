@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+import api.image_inputs as image_inputs_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -66,6 +67,54 @@ class ImagesEditsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("file_id image references are not supported", response.text)
         self.assertEqual(self.handle_calls, [])
+
+    def test_image_url_fetch_bypasses_proxy_for_configured_direct_host(self):
+        response = mock.Mock(
+            status_code=200,
+            content=PNG_BYTES,
+            headers={"content-type": "image/png", "content-length": str(len(PNG_BYTES))},
+        )
+
+        with (
+            mock.patch.dict(
+                image_inputs_module.config.data,
+                {"image_fetch_direct_hosts": ["api.example.test"]},
+            ),
+            mock.patch.object(
+                image_inputs_module.proxy_settings,
+                "build_session_kwargs",
+                side_effect=AssertionError("direct image host must not use the upstream proxy"),
+            ),
+            mock.patch.object(image_inputs_module.requests, "get", return_value=response) as fetch,
+        ):
+            image = image_inputs_module._download_image_url("https://api.example.test/images/source.png")
+
+        self.assertEqual(image, (PNG_BYTES, "source.png", "image/png"))
+        self.assertNotIn("proxy", fetch.call_args.kwargs)
+
+    def test_image_url_fetch_keeps_proxy_for_non_direct_host(self):
+        response = mock.Mock(
+            status_code=200,
+            content=PNG_BYTES,
+            headers={"content-type": "image/png", "content-length": str(len(PNG_BYTES))},
+        )
+
+        with (
+            mock.patch.dict(
+                image_inputs_module.config.data,
+                {"image_fetch_direct_hosts": ["api.example.test"]},
+            ),
+            mock.patch.object(
+                image_inputs_module.proxy_settings,
+                "build_session_kwargs",
+                return_value={"proxy": "http://proxy.example.test:8080"},
+            ),
+            mock.patch.object(image_inputs_module.requests, "get", return_value=response) as fetch,
+        ):
+            image = image_inputs_module._download_image_url("https://cdn.example.test/source.png")
+
+        self.assertEqual(image, (PNG_BYTES, "source.png", "image/png"))
+        self.assertEqual(fetch.call_args.kwargs["proxy"], "http://proxy.example.test:8080")
 
 
 if __name__ == "__main__":
