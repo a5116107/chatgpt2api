@@ -71,6 +71,7 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_poll_initial_wait_secs, 0.25)
             self.assertEqual(config.image_poll_interval_secs, 0.5)
             self.assertEqual(config.image_poll_request_timeout_secs, 2.0)
+            self.assertEqual(config.image_poll_progress_persist_interval_secs, 2.0)
             self.assertEqual(config.image_png_compress_level, 1)
 
         with mock.patch.dict(config.data, {
@@ -512,6 +513,71 @@ class ImageTaskLifecycleTests(unittest.TestCase):
             self.assertIn("source_ready", item["stage_metrics"])
             self.assertIn("output_processing", item["stage_metrics"])
             self.assertIn("output_ready", item["stage_metrics"])
+
+    def test_polling_progress_is_compacted_and_hot_path_persistence_is_throttled(self) -> None:
+        def handler(payload: dict) -> dict:
+            payload["progress_callback"]("conversation_ready")
+            for attempt in range(1, 51):
+                payload["progress_callback"](f"polling:{attempt}")
+            return {"data": [{"url": "https://example.test/image.png"}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("services.image_task_service._sync_unified_task") as sync_task:
+                service = ImageTaskService(
+                    Path(directory) / "tasks.json",
+                    generation_handler=handler,
+                    output_handler=lambda item, _size, _base_url: item,
+                    progress_persist_interval_getter=lambda: 30.0,
+                )
+                with mock.patch.object(service, "_save_locked", wraps=service._save_locked) as save_tasks:
+                    service.submit_generation(
+                        {"id": "owner", "name": "owner", "role": "admin"},
+                        client_task_id="task-polling",
+                        prompt="test",
+                        model="gpt-image-2",
+                        size="1024x1024",
+                    )
+                    deadline = time.time() + 2
+                    while time.time() < deadline:
+                        item = service.list_tasks({"id": "owner"}, ["task-polling"])["items"][0]
+                        if item["status"] == TASK_STATUS_SUCCESS:
+                            break
+                        time.sleep(0.01)
+
+        self.assertEqual(item["status"], TASK_STATUS_SUCCESS)
+        self.assertEqual(item["stage_metrics"]["polling"]["attempts"], 50)
+        self.assertFalse(any(key.startswith("polling:") for key in item["stage_metrics"]))
+        polling_syncs = [
+            call for call in sync_task.call_args_list
+            if str(call.kwargs.get("progress") or "").startswith("polling:")
+        ]
+        self.assertEqual(polling_syncs, [])
+        self.assertLess(save_tasks.call_count, 15)
+
+    def test_legacy_polling_metrics_are_compacted_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            path.write_text(json.dumps({"tasks": [{
+                "id": "legacy-task",
+                "owner_id": "owner",
+                "status": TASK_STATUS_SUCCESS,
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "created_at": "2099-01-01 00:00:00",
+                "updated_at": "2099-01-01 00:00:00",
+                "stage_metrics": {
+                    "polling:1": {"elapsed_ms": 100, "stage_ms": 100},
+                    "polling:12": {"elapsed_ms": 1200, "stage_ms": 80},
+                    "output_ready": {"elapsed_ms": 1300, "stage_ms": 100},
+                },
+            }]}), encoding="utf-8")
+
+            service = ImageTaskService(path)
+            item = service.list_tasks({"id": "owner"}, ["legacy-task"])["items"][0]
+
+        self.assertEqual(item["stage_metrics"]["polling"]["attempts"], 12)
+        self.assertEqual(item["stage_metrics"]["polling"]["elapsed_ms"], 1200)
+        self.assertNotIn("polling:1", item["stage_metrics"])
 
     def test_terminal_compare_and_set_rejects_late_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

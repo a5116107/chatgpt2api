@@ -580,6 +580,17 @@ class ConfigStore:
             return 2.0
 
     @property
+    def image_poll_progress_persist_interval_secs(self) -> float:
+        """Minimum interval between durable polling-progress updates."""
+        try:
+            return min(
+                30.0,
+                max(0.5, float(self.data.get("image_poll_progress_persist_interval_secs", 2.0))),
+            )
+        except (TypeError, ValueError):
+            return 2.0
+
+    @property
     def image_poll_fast_window_secs(self) -> float:
         try:
             return max(0.0, float(self.data.get("image_poll_fast_window_secs", 60.0)))
@@ -779,6 +790,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_poll_request_timeout_secs"] = self.image_poll_request_timeout_secs
+        data["image_poll_progress_persist_interval_secs"] = self.image_poll_progress_persist_interval_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs
         data["image_tasks_check_every"] = self.image_tasks_check_every

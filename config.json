@@ -50,6 +50,7 @@
   "image_poll_interval_secs": 0.5,
   "image_poll_initial_wait_secs": 0.25,
   "image_poll_request_timeout_secs": 2.0,
+  "image_poll_progress_persist_interval_secs": 2.0,
   "image_png_compress_level": 1,
   "image_storage": {
     "enabled": false,
