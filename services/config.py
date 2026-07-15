@@ -551,37 +551,37 @@ class ConfigStore:
     def image_poll_initial_wait_secs(self) -> float:
         """Short commit grace before the first conversation poll."""
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 2.5)))
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 1.0)))
         except (TypeError, ValueError):
-            return 2.5
+            return 1.0
 
     @property
     def image_poll_fast_window_secs(self) -> float:
         try:
-            return max(0.0, float(self.data.get("image_poll_fast_window_secs", 30.0)))
+            return max(0.0, float(self.data.get("image_poll_fast_window_secs", 60.0)))
         except (TypeError, ValueError):
-            return 30.0
+            return 60.0
 
     @property
     def image_poll_slow_interval_secs(self) -> float:
         try:
-            return max(1.0, float(self.data.get("image_poll_slow_interval_secs", 5.0)))
+            return max(1.0, float(self.data.get("image_poll_slow_interval_secs", 3.0)))
         except (TypeError, ValueError):
-            return 5.0
+            return 3.0
 
     @property
     def image_tasks_check_every(self) -> int:
         try:
-            return max(1, int(self.data.get("image_tasks_check_every", 4)))
+            return max(1, int(self.data.get("image_tasks_check_every", 6)))
         except (TypeError, ValueError):
-            return 4
+            return 6
 
     @property
     def image_tasks_timeout_secs(self) -> float:
         try:
-            return max(0.5, float(self.data.get("image_tasks_timeout_secs", 2.0)))
+            return max(0.5, float(self.data.get("image_tasks_timeout_secs", 0.75)))
         except (TypeError, ValueError):
-            return 2.0
+            return 0.75
 
     @property
     def image_heartbeat_interval_secs(self) -> float:

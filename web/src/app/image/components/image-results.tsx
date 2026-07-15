@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- generated images use runtime blob and external URLs */
+
 import { useState } from "react";
 import { Clock3, Download, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
@@ -33,23 +35,37 @@ function getStoredImageSrc(image: StoredImage) {
   return image.url || "";
 }
 
-async function downloadStoredImage(image: StoredImage, index: number) {
-  let blob: Blob;
-  if (image.b64_json) {
-    const binary = atob(image.b64_json);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    blob = new Blob([bytes], { type: "image/png" });
-  } else if (image.url) {
-    const res = await fetch(image.url);
-    blob = await res.blob();
-  } else {
+async function downloadStoredImage(image: StoredImage, index: number, original = false) {
+  let blob: Blob | null = null;
+  const selectedUrl = original ? image.originalUrl || image.url : image.url;
+  try {
+    if (image.b64_json && !original) {
+      const binary = atob(image.b64_json);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      blob = new Blob([bytes], { type: "image/png" });
+    } else if (selectedUrl) {
+      const url = selectedUrl.startsWith("http") ? selectedUrl : `${window.location.origin}${selectedUrl}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      blob = await res.blob();
+    }
+  } catch (error) {
+    console.error("Failed to download image:", error);
+    if (selectedUrl) {
+      window.open(selectedUrl, "_blank");
+    }
+    return;
+  }
+  if (!blob) {
     return;
   }
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `image-${index + 1}.png`;
+  a.download = `image-${index + 1}${original ? "-original" : ""}.png`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -119,7 +135,9 @@ export function ImageResults({
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: imageDimensions[image.id],
+                  dimensions: image.width && image.height
+                    ? formatImageDimensions(image.width, image.height)
+                    : imageDimensions[image.id],
                 },
               ]
             : [];
@@ -210,8 +228,19 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensions[image.id];
-                        const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
+                        const dimensions = image.width && image.height
+                          ? formatImageDimensions(image.width, image.height)
+                          : imageDimensions[image.id];
+                        const sourceDimensions = image.sourceWidth && image.sourceHeight
+                          ? formatImageDimensions(image.sourceWidth, image.sourceHeight)
+                          : "";
+                        const transformed = image.outputTransform === "lanczos_upscale";
+                        const imageMeta = [
+                          sizeLabel,
+                          dimensions,
+                          transformed && sourceDimensions ? `源图 ${sourceDimensions}` : "",
+                          transformed ? "LANCZOS 放大" : "原始输出",
+                        ].filter(Boolean).join(" · ");
 
                         return (
                           <div
@@ -257,11 +286,23 @@ export function ImageResults({
                                   size="sm"
                                   className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
                                   onClick={() => void downloadStoredImage(image, index)}
-                                  aria-label="下载"
+                                  aria-label={transformed ? "下载高清图" : "下载图片"}
                                 >
                                   <Download className="size-3 sm:size-4" />
-                                  <span className="hidden sm:inline">下载</span>
+                                  <span className="hidden sm:inline">{transformed ? "高清图" : "下载"}</span>
                                 </Button>
+                                {transformed && image.originalUrl ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
+                                    onClick={() => void downloadStoredImage(image, index, true)}
+                                    aria-label="下载原图"
+                                  >
+                                    <Download className="size-3 sm:size-4" />
+                                    <span className="hidden sm:inline">原图</span>
+                                  </Button>
+                                ) : null}
                               </div>
                             </div>
                           </div>

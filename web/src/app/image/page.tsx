@@ -164,10 +164,11 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
     };
   }
 
-  if (!image.url) {
+  const sourceUrl = image.originalUrl || image.url;
+  if (!sourceUrl) {
     return null;
   }
-  const file = await fetchImageAsFile(image.url, fileName);
+  const file = await fetchImageAsFile(sourceUrl, fileName);
   return {
     referenceImage: {
       name: file.name,
@@ -195,7 +196,13 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       status: "success",
       b64_json: first.b64_json,
       url: first.url,
+      originalUrl: first.original_url,
       revised_prompt: first.revised_prompt,
+      sourceWidth: first.source_width,
+      sourceHeight: first.source_height,
+      width: first.width,
+      height: first.height,
+      outputTransform: first.output_transform,
       error: undefined,
     };
   }
@@ -380,7 +387,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageCount, setImageCount] = useState("3");
   const [imageRatio, setImageRatio] = useState("auto");
-  const [imageTier, setImageTier] = useState("1k");
+  const [imageTier, setImageTier] = useState("auto");
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
@@ -410,6 +417,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
   );
+  const selectedConversationScrollId = selectedConversation?.id;
   const activeTaskCount = useMemo(
     () =>
       conversations.reduce((sum, conversation) => {
@@ -492,8 +500,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         const storedTier = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
         const storedQuality = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
         const storedCount = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
-        setImageRatio(storedRatio || "1:1");
-        setImageTier(storedTier || "1k");
+        setImageRatio(storedRatio || "auto");
+        setImageTier(storedTier || "auto");
         setImageWidth("1024");
         setImageHeight("1024");
         setImageQuality(storedQuality || "auto");
@@ -592,11 +600,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [isAdmin, loadQuota]);
 
   useEffect(() => {
-    if (!selectedConversation) {
+    if (!selectedConversationScrollId) {
       lastConversationIdRef.current = null;
       shouldStickToBottomRef.current = true;
-      setShowScrollToLatest(false);
-      return;
+      const frame = window.requestAnimationFrame(() => setShowScrollToLatest(false));
+      return () => window.cancelAnimationFrame(frame);
     }
 
     const element = resultsViewportRef.current;
@@ -604,8 +612,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    const didSwitchConversation = lastConversationIdRef.current !== selectedConversation.id;
-    lastConversationIdRef.current = selectedConversation.id;
+    const didSwitchConversation = lastConversationIdRef.current !== selectedConversationScrollId;
+    lastConversationIdRef.current = selectedConversationScrollId;
 
     if (didSwitchConversation) {
       requestAnimationFrame(() => scrollResultsToLatest("auto"));
@@ -622,7 +630,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     setShowScrollToLatest(true);
-  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
+  }, [selectedConversationScrollId, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -655,7 +663,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
-      setSelectedConversationId(pickFallbackConversationId(conversations));
+      const timer = window.setTimeout(
+        () => setSelectedConversationId(pickFallbackConversationId(conversations)),
+        0,
+      );
+      return () => window.clearTimeout(timer);
     }
   }, [conversations, selectedConversationId]);
 
@@ -1234,7 +1246,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const now = new Date().toISOString();
     const conversationId = targetConversation?.id ?? createId();
     const turnId = createId();
-    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+    const imageSize = imageRatio === "auto" ? "" : `${imageWidth || 1024}x${imageHeight || 1024}`;
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,

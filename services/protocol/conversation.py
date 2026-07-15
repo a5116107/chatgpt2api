@@ -295,8 +295,16 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
-def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+def build_image_prompt(
+    prompt: str,
+    size: str | None,
+    quality: str = "auto",
+    *,
+    single_image: bool = False,
+) -> str:
     hints = []
+    if single_image:
+        hints.append("仅生成一张图片，不要返回多个候选结果。")
     if size:
         hints.append(f"输出图片尺寸为 {size}。")
     if quality:
@@ -390,6 +398,7 @@ class ConversationRequest:
     request_id: str = ""
     started_monotonic: float = field(default_factory=time.monotonic)
     deadline_monotonic: float | None = None
+    single_result: bool = False
 
 
 @dataclass
@@ -759,12 +768,15 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    single_image: bool = False,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = prompt_with_global_system(
+        build_image_prompt(prompt, size, quality, single_image=single_image)
+    ) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -946,6 +958,21 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
+def _select_image_result_urls(
+    image_urls: list[str],
+    request: ConversationRequest,
+    conversation_id: str,
+) -> list[str]:
+    if not request.single_result or len(image_urls) <= 1:
+        return image_urls
+    logger.info({
+        "event": "image_extra_results_discarded",
+        "conversation_id": conversation_id,
+        "discarded_count": len(image_urls) - 1,
+    })
+    return image_urls[:1]
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -963,6 +990,7 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            single_image=request.single_result,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1111,6 +1139,7 @@ def stream_image_outputs(
             raise
 
     if image_urls:
+        image_urls = _select_image_result_urls(image_urls, request, conversation_id)
         if request.progress_callback:
             request.progress_callback("receiving_image")
         image_items = [
@@ -1208,6 +1237,7 @@ def stream_image_outputs(
                     conversation_id, file_ids, sediment_ids, poll=False,
                 )
                 if image_urls:
+                    image_urls = _select_image_result_urls(image_urls, request, conversation_id)
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
                     image_items = [
@@ -1320,6 +1350,7 @@ def stream_image_outputs(
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
             if image_urls:
+                image_urls = _select_image_result_urls(image_urls, request, conversation_id)
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
                 image_items = [

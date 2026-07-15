@@ -222,6 +222,7 @@ class ImageTaskLifecycleTests(unittest.TestCase):
             service = ImageTaskService(
                 Path(directory) / "tasks.json",
                 generation_handler=handler,
+                output_handler=lambda item, _size, _base_url: item,
                 heartbeat_interval_getter=lambda: 0.05,
             )
             service.submit_generation(

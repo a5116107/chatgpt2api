@@ -18,7 +18,13 @@ export type StoredImage = {
   status?: "loading" | "success" | "error";
   b64_json?: string;
   url?: string;
+  originalUrl?: string;
   revised_prompt?: string;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  width?: number;
+  height?: number;
+  outputTransform?: string;
   error?: string;
 };
 
@@ -69,7 +75,13 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     ...image,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
+    originalUrl: typeof image.originalUrl === "string" && image.originalUrl ? image.originalUrl : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    sourceWidth: typeof image.sourceWidth === "number" ? image.sourceWidth : undefined,
+    sourceHeight: typeof image.sourceHeight === "number" ? image.sourceHeight : undefined,
+    width: typeof image.width === "number" ? image.width : undefined,
+    height: typeof image.height === "number" ? image.height : undefined,
+    outputTransform: typeof image.outputTransform === "string" ? image.outputTransform : undefined,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
     return normalized;

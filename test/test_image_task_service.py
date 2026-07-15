@@ -31,8 +31,81 @@ class ImageTaskServiceTests(unittest.TestCase):
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
+            output_handler=lambda item, _size, _base_url: item,
             retention_days_getter=lambda: 30,
         )
+
+    def test_web_task_requests_one_source_result_and_runs_output_processing(self):
+        captured = {}
+
+        def generation_handler(payload):
+            captured.update(payload)
+            return {"data": [{"b64_json": "source", "url": "https://example.test/original.png"}]}
+
+        def output_handler(item, size, base_url):
+            self.assertEqual(item["b64_json"], "source")
+            self.assertEqual(size, "1536x1536")
+            self.assertEqual(base_url, "https://example.test")
+            return {
+                "url": "https://example.test/upscaled.png",
+                "original_url": item["url"],
+                "source_width": 1024,
+                "source_height": 1024,
+                "width": 1536,
+                "height": 1536,
+                "output_transform": "lanczos_upscale",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=generation_handler,
+                output_handler=output_handler,
+                retention_days_getter=lambda: 30,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="web-output-task",
+                prompt="draw",
+                model="gpt-image-2",
+                size="1536x1536",
+                base_url="https://example.test",
+            )
+            task = wait_for_task(service, OWNER, "web-output-task", "success")
+
+        self.assertEqual(captured["response_format"], "b64_json")
+        self.assertTrue(captured["_single_result"])
+        self.assertEqual(task["data"][0]["original_url"], "https://example.test/original.png")
+
+    def test_codex_task_keeps_existing_url_output_path(self):
+        captured = {}
+
+        def generation_handler(payload):
+            captured.update(payload)
+            return {"data": [{"url": "https://example.test/codex.png"}]}
+
+        def output_handler(*_args):
+            raise AssertionError("Codex output must not enter the Web output processor")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=generation_handler,
+                output_handler=output_handler,
+                retention_days_getter=lambda: 30,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="codex-output-task",
+                prompt="draw",
+                model="codex-gpt-image-2",
+                size="2048x2048",
+            )
+            task = wait_for_task(service, OWNER, "codex-output-task", "success")
+
+        self.assertEqual(task["data"][0]["url"], "https://example.test/codex.png")
+        self.assertEqual(captured["response_format"], "url")
+        self.assertFalse(captured["_single_result"])
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
