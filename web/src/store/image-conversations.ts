@@ -20,7 +20,13 @@ export type StoredImage = {
   progress?: string;
   b64_json?: string;
   url?: string;
+  originalUrl?: string;
   revised_prompt?: string;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  width?: number;
+  height?: number;
+  outputTransform?: string;
   error?: string;
   startTime?: number;
   elapsedSecs?: number;
@@ -76,7 +82,13 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
+    originalUrl: typeof image.originalUrl === "string" && image.originalUrl ? image.originalUrl : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    sourceWidth: typeof image.sourceWidth === "number" ? image.sourceWidth : undefined,
+    sourceHeight: typeof image.sourceHeight === "number" ? image.sourceHeight : undefined,
+    width: typeof image.width === "number" ? image.width : undefined,
+    height: typeof image.height === "number" ? image.height : undefined,
+    outputTransform: typeof image.outputTransform === "string" ? image.outputTransform : undefined,
     startTime: typeof image.startTime === "number" ? image.startTime : undefined,
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,

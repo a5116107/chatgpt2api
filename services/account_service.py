@@ -56,6 +56,7 @@ class AccountService:
         self._text_index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        self._image_inflight_meta: dict[str, list[float]] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -635,6 +636,9 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                old_acquisitions = self._image_inflight_meta.pop(old_token, [])
+                if old_acquisitions:
+                    self._image_inflight_meta.setdefault(new_token, []).extend(old_acquisitions)
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -1419,6 +1423,7 @@ class AccountService:
             created = self._parse_time(acc.get("created_at"))
             created_ts = created.timestamp() if created is not None else 0.0
             invalid = int(acc.get("invalid_count") or 0)
+            image_inflight = int(self._image_inflight.get(tok, 0))
             image_samples = int(acc.get("image_health_samples") or 0)
             image_success_ema = float(acc.get("image_success_ema") if image_samples else 0.5)
             image_latency = float(acc.get("image_latency_ema_ms") or 60000.0)
@@ -1437,6 +1442,7 @@ class AccountService:
                 status_rank,
                 token_dead,
                 refresh_err,
+                image_inflight,
                 probe_rank,
                 min(consecutive_failures, 3),
                 1.0 - probe_success_ema,
@@ -1458,27 +1464,37 @@ class AccountService:
     ) -> str:
         # 有候选但并发槽被占满时，有界等待；避免无限阻塞导致 /v1/images 客户端超时后服务端仍占坑
         max_wait_secs = 12.0
-        stale_hold_secs = 45.0
+        stale_hold_secs = max(180.0, float(config.image_request_deadline_secs) + 60.0)
         started = time.time()
         with self._image_slot_condition:
             while True:
-                # 清理长时间未释放的 inflight（进程中断/上游 hang）
+                # Each slot keeps its own acquisition timestamp so one stale request does
+                # not release newer requests sharing the same account.
                 now = time.time()
-                stale_tokens = []
-                for tok, meta in list(getattr(self, "_image_inflight_meta", {}).items()):
-                    acquired_at = float(meta.get("acquired_at") or 0)
-                    if acquired_at and now - acquired_at >= stale_hold_secs:
-                        stale_tokens.append(tok)
-                for tok in stale_tokens:
-                    self._image_inflight.pop(tok, None)
-                    if hasattr(self, "_image_inflight_meta"):
+                stale_slots: dict[str, int] = {}
+                for tok, acquisitions in list(self._image_inflight_meta.items()):
+                    active = [acquired_at for acquired_at in acquisitions if now - acquired_at < stale_hold_secs]
+                    released = len(acquisitions) - len(active)
+                    if not released:
+                        continue
+                    stale_slots[tok] = released
+                    current = max(0, int(self._image_inflight.get(tok, 0)) - released)
+                    if current:
+                        self._image_inflight[tok] = current
+                        self._image_inflight_meta[tok] = active[-current:]
+                    else:
+                        self._image_inflight.pop(tok, None)
                         self._image_inflight_meta.pop(tok, None)
                     log_service.add(
                         LOG_TYPE_ACCOUNT,
                         "释放过期图片并发槽",
-                        {"token": anonymize_token(tok), "stale_hold_secs": stale_hold_secs},
+                        {
+                            "token": anonymize_token(tok),
+                            "released_slots": released,
+                            "stale_hold_secs": stale_hold_secs,
+                        },
                     )
-                if stale_tokens:
+                if stale_slots:
                     self._image_slot_condition.notify_all()
 
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
@@ -1493,9 +1509,7 @@ class AccountService:
                     # account when the best candidate has no free slot.
                     access_token = tokens[0]
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
-                    if not hasattr(self, "_image_inflight_meta"):
-                        self._image_inflight_meta = {}
-                    self._image_inflight_meta[access_token] = {"acquired_at": time.time()}
+                    self._image_inflight_meta.setdefault(access_token, []).append(time.time())
                     return access_token
                 if time.time() - started >= max_wait_secs:
                     raise RuntimeError("image account slots busy; retry later")
@@ -1509,11 +1523,16 @@ class AccountService:
             current_inflight = int(self._image_inflight.get(access_token, 0))
             if current_inflight <= 1:
                 self._image_inflight.pop(access_token, None)
-                if hasattr(self, "_image_inflight_meta"):
-                    self._image_inflight_meta.pop(access_token, None)
+                self._image_inflight_meta.pop(access_token, None)
             else:
                 self._image_inflight[access_token] = current_inflight - 1
-                # 保留最近一次 acquire 时间，避免过早判定 stale
+                acquisitions = self._image_inflight_meta.get(access_token, [])
+                if acquisitions:
+                    acquisitions.pop(0)
+                if acquisitions:
+                    self._image_inflight_meta[access_token] = acquisitions
+                else:
+                    self._image_inflight_meta.pop(access_token, None)
             self._image_slot_condition.notify_all()
 
     def get_available_access_token(
@@ -1964,6 +1983,7 @@ class AccountService:
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
+                self._image_inflight_meta.pop(token, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()

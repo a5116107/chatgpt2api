@@ -1,4 +1,6 @@
 "use client";
+
+/* eslint-disable @next/next/no-img-element -- previews use data URLs and user-provided image sources */
 import { ArrowUp, ChevronDown, ImagePlus, Info, LoaderCircle, RectangleHorizontal, RectangleVertical, Square, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type RefObject } from "react";
 
@@ -63,7 +65,7 @@ const qualityOptions = [
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
 ];
-const aspectOptions = [
+const codexAspectOptions = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
   { ratio: "2:3", tier: "1k", width: "1024", height: "1536", label: "2:3", icon: RectangleVertical },
   { ratio: "3:2", tier: "1k", width: "1536", height: "1024", label: "3:2", icon: RectangleHorizontal },
@@ -77,6 +79,18 @@ const aspectOptions = [
   { ratio: "16:9", tier: "4k", width: "3840", height: "2160", label: "16:9(4k)", icon: RectangleHorizontal },
   { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16(4k)", icon: RectangleVertical },
   { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
+];
+const webAspectOptions = [
+  { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "auto", icon: null },
+  { ratio: "1:1", tier: "1.5k", width: "1536", height: "1536", label: "1:1 (1.5K)", icon: Square },
+  { ratio: "3:2", tier: "1.5k", width: "1536", height: "1024", label: "3:2 (1.5K)", icon: RectangleHorizontal },
+  { ratio: "2:3", tier: "1.5k", width: "1024", height: "1536", label: "2:3 (1.5K)", icon: RectangleVertical },
+  { ratio: "1:1", tier: "2k", width: "2048", height: "2048", label: "1:1 (2K)", icon: Square },
+  { ratio: "16:9", tier: "2k", width: "2560", height: "1440", label: "16:9 (2K)", icon: RectangleHorizontal },
+  { ratio: "9:16", tier: "2k", width: "1440", height: "2560", label: "9:16 (2K)", icon: RectangleVertical },
+  { ratio: "1:1", tier: "4k", width: "4096", height: "4096", label: "1:1 (4K)", icon: Square },
+  { ratio: "16:9", tier: "4k", width: "3840", height: "2160", label: "16:9 (4K)", icon: RectangleHorizontal },
+  { ratio: "9:16", tier: "4k", width: "2160", height: "3840", label: "9:16 (4K)", icon: RectangleVertical },
 ];
 const countOptions = Array.from({ length: 10 }, (_, index) => String(index + 1));
 
@@ -128,6 +142,7 @@ export function ImageComposer({
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
   const isCodexModel = imageModel.toLowerCase().includes("codex");
+  const aspectOptions = isCodexModel ? codexAspectOptions : webAspectOptions;
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -425,6 +440,7 @@ export function ImageComposer({
                                 type="number"
                                 inputMode="numeric"
                                 min="1"
+                                max={isCodexModel ? undefined : 4096}
                                 value={imageWidth}
                                 onChange={(event) => onImageWidthChange(event.target.value)}
                                 className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
@@ -437,6 +453,7 @@ export function ImageComposer({
                                 type="number"
                                 inputMode="numeric"
                                 min="1"
+                                max={isCodexModel ? undefined : 4096}
                                 value={imageHeight}
                                 onChange={(event) => onImageHeightChange(event.target.value)}
                                 className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
@@ -452,21 +469,15 @@ export function ImageComposer({
                             {aspectOptions.map((option) => {
                               const active = option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight;
                               const Icon = option.icon;
-                              const disabled = !isCodexModel && (option.tier === "2k" || option.tier === "4k");
                               return (
                                 <button
                                   key={`${option.ratio}-${option.tier}-${option.label}`}
                                   type="button"
-                                  disabled={disabled}
                                   className={cn(
                                     "flex h-[64px] cursor-pointer flex-col items-center justify-center gap-1 rounded-2xl border border-stone-200 bg-white text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50",
                                     active && "border-stone-950",
-                                    disabled && "cursor-not-allowed border-stone-100 bg-stone-50 text-stone-300 hover:border-stone-100 hover:bg-stone-50",
                                   )}
                                   onClick={() => {
-                                    if (disabled) {
-                                      return;
-                                    }
                                     onImageRatioChange(option.ratio);
                                     onImageTierChange(option.tier);
                                     onImageWidthChange(option.width);

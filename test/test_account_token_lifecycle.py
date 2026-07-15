@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+import time
 from unittest import mock
 
 from services.account_service import AccountService
+from services.account_service import config as account_service_config
 from services.storage.base import StorageBackend
 
 
@@ -187,6 +189,32 @@ class AccountTokenLifecycleTests(unittest.TestCase):
         self.assertEqual(selected, "second")
         self.assertTrue(service.has_alternative_image_account("first"))
         self.assertFalse(service.has_alternative_image_account("first", excluded_tokens={"second"}))
+        service.release_image_slot(selected)
+
+    def test_image_selection_prefers_the_least_loaded_healthy_account(self) -> None:
+        service = self.service(account("first"), account("second"))
+        service._image_inflight["first"] = 1
+        service._image_inflight_meta["first"] = [time.time()]
+
+        with mock.patch.object(type(account_service_config), "image_account_concurrency", new_callable=mock.PropertyMock, return_value=3):
+            selected = service.get_available_access_token()
+
+        self.assertEqual(selected, "second")
+        service.release_image_slot(selected)
+
+    def test_image_slot_is_not_released_at_the_old_45_second_boundary(self) -> None:
+        service = self.service(account("first"), account("second"))
+        service._image_inflight["first"] = 1
+        service._image_inflight_meta["first"] = [time.time() - 60.0]
+
+        with (
+            mock.patch.object(type(account_service_config), "image_account_concurrency", new_callable=mock.PropertyMock, return_value=1),
+            mock.patch.object(type(account_service_config), "image_request_deadline_secs", new_callable=mock.PropertyMock, return_value=120.0),
+        ):
+            selected = service.get_available_access_token()
+
+        self.assertEqual(selected, "second")
+        self.assertEqual(service._image_inflight["first"], 1)
         service.release_image_slot(selected)
 
 

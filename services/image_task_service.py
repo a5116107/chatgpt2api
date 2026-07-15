@@ -11,8 +11,10 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.image_output_service import image_output_service, parse_target_size
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.helper import is_codex_image_model
 from utils.log import logger
 
 TASK_STATUS_QUEUED = "queued"
@@ -143,12 +145,14 @@ class ImageTaskService:
         *,
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
+        output_handler: Callable[[dict[str, Any], object, str | None], dict[str, Any]] = image_output_service.prepare_web_output,
         retention_days_getter: Callable[[], int] | None = None,
         heartbeat_interval_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
+        self.output_handler = output_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self.heartbeat_interval_getter = heartbeat_interval_getter or (lambda: config.image_heartbeat_interval_secs)
         self._lock = threading.RLock()
@@ -173,14 +177,19 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
     ) -> dict[str, Any]:
+        web_image_output = not is_codex_image_model(model)
+        if web_image_output:
+            parse_target_size(size)
         payload = {
             "prompt": prompt,
             "model": model,
             "n": 1,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": "b64_json" if web_image_output else "url",
             "base_url": base_url,
+            "_web_image_output": web_image_output,
+            "_single_result": web_image_output,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -197,6 +206,9 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
+        web_image_output = not is_codex_image_model(model)
+        if web_image_output:
+            parse_target_size(size)
         payload = {
             "prompt": prompt,
             "images": images or [],
@@ -205,8 +217,10 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": "b64_json" if web_image_output else "url",
             "base_url": base_url,
+            "_web_image_output": web_image_output,
+            "_single_result": web_image_output,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -392,6 +406,8 @@ class ImageTaskService:
                 if account_email:
                     setattr(error, "account_email", account_email)
                 raise error
+            if payload.get("_web_image_output"):
+                data = [self.output_handler(data[0], payload.get("size"), _clean(payload.get("base_url")) or None)]
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
             if not self._transition_task(

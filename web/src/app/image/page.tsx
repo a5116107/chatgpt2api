@@ -188,10 +188,11 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
     };
   }
 
-  if (!image.url) {
+  const sourceUrl = image.originalUrl || image.url;
+  if (!sourceUrl) {
     return null;
   }
-  const file = await fetchImageAsFile(image.url, fileName);
+  const file = await fetchImageAsFile(sourceUrl, fileName);
   return {
     referenceImage: {
       name: file.name,
@@ -223,7 +224,13 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       progress: undefined,
       b64_json: first.b64_json,
       url: first.url,
+      originalUrl: first.original_url,
       revised_prompt: first.revised_prompt,
+      sourceWidth: first.source_width,
+      sourceHeight: first.source_height,
+      width: first.width,
+      height: first.height,
+      outputTransform: first.output_transform,
       error: undefined,
       durationMs: task.duration_ms,
     };
@@ -447,7 +454,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageCount, setImageCount] = useState("3");
   const [imageRatio, setImageRatio] = useState("auto");
-  const [imageTier, setImageTier] = useState("1k");
+  const [imageTier, setImageTier] = useState("auto");
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
@@ -482,6 +489,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
     [conversations, selectedConversationId],
   );
+  const selectedConversationScrollId = selectedConversation?.id;
   const activeTaskCount = useMemo(
     () =>
       conversations.reduce((sum, conversation) => {
@@ -573,13 +581,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   useEffect(() => {
+    const scrollPositions = scrollPositionsRef.current;
     return () => {
       if (scrollRafRef.current !== null) {
         window.cancelAnimationFrame(scrollRafRef.current);
       }
       if (scrollSaveTimerRef.current !== null) {
         clearTimeout(scrollSaveTimerRef.current);
-        saveScrollPositions(scrollPositionsRef.current);
+        saveScrollPositions(scrollPositions);
       }
     };
   }, []);
@@ -594,8 +603,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
       const storedCount =
         typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
-      setImageRatio(storedRatio || "1:1");
-      setImageTier(storedTier || "1k");
+      setImageRatio(storedRatio || "auto");
+      setImageTier(storedTier || "auto");
       setImageWidth("1024");
       setImageHeight("1024");
       setImageQuality(storedQuality || "auto");
@@ -649,15 +658,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     loadCancelledRef.current = false;
-    void loadHistory();
+    const resultsViewport = resultsViewportRef.current;
+    const scrollPositions = scrollPositionsRef.current;
+    const loadFrame = window.requestAnimationFrame(() => void loadHistory());
     return () => {
+      window.cancelAnimationFrame(loadFrame);
       loadCancelledRef.current = true;
       // 组件卸载时保存当前滚动位置到 sessionStorage
-      const element = resultsViewportRef.current;
+      const element = resultsViewport;
       const convId = lastConversationIdRef.current;
       if (element && convId) {
-        scrollPositionsRef.current.set(convId, element.scrollTop);
-        saveScrollPositions(scrollPositionsRef.current);
+        scrollPositions.set(convId, element.scrollTop);
+        saveScrollPositions(scrollPositions);
       }
       activeConversationQueueIds.clear();
       if (pollAbortController) {
@@ -730,7 +742,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   // 切换会话时保存旧会话滚动位置，并隐藏容器防止闪烁
   useLayoutEffect(() => {
-    if (!selectedConversation) {
+    if (!selectedConversationScrollId) {
       lastConversationIdRef.current = null;
       shouldStickToBottomRef.current = true;
       const btn = scrollToLatestBtnRef.current;
@@ -743,7 +755,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    const didSwitchConversation = lastConversationIdRef.current !== selectedConversation.id;
+    const didSwitchConversation = lastConversationIdRef.current !== selectedConversationScrollId;
 
     if (didSwitchConversation) {
       // 递增 generation，使之前未完成的 rAF 回调失效
@@ -756,20 +768,20 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         saveScrollPositions(scrollPositionsRef.current);
       }
       // 更新为新会话 ID
-      lastConversationIdRef.current = selectedConversation.id;
+      lastConversationIdRef.current = selectedConversationScrollId;
 
       // 如果有保存的滚动位置，隐藏容器防止用户看到 scrollTop=0 的内容
-      const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+      const savedScrollTop = scrollPositionsRef.current.get(selectedConversationScrollId);
       if (savedScrollTop != null && savedScrollTop > 0) {
         element.style.visibility = "hidden";
         isRestoringScrollRef.current = true;
       }
     }
-  }, [selectedConversation?.id]);
+  }, [selectedConversationScrollId]);
 
   // 恢复滚动位置或跟随最新内容
   useEffect(() => {
-    if (!selectedConversation) {
+    if (!selectedConversationScrollId) {
       return;
     }
 
@@ -778,7 +790,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+    const savedScrollTop = scrollPositionsRef.current.get(selectedConversationScrollId);
 
     if (savedScrollTop != null && savedScrollTop > 0) {
       // 捕获当前 generation，用于检测是否已被新的切换取代
@@ -802,7 +814,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
       });
       // 恢复后清除保存的位置，下次内容更新时走正常的 shouldFollowLatest 逻辑
-      scrollPositionsRef.current.delete(selectedConversation.id);
+      scrollPositionsRef.current.delete(selectedConversationScrollId);
       return;
     }
 
@@ -818,7 +830,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     const btn = scrollToLatestBtnRef.current;
     if (btn) btn.style.display = "";
-  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
+  }, [selectedConversationScrollId, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -851,7 +863,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
-      setSelectedConversationId(pickFallbackConversationId(conversations));
+      const timer = window.setTimeout(
+        () => setSelectedConversationId(pickFallbackConversationId(conversations)),
+        0,
+      );
+      return () => window.clearTimeout(timer);
     }
   }, [conversations, selectedConversationId]);
 
@@ -1532,7 +1548,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const now = new Date().toISOString();
     const conversationId = targetConversation?.id ?? createId();
     const turnId = createId();
-    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+    const imageSize = imageRatio === "auto" ? "" : `${imageWidth || 1024}x${imageHeight || 1024}`;
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,

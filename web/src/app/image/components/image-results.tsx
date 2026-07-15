@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- generated images use runtime blob and external URLs */
+
 import { memo, useEffect, useRef, useState } from "react";
 import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
@@ -47,17 +49,18 @@ function getStoredImageSrc(image: StoredImage) {
   return image.url || "";
 }
 
-async function downloadStoredImage(image: StoredImage, index: number) {
+async function downloadStoredImage(image: StoredImage, index: number, original = false) {
   let blob: Blob | null = null;
+  const selectedUrl = original ? image.originalUrl || image.url : image.url;
   try {
-    if (image.b64_json) {
+    if (image.b64_json && !original) {
       const binary = atob(image.b64_json);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       blob = new Blob([bytes], { type: "image/png" });
-    } else if (image.url) {
+    } else if (selectedUrl) {
       // 确保 URL 是绝对路径
-      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
+      const url = selectedUrl.startsWith("http") ? selectedUrl : `${window.location.origin}${selectedUrl}`;
       const res = await fetch(url);
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -69,15 +72,15 @@ async function downloadStoredImage(image: StoredImage, index: number) {
   } catch (err) {
     console.error("Failed to download image:", err);
     // 如果 fetch 失败，尝试直接在新窗口打开
-    if (image.url) {
-      window.open(image.url, "_blank");
+    if (selectedUrl) {
+      window.open(selectedUrl, "_blank");
     }
     return;
   }
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `image-${index + 1}.png`;
+  a.download = `image-${index + 1}${original ? "-original" : ""}.png`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -97,8 +100,8 @@ export function ImageResults({
   onDismissErrors,
   formatConversationTime,
 }: ImageResultsProps) {
-  const imageDimensionsRef = useRef<Record<string, string>>({});
-  const [currentTime, setCurrentTime] = useState(Date.now());
+  const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
+  const [currentTime, setCurrentTime] = useState(0);
   
   // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
   const hasLoadingImages = selectedConversation?.turns.some(
@@ -114,10 +117,7 @@ export function ImageResults({
 
   const updateImageDimensions = (id: string, width: number, height: number) => {
     const dimensions = formatImageDimensions(width, height);
-    // 使用 ref 存储，不触发 React 重渲染，消除级联重渲染
-    if (imageDimensionsRef.current[id] !== dimensions) {
-      imageDimensionsRef.current[id] = dimensions;
-    }
+    setImageDimensions((current) => current[id] === dimensions ? current : { ...current, [id]: dimensions });
   };
 
   if (!selectedConversation) {
@@ -160,7 +160,9 @@ export function ImageResults({
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: imageDimensionsRef.current[image.id],
+                  dimensions: image.width && image.height
+                    ? formatImageDimensions(image.width, image.height)
+                    : imageDimensions[image.id],
                 },
               ]
             : [];
@@ -251,8 +253,19 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensionsRef.current[image.id];
-                        const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
+                        const dimensions = image.width && image.height
+                          ? formatImageDimensions(image.width, image.height)
+                          : imageDimensions[image.id];
+                        const sourceDimensions = image.sourceWidth && image.sourceHeight
+                          ? formatImageDimensions(image.sourceWidth, image.sourceHeight)
+                          : "";
+                        const transformed = image.outputTransform === "lanczos_upscale";
+                        const imageMeta = [
+                          sizeLabel,
+                          dimensions,
+                          transformed && sourceDimensions ? `源图 ${sourceDimensions}` : "",
+                          transformed ? "LANCZOS 放大" : "原始输出",
+                        ].filter(Boolean).join(" · ");
 
                         return (
                           <div
@@ -294,11 +307,23 @@ export function ImageResults({
                                   size="sm"
                                   className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
                                   onClick={() => void downloadStoredImage(image, index)}
-                                  aria-label="下载"
+                                  aria-label={transformed ? "下载高清图" : "下载图片"}
                                 >
                                   <Download className="size-3 sm:size-4" />
-                                  <span className="hidden sm:inline">下载</span>
+                                  <span className="hidden sm:inline">{transformed ? "高清图" : "下载"}</span>
                                 </Button>
+                                {transformed && image.originalUrl ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
+                                    onClick={() => void downloadStoredImage(image, index, true)}
+                                    aria-label="下载原图"
+                                  >
+                                    <Download className="size-3 sm:size-4" />
+                                    <span className="hidden sm:inline">原图</span>
+                                  </Button>
+                                ) : null}
                               </div>
                             </div>
                           </div>
@@ -360,7 +385,7 @@ export function ImageResults({
                       const elapsedDisplay = showElapsed
                         ? formatElapsed(
                             image.elapsedUpdatedAt != null
-                              ? image.elapsedSecs! + (currentTime - image.elapsedUpdatedAt!) / 1000
+                              ? image.elapsedSecs! + ((currentTime || image.elapsedUpdatedAt!) - image.elapsedUpdatedAt!) / 1000
                               : image.elapsedSecs!,
                           )
                         : null;

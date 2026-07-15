@@ -78,6 +78,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         request_id=str(body.get("_request_id") or ""),
         started_monotonic=float(body.get("_request_started_monotonic") or time.monotonic()),
         deadline_monotonic=float(body.get("_request_deadline_monotonic") or 0) or None,
+        single_result=bool(body.get("_single_result")),
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

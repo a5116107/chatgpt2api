@@ -13,6 +13,33 @@ from services.protocol import conversation as conversation_module
 
 
 class ImageProtocolTests(unittest.TestCase):
+    def test_web_single_result_prompt_and_url_selection_are_opt_in(self) -> None:
+        prompt = conversation_module.build_image_prompt(
+            "draw a lighthouse",
+            "1536x1536",
+            "high",
+            single_image=True,
+        )
+        request = conversation_module.ConversationRequest(single_result=True)
+
+        self.assertIn("仅生成一张图片", prompt)
+        self.assertEqual(
+            conversation_module._select_image_result_urls(
+                ["https://example.test/one.png", "https://example.test/two.png"],
+                request,
+                "conversation-1",
+            ),
+            ["https://example.test/one.png"],
+        )
+        self.assertEqual(
+            conversation_module._select_image_result_urls(
+                ["https://example.test/one.png", "https://example.test/two.png"],
+                conversation_module.ConversationRequest(),
+                "conversation-1",
+            ),
+            ["https://example.test/one.png", "https://example.test/two.png"],
+        )
+
     def backend(self, prepare_data: dict | None = None):
         backend = backend_module.OpenAIBackendAPI.__new__(backend_module.OpenAIBackendAPI)
         backend.base_url = "https://example.test"

@@ -375,9 +375,23 @@ export type SystemLog = {
   [key: string]: unknown;
 };
 
+export type ImageData = {
+  b64_json?: string;
+  url?: string;
+  original_url?: string;
+  revised_prompt?: string;
+  source_width?: number;
+  source_height?: number;
+  width?: number;
+  height?: number;
+  requested_width?: number | null;
+  requested_height?: number | null;
+  output_transform?: "original" | "lanczos_upscale" | string;
+};
+
 export type ImageResponse = {
   created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data: ImageData[];
 };
 
 export type ImageTask = {
@@ -390,7 +404,7 @@ export type ImageTask = {
   created_at: string;
   updated_at: string;
   conversation_id?: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: ImageData[];
   error?: string;
   progress?: string;
   elapsed_secs?: number;
