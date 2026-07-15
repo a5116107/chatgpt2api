@@ -526,6 +526,22 @@ class ConfigStore:
             return 90.0
 
     @property
+    def image_attempt_timeout_secs(self) -> float:
+        """Per-account image budget when another healthy account can take over."""
+        try:
+            return max(15.0, float(self.data.get("image_attempt_timeout_secs", 55.0)))
+        except (TypeError, ValueError):
+            return 55.0
+
+    @property
+    def image_min_retry_budget_secs(self) -> float:
+        """Minimum remaining wall-clock budget required to start another upstream task."""
+        try:
+            return max(5.0, float(self.data.get("image_min_retry_budget_secs", 20.0)))
+        except (TypeError, ValueError):
+            return 20.0
+
+    @property
     def image_sse_idle_timeout_secs(self) -> float:
         try:
             return max(5.0, float(self.data.get("image_sse_idle_timeout_secs", 20.0)))
@@ -756,6 +772,8 @@ class ConfigStore:
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_request_deadline_secs"] = self.image_request_deadline_secs
+        data["image_attempt_timeout_secs"] = self.image_attempt_timeout_secs
+        data["image_min_retry_budget_secs"] = self.image_min_retry_budget_secs
         data["image_sse_idle_timeout_secs"] = self.image_sse_idle_timeout_secs
         data["image_stream_close_timeout_secs"] = self.image_stream_close_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs

@@ -17,7 +17,7 @@ from services.image_task_service import (
     TASK_STATUS_RUNNING,
     TASK_STATUS_SUCCESS,
 )
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, ImagePollTimeoutError, OpenAIBackendAPI
 from services.protocol import conversation as conversation_module
 from utils.helper import UpstreamHTTPError
 
@@ -72,6 +72,15 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_poll_interval_secs, 0.5)
             self.assertEqual(config.image_poll_request_timeout_secs, 2.0)
             self.assertEqual(config.image_png_compress_level, 1)
+
+        with mock.patch.dict(config.data, {
+            "image_attempt_timeout_secs": 1,
+            "image_min_retry_budget_secs": 1,
+        }, clear=True):
+            self.assertEqual(config.image_attempt_timeout_secs, 15.0)
+            self.assertEqual(config.image_min_retry_budget_secs, 5.0)
+            self.assertEqual(config.get()["image_attempt_timeout_secs"], 15.0)
+            self.assertEqual(config.get()["image_min_retry_budget_secs"], 5.0)
 
     def test_transient_conversation_404_is_retried_without_aborting_polling(self) -> None:
         backend = self.backend()
@@ -171,6 +180,101 @@ class ImagePollingTests(unittest.TestCase):
         backend._query_backend_tasks.assert_called_once()
 
 
+class ImageProtocolTests(unittest.TestCase):
+    def backend(self, prepare_data: dict | None = None) -> tuple[OpenAIBackendAPI, mock.Mock]:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://example.test"
+        backend.account = {"default_model_slug": "auto"}
+        backend.client_version = "test-client"
+        backend.image_deadline_monotonic = None
+        backend.image_request_id = "protocol-test"
+        backend.progress_callback = None
+        backend._headers = lambda _path, headers=None: dict(headers or {})
+        prepare_response = mock.Mock()
+        prepare_response.json.return_value = prepare_data or {"conduit_token": "conduit-token"}
+        start_response = mock.Mock()
+        backend.session = mock.Mock()
+        backend.session.post.side_effect = [prepare_response, start_response]
+        return backend, start_response
+
+    def test_prepare_and_start_share_context_and_sentinel_headers(self) -> None:
+        backend, _response = self.backend()
+        requirements = ChatRequirements(token="requirements-token", so_token="so-token")
+
+        with mock.patch("services.openai_backend_api.ensure_ok"):
+            context = backend._prepare_image_conversation("draw a lighthouse", requirements, "gpt-image-2")
+            backend._start_image_generation("draw a lighthouse", requirements, context, "gpt-image-2")
+
+        prepare_call, start_call = backend.session.post.call_args_list
+        prepare_payload = prepare_call.kwargs["json"]
+        start_payload = start_call.kwargs["json"]
+        self.assertEqual(prepare_payload["client_prepare_state"], "none")
+        self.assertEqual(start_payload["client_prepare_state"], "sent")
+        self.assertEqual(prepare_payload["parent_message_id"], start_payload["parent_message_id"])
+        self.assertEqual(prepare_payload["partial_query"]["id"], start_payload["messages"][0]["id"])
+        self.assertEqual(prepare_call.kwargs["headers"]["X-Conduit-Token"], "no-token")
+        self.assertEqual(prepare_call.kwargs["headers"]["OpenAI-Sentinel-SO-Token"], "so-token")
+        self.assertEqual(start_call.kwargs["headers"]["X-Conduit-Token"], "conduit-token")
+        self.assertEqual(start_call.kwargs["headers"]["OpenAI-Sentinel-SO-Token"], "so-token")
+
+    def test_missing_conduit_token_fails_before_start(self) -> None:
+        backend, _response = self.backend({"other": "value"})
+
+        with mock.patch("services.openai_backend_api.ensure_ok"):
+            with self.assertRaisesRegex(RuntimeError, "missing conduit_token"):
+                backend._prepare_image_conversation(
+                    "draw a lighthouse",
+                    ChatRequirements(token="requirements-token"),
+                    "gpt-image-2",
+                )
+
+    def test_duplicate_file_and_sediment_reference_is_resolved_once(self) -> None:
+        backend, _response = self.backend()
+        backend._get_file_download_url = mock.Mock(return_value="https://example.test/file.png")
+        backend._get_attachment_download_url = mock.Mock(return_value="https://example.test/attachment.png")
+
+        urls = backend._resolve_image_urls("conversation-1", ["file-1"], ["file-1"])
+
+        self.assertEqual(urls, ["https://example.test/file.png"])
+        backend._get_attachment_download_url.assert_not_called()
+
+
+class ImageAccountSelectionTests(unittest.TestCase):
+    def service(self) -> AccountService:
+        service = AccountService.__new__(AccountService)
+        service._lock = threading.RLock()
+        return service
+
+    def test_selection_honors_exclusions(self) -> None:
+        service = self.service()
+        seen_exclusions: list[set[str]] = []
+
+        def acquire(**kwargs) -> str:
+            seen_exclusions.append(set(kwargs["excluded_tokens"]))
+            return "second"
+
+        service._acquire_next_candidate_token = mock.Mock(side_effect=acquire)
+        service.get_account = mock.Mock(return_value={"access_token": "second"})
+        service._is_image_account_available = mock.Mock(return_value=True)
+        service._should_skip_remote_image_preflight = mock.Mock(return_value=True)
+
+        selected = service.get_available_access_token(excluded_tokens={"first"})
+
+        self.assertEqual(selected, "second")
+        self.assertEqual(seen_exclusions, [{"first"}])
+
+    def test_alternative_selection_excludes_current_and_prior_failures(self) -> None:
+        service = self.service()
+        service._resolve_access_token_locked = mock.Mock(return_value="first")
+        service._list_ready_candidate_tokens = mock.Mock(return_value=["third"])
+
+        self.assertTrue(service.has_alternative_image_account("first", excluded_tokens={"second"}))
+        self.assertEqual(
+            service._list_ready_candidate_tokens.call_args.kwargs["excluded_tokens"],
+            {"first", "second"},
+        )
+
+
 class BlockingResponse:
     def __init__(self) -> None:
         self.closed = threading.Event()
@@ -255,6 +359,113 @@ class ImageRaceTests(unittest.TestCase):
         self.assertFalse(any(t.name == "image-sse-reader-slow-close-test" for t in threading.enumerate()))
         self.assertTrue(response.close_finished.wait(2))
         self.assertFalse(any(t.name == "image-sse-close-slow-close-test" for t in threading.enumerate()))
+
+
+class ImageAccountFailoverTests(unittest.TestCase):
+    def test_poll_timeout_excludes_account_and_uses_per_attempt_deadline(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            response_format="url",
+            started_monotonic=started,
+            deadline_monotonic=started + 120.0,
+        )
+        seen_exclusions: list[set[str]] = []
+        deadlines: list[float] = []
+
+        def select_token(**kwargs) -> str:
+            excluded = set(kwargs.get("excluded_tokens") or set())
+            seen_exclusions.append(excluded)
+            return "token-2" if "token-1" in excluded else "token-1"
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, _request_id: str, deadline: float) -> None:
+                deadlines.append(deadline)
+
+            def close(self) -> None:
+                return None
+
+        def stream(backend, _attempt_request, _index, _total):
+            if backend.access_token == "token-1":
+                raise ImagePollTimeoutError("attempt timed out")
+            yield conversation_module.ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                data=[{"url": "https://example.test/image.png"}],
+            )
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", side_effect=select_token),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                side_effect=lambda token: {"access_token": token, "email": f"{token}@example.test"},
+            ),
+            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=stream),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+            mock.patch.object(conversation_module, "_record_runtime_success"),
+            mock.patch.dict(config.data, {"image_attempt_timeout_secs": 55.0}),
+        ):
+            outputs = conversation_module._generate_single_image(request, 1, 1)
+
+        self.assertEqual(outputs[-1].kind, "result")
+        self.assertEqual(seen_exclusions, [set(), {"token-1"}])
+        self.assertEqual(len(deadlines), 2)
+        self.assertLessEqual(max(deadlines), started + 55.1)
+        self.assertLess(max(deadlines), request.deadline_monotonic)
+
+    def test_retry_does_not_start_without_a_useful_time_budget(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            started_monotonic=started,
+            deadline_monotonic=started + 10.0,
+        )
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, *_args) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def timeout_stream(*_args, **_kwargs):
+            raise ImagePollTimeoutError("attempt timed out")
+            yield
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", return_value="token-1") as select,
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"access_token": "token-1", "email": "token-1@example.test"},
+            ),
+            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=timeout_stream),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+            mock.patch.dict(config.data, {"image_min_retry_budget_secs": 20.0}),
+        ):
+            with self.assertRaisesRegex(ImagePollTimeoutError, "useful retry"):
+                conversation_module._generate_single_image(request, 1, 1)
+
+        select.assert_called_once()
 
 
 class ImageTaskLifecycleTests(unittest.TestCase):

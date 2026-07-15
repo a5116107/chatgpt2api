@@ -1535,6 +1535,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1543,7 +1544,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = set(excluded_tokens or set())
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1585,6 +1586,26 @@ class AccountService:
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
+
+    def has_alternative_image_account(
+            self,
+            access_token: str,
+            *,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> bool:
+        """Return whether another ready image account can take over this request."""
+        with self._lock:
+            excluded = set(excluded_tokens or set())
+            excluded.add(self._resolve_access_token_locked(access_token))
+            return bool(self._list_ready_candidate_tokens(
+                excluded_tokens=excluded,
+                plan_type=plan_type,
+                source_type=source_type,
+                plan_types=plan_types,
+            ))
 
     def _text_candidate_score(self, account: dict) -> tuple:
         status_penalty = 0 if account.get("status") == "正常" else 1

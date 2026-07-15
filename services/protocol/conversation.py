@@ -5,7 +5,7 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -1482,12 +1482,23 @@ def _generate_single_image(
     emitted_for_token = False
     returned_message = False
     returned_result = False
+    attempts_started = 0
     if request.deadline_monotonic is None:
         request.deadline_monotonic = request.started_monotonic + config.image_request_deadline_secs
 
     while True:
-        if _image_request_remaining(request) <= 0:
+        remaining = _image_request_remaining(request)
+        if remaining <= 0:
             raise ImagePollTimeoutError("image request deadline exceeded")
+        if attempts_started > 0 and remaining < config.image_min_retry_budget_secs:
+            logger.warning({
+                "event": "image_retry_budget_exhausted",
+                "request_id": request.request_id,
+                "attempts_started": attempts_started,
+                "remaining_secs": round(remaining, 3),
+                "minimum_secs": config.image_min_retry_budget_secs,
+            })
+            raise ImagePollTimeoutError("image request deadline exceeded before another useful retry")
         attempt_started = time.monotonic()
         try:
             # reset per attempt so previous progress/message state cannot poison tls_transient
@@ -1507,6 +1518,7 @@ def _generate_single_image(
                         plan_type=plan_type,
                         source_type="codex" if codex_model else None,
                         plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                        excluded_tokens=excluded_image_tokens,
                     )
                 except RuntimeError as exc:
                     last_acquire_err = exc
@@ -1525,6 +1537,7 @@ def _generate_single_image(
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         account = account_service.get_account(token) or {}
+        attempts_started += 1
         account_email = str(account.get("email") or "").strip()
         account_hash = anonymize_token(token)
         logger.debug({
@@ -1538,13 +1551,35 @@ def _generate_single_image(
         backend = None
         slot_settled = False
         try:
+            alternative_available = account_service.has_alternative_image_account(
+                token,
+                excluded_tokens=excluded_image_tokens,
+                plan_type=plan_type,
+                source_type="codex" if codex_model else None,
+                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+            )
+            attempt_deadline = request.deadline_monotonic
+            if alternative_available:
+                attempt_deadline = min(
+                    request.deadline_monotonic,
+                    attempt_started + config.image_attempt_timeout_secs,
+                )
+            attempt_request = replace(request, deadline_monotonic=attempt_deadline)
+            logger.info({
+                "event": "image_attempt_budget",
+                "request_id": request.request_id,
+                "account_hash": account_hash,
+                "alternative_available": alternative_available,
+                "attempt_timeout_secs": round(max(0.0, attempt_deadline - attempt_started), 3),
+                "request_remaining_secs": round(_image_request_remaining(request), 3),
+            })
             backend = OpenAIBackendAPI(access_token=token)
-            backend.set_image_request_context(request.request_id, request.deadline_monotonic)
+            backend.set_image_request_context(request.request_id, attempt_deadline)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
-            for output in stream_fn(backend, request, index, total):
+            for output in stream_fn(backend, attempt_request, index, total):
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if not output.account_hash:
@@ -1594,6 +1629,7 @@ def _generate_single_image(
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
             if not emitted_for_token:
+                excluded_image_tokens.add(token)
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
@@ -1772,7 +1808,25 @@ def _generate_single_image(
                 # 本请求内排除坏 token，避免 requirements 抖动路径把它当瞬时错误反复重试
                 if token:
                     excluded_image_tokens.add(token)
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                account = account_service.get_account(token) or {}
+                plan = str(account.get("type") or account.get("plan") or "").strip().lower()
+                is_free = (not plan) or plan in {"free", "unknown", "null", "none"} or "free" in plan
+                has_refresh = bool(str(account.get("refresh_token") or "").strip())
+                refreshed_token = ""
+                if has_refresh and not is_free:
+                    try:
+                        refreshed_token = account_service.refresh_access_token(
+                            token,
+                            force=True,
+                            event="image_stream",
+                        )
+                    except Exception as refresh_exc:
+                        logger.warning({
+                            "event": "image_stream_token_refresh_failed",
+                            "account_email": account_email,
+                            "index": index,
+                            "error": str(refresh_exc)[:200],
+                        })
                 if refreshed_token and refreshed_token != token:
                     # refresh 已写入号池；释放旧槽后由下一轮 acquire 拿到新 token
                     logger.warning({
@@ -1791,6 +1845,7 @@ def _generate_single_image(
                     "account_email": account_email,
                     "index": index,
                     "excluded": len(excluded_image_tokens),
+                    "free": is_free,
                     "error": last_error[:200],
                 })
                 if len(excluded_image_tokens) <= MAX_REQUIREMENTS_ROTATES + 2:

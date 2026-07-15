@@ -53,6 +53,13 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
+@dataclass(frozen=True)
+class ImagePrepareContext:
+    conduit_token: str
+    parent_message_id: str
+    message_id: str
+
+
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
@@ -633,7 +640,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return str(self.account.get("default_model_slug") or "auto").strip() or "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -648,6 +655,8 @@ class OpenAIBackendAPI:
         }
         if requirements.proof_token:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+        if requirements.so_token:
+            headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
         if accept == "text/event-stream":
@@ -922,21 +931,29 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
-        """为图片生成准备 conduit token。"""
+    def _prepare_image_conversation(
+        self,
+        prompt: str,
+        requirements: ChatRequirements,
+        model: str,
+    ) -> ImagePrepareContext:
+        """Prepare the exact message context later reused by the image start request."""
         path = "/backend-api/f/conversation/prepare"
+        parent_message_id = new_uuid()
+        message_id = new_uuid()
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id,
             "model": self._image_model_slug(model),
-            "client_prepare_state": "success",
+            "client_prepare_state": "none",
+            "thinking_effort": "standard",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
             "partial_query": {
-                "id": new_uuid(),
+                "id": message_id,
                 "author": {"role": "user"},
                 "content": {"content_type": "text", "parts": [prompt]},
             },
@@ -947,12 +964,30 @@ class OpenAIBackendAPI:
         prepare_timeout = self._bounded_image_timeout(45.0)
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements),
+            headers=self._image_headers(path, requirements, "no-token"),
             json=payload,
             timeout=(min(10.0, prepare_timeout), prepare_timeout),
         )
         ensure_ok(response, path)
-        return response.json().get("conduit_token", "")
+        data = response.json()
+        conduit_token = str(data.get("conduit_token") or "") if isinstance(data, dict) else ""
+        logger.debug({
+            "event": "image_prepare_protocol",
+            "client_version": getattr(self, "client_version", DEFAULT_CLIENT_VERSION),
+            "requirements_token_len": len(requirements.token),
+            "so_token_present": bool(requirements.so_token),
+            "so_token_len": len(requirements.so_token),
+            "conduit_token_present": bool(conduit_token),
+            "conduit_token_len": len(conduit_token),
+        })
+        if not conduit_token:
+            response_keys = sorted(data) if isinstance(data, dict) else []
+            raise RuntimeError(f"missing conduit_token: response_keys={response_keys}")
+        return ImagePrepareContext(
+            conduit_token=conduit_token,
+            parent_message_id=parent_message_id,
+            message_id=message_id,
+        )
 
     def _decode_image_base64(self, image: str) -> bytes:
         """把 base64 图片字符串或本地路径解码成二进制。"""
@@ -1028,7 +1063,7 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
+    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, context: ImagePrepareContext, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
@@ -1061,15 +1096,16 @@ class OpenAIBackendAPI:
         payload = {
             "action": "next",
             "messages": [{
-                "id": new_uuid(),
+                "id": context.message_id,
                 "author": {"role": "user"},
                 "create_time": time.time(),
                 "content": content,
                 "metadata": metadata,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": context.parent_message_id,
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
+            "thinking_effort": "standard",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
@@ -1094,7 +1130,7 @@ class OpenAIBackendAPI:
         idle_timeout = self._bounded_image_timeout(config.image_sse_idle_timeout_secs)
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=self._image_headers(path, requirements, context.conduit_token, "text/event-stream"),
             json=payload,
             timeout=(min(10.0, idle_timeout), idle_timeout),
             stream=True,
@@ -2490,6 +2526,7 @@ class OpenAIBackendAPI:
     ) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls: list[str] = []
+        resolved_reference_ids: set[str] = set()
         max_results = max(1, int(limit)) if limit is not None else None
         self._report_progress("resolving_image_url")
 
@@ -2532,6 +2569,7 @@ class OpenAIBackendAPI:
             if url:
                 if url not in urls:
                     urls.append(url)
+                    resolved_reference_ids.add(file_id)
                     if complete():
                         return finish()
             else:
@@ -2544,6 +2582,8 @@ class OpenAIBackendAPI:
         if not conversation_id or not sediment_ids:
             return finish()
         for sediment_id in sediment_ids:
+            if sediment_id in resolved_reference_ids:
+                continue
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
@@ -2968,8 +3008,9 @@ class OpenAIBackendAPI:
                     if not poll_thread.is_alive() and sse_error is not None:
                         raise sse_error
 
+            attempt_budget = max(0.0, deadline - started)
             exc = ImagePollTimeoutError(
-                f"image request exceeded the {config.image_request_deadline_secs:g}s wall-clock deadline"
+                f"image attempt exceeded its {attempt_budget:g}s wall-clock deadline"
             )
             setattr(exc, "conversation_id", conversation_id)
             if sse_error is not None:
@@ -3017,11 +3058,11 @@ class OpenAIBackendAPI:
         logger.debug({"event": "image_requirements_done"})
         self._report_progress("preparing_conversation")
         logger.debug({"event": "image_prepare_begin"})
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
-        logger.debug({"event": "image_prepare_done", "has_conduit": bool(conduit_token)})
+        prepare_context = self._prepare_image_conversation(prompt, requirements, model)
+        logger.debug({"event": "image_prepare_done", "has_conduit": bool(prepare_context.conduit_token)})
         self._report_progress("starting_generation")
         logger.debug({"event": "image_start_begin"})
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, prepare_context, model, references)
         logger.debug({"event": "image_start_done", "status": getattr(response, "status_code", None)})
         self._report_progress("generating")
         try:
