@@ -13,7 +13,12 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollRateLimitError,
+    ImagePollTimeoutError,
+    OpenAIBackendAPI,
+)
 from utils.helper import (
     IMAGE_MODELS,
     anonymize_token,
@@ -1575,6 +1580,7 @@ def _generate_single_image(
             })
             backend = OpenAIBackendAPI(access_token=token)
             backend.set_image_request_context(request.request_id, attempt_deadline)
+            backend.image_rate_limit_failover_enabled = alternative_available
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1624,7 +1630,15 @@ def _generate_single_image(
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
             slot_settled = True
-            _record_runtime_risk(backend, str(exc), status_code=_exception_status_code(exc), code="image_poll_timeout", scope="account", raw={"phase": "image_stream", "index": index})
+            rate_limited = isinstance(exc, ImagePollRateLimitError)
+            _record_runtime_risk(
+                backend,
+                str(exc),
+                status_code=_exception_status_code(exc),
+                code="image_poll_rate_limit" if rate_limited else "image_poll_timeout",
+                scope="account",
+                raw={"phase": "image_stream", "index": index},
+            )
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1633,7 +1647,7 @@ def _generate_single_image(
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
-                        "event": "image_poll_timeout_retry",
+                        "event": "image_poll_rate_limit_retry" if rate_limited else "image_poll_timeout_retry",
                         "request_token": token,
                         "account_email": account_email,
                         "retry_count": poll_timeout_retry_count,

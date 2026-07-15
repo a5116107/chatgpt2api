@@ -38,6 +38,10 @@ class ImagePollTimeoutError(RuntimeError):
     pass
 
 
+class ImagePollRateLimitError(ImagePollTimeoutError):
+    """Raised when repeated poll throttling should trigger account failover."""
+
+
 class ImageContentPolicyError(RuntimeError):
     """Raised when image generation is blocked by content policy moderation."""
     pass
@@ -182,6 +186,7 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self.image_request_id = ""
         self.image_deadline_monotonic: float | None = None
+        self.image_rate_limit_failover_enabled = False
         self.session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             upstream=True,
@@ -2231,6 +2236,9 @@ class OpenAIBackendAPI:
         tasks_every = int(config.image_tasks_check_every)
         tasks_timeout = float(config.image_tasks_timeout_secs)
         request_timeout = float(config.image_poll_request_timeout_secs)
+        rate_limit_threshold = int(config.image_poll_rate_limit_failover_threshold)
+        rate_limit_retry_delay = float(config.image_poll_rate_limit_retry_delay_secs)
+        rate_limit_streak = 0
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -2308,7 +2316,27 @@ class OpenAIBackendAPI:
                 )
             except UpstreamHTTPError as exc:
                 if exc.status_code in (404, 429, 500, 502, 503, 504):
-                    preferred_delay = fast_interval if exc.status_code == 404 else None
+                    if exc.status_code == 429:
+                        rate_limit_streak += 1
+                        if self.image_rate_limit_failover_enabled and rate_limit_streak >= rate_limit_threshold:
+                            logger.warning({
+                                "event": "image_poll_rate_limit_failover",
+                                "request_id": self.image_request_id,
+                                "conversation_id": conversation_id,
+                                "attempt": attempt,
+                                "consecutive_429s": rate_limit_streak,
+                                "threshold": rate_limit_threshold,
+                            })
+                            error = ImagePollRateLimitError(
+                                f"image polling received {rate_limit_streak} consecutive 429 responses"
+                            )
+                            setattr(error, "status_code", 429)
+                            setattr(error, "conversation_id", conversation_id or "")
+                            raise error from exc
+                        preferred_delay = rate_limit_retry_delay if self.image_rate_limit_failover_enabled else None
+                    else:
+                        rate_limit_streak = 0
+                        preferred_delay = fast_interval if exc.status_code == 404 else None
                     if _retry_sleep(
                         "conversation_not_ready" if exc.status_code == 404 else "upstream_status",
                         exc.status_code,
@@ -2320,9 +2348,12 @@ class OpenAIBackendAPI:
                     break
                 raise
             except requests.exceptions.RequestException as exc:
+                rate_limit_streak = 0
                 if _retry_sleep("network", None, str(exc), None):
                     continue
                 break
+
+            rate_limit_streak = 0
 
             for record in self._extract_image_tool_records(conversation):
                 self._add_unique(file_ids, record["file_ids"])
@@ -2808,6 +2839,7 @@ class OpenAIBackendAPI:
     def _clone_for_image_poll(self) -> "OpenAIBackendAPI":
         backend = OpenAIBackendAPI(access_token=self.access_token)
         backend.set_image_request_context(self.image_request_id, self.image_deadline_monotonic)
+        backend.image_rate_limit_failover_enabled = self.image_rate_limit_failover_enabled
         backend.progress_callback = self.progress_callback
         try:
             backend.session.headers.clear()

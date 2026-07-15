@@ -17,7 +17,12 @@ from services.image_task_service import (
     TASK_STATUS_RUNNING,
     TASK_STATUS_SUCCESS,
 )
-from services.openai_backend_api import ChatRequirements, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ChatRequirements,
+    ImagePollRateLimitError,
+    ImagePollTimeoutError,
+    OpenAIBackendAPI,
+)
 from services.protocol import conversation as conversation_module
 from utils.helper import UpstreamHTTPError
 
@@ -48,6 +53,7 @@ class ImagePollingTests(unittest.TestCase):
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
         backend.image_request_id = "task-test"
         backend.image_deadline_monotonic = None
+        backend.image_rate_limit_failover_enabled = False
         backend.progress_callback = None
         return backend
 
@@ -71,6 +77,8 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_poll_initial_wait_secs, 0.25)
             self.assertEqual(config.image_poll_interval_secs, 0.5)
             self.assertEqual(config.image_poll_request_timeout_secs, 2.0)
+            self.assertEqual(config.image_poll_rate_limit_failover_threshold, 2)
+            self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 1.0)
             self.assertEqual(config.image_poll_progress_persist_interval_secs, 2.0)
             self.assertEqual(config.image_png_compress_level, 1)
 
@@ -82,6 +90,15 @@ class ImagePollingTests(unittest.TestCase):
             self.assertEqual(config.image_min_retry_budget_secs, 5.0)
             self.assertEqual(config.get()["image_attempt_timeout_secs"], 15.0)
             self.assertEqual(config.get()["image_min_retry_budget_secs"], 5.0)
+
+        with mock.patch.dict(config.data, {
+            "image_poll_rate_limit_failover_threshold": 99,
+            "image_poll_rate_limit_retry_delay_secs": 99,
+        }, clear=True):
+            self.assertEqual(config.image_poll_rate_limit_failover_threshold, 10)
+            self.assertEqual(config.image_poll_rate_limit_retry_delay_secs, 10.0)
+            self.assertEqual(config.get()["image_poll_rate_limit_failover_threshold"], 10)
+            self.assertEqual(config.get()["image_poll_rate_limit_retry_delay_secs"], 10.0)
 
     def test_transient_conversation_404_is_retried_without_aborting_polling(self) -> None:
         backend = self.backend()
@@ -101,6 +118,79 @@ class ImagePollingTests(unittest.TestCase):
         self.assertEqual(file_ids, [FILE_ID])
         self.assertEqual(backend._get_conversation.call_count, 2)
         self.assertLessEqual(backend._get_conversation.call_args.kwargs["timeout_secs"], 2.0)
+
+    def test_single_429_recovers_without_triggering_account_failover(self) -> None:
+        backend = self.backend()
+        backend.image_rate_limit_failover_enabled = True
+        backend._get_conversation = mock.Mock(side_effect=[
+            UpstreamHTTPError("conversation", 429, {"detail": "rate limited"}),
+            image_conversation(FILE_ID),
+        ])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+
+        with (
+            mock.patch("services.openai_backend_api.time.sleep", return_value=None),
+            mock.patch.dict(config.data, {
+                "image_poll_rate_limit_failover_threshold": 2,
+                "image_poll_rate_limit_retry_delay_secs": 0.25,
+            }),
+        ):
+            file_ids, _ = backend._poll_image_results(
+                "conversation-rate-limit-recovers",
+                timeout_secs=2,
+                initial_wait_secs=0,
+            )
+
+        self.assertEqual(file_ids, [FILE_ID])
+        self.assertEqual(backend._get_conversation.call_count, 2)
+
+    def test_repeated_429_triggers_early_failover_when_alternative_exists(self) -> None:
+        backend = self.backend()
+        backend.image_rate_limit_failover_enabled = True
+        backend._get_conversation = mock.Mock(
+            side_effect=UpstreamHTTPError("conversation", 429, {"detail": "rate limited"})
+        )
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+
+        with (
+            mock.patch("services.openai_backend_api.time.sleep", return_value=None),
+            mock.patch.dict(config.data, {
+                "image_poll_rate_limit_failover_threshold": 2,
+                "image_poll_rate_limit_retry_delay_secs": 0.25,
+            }),
+        ):
+            with self.assertRaises(ImagePollRateLimitError) as raised:
+                backend._poll_image_results(
+                    "conversation-rate-limit-failover",
+                    timeout_secs=2,
+                    initial_wait_secs=0,
+                )
+
+        self.assertEqual(getattr(raised.exception, "status_code", None), 429)
+        self.assertEqual(backend._get_conversation.call_count, 2)
+
+    def test_repeated_429_keeps_polling_when_no_alternative_exists(self) -> None:
+        backend = self.backend()
+        backend.image_rate_limit_failover_enabled = False
+        backend._get_conversation = mock.Mock(side_effect=[
+            UpstreamHTTPError("conversation", 429, {"detail": "rate limited"}),
+            UpstreamHTTPError("conversation", 429, {"detail": "rate limited"}),
+            image_conversation(FILE_ID),
+        ])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+
+        with (
+            mock.patch("services.openai_backend_api.time.sleep", return_value=None),
+            mock.patch.dict(config.data, {"image_poll_rate_limit_failover_threshold": 2}),
+        ):
+            file_ids, _ = backend._poll_image_results(
+                "conversation-rate-limit-no-alternative",
+                timeout_secs=2,
+                initial_wait_secs=0,
+            )
+
+        self.assertEqual(file_ids, [FILE_ID])
+        self.assertEqual(backend._get_conversation.call_count, 3)
 
     def test_single_result_url_resolution_stops_after_first_valid_file(self) -> None:
         backend = self.backend()
@@ -493,9 +583,15 @@ class ImageTaskLifecycleTests(unittest.TestCase):
                 model="gpt-image-2",
                 size="1024x1024",
             )
-            time.sleep(0.14)
-            with service._lock:
-                running = dict(service._tasks["owner:task-1"])
+            heartbeat_deadline = time.time() + 1.0
+            while True:
+                with service._lock:
+                    running = dict(service._tasks["owner:task-1"])
+                if running["last_heartbeat_ts"] > running["started_ts"]:
+                    break
+                if time.time() >= heartbeat_deadline:
+                    break
+                time.sleep(0.01)
             self.assertEqual(running["status"], TASK_STATUS_RUNNING)
             self.assertGreater(running["last_heartbeat_ts"], running["started_ts"])
             release_handler.set()

@@ -580,6 +580,25 @@ class ConfigStore:
             return 2.0
 
     @property
+    def image_poll_rate_limit_failover_threshold(self) -> int:
+        """Consecutive poll 429s required before switching to a healthy alternative account."""
+        try:
+            return min(10, max(1, int(self.data.get("image_poll_rate_limit_failover_threshold", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
+    def image_poll_rate_limit_retry_delay_secs(self) -> float:
+        """Short retry delay for a first poll 429 when account failover is available."""
+        try:
+            return min(
+                10.0,
+                max(0.25, float(self.data.get("image_poll_rate_limit_retry_delay_secs", 1.0))),
+            )
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
     def image_poll_progress_persist_interval_secs(self) -> float:
         """Minimum interval between durable polling-progress updates."""
         try:
@@ -790,6 +809,8 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_poll_request_timeout_secs"] = self.image_poll_request_timeout_secs
+        data["image_poll_rate_limit_failover_threshold"] = self.image_poll_rate_limit_failover_threshold
+        data["image_poll_rate_limit_retry_delay_secs"] = self.image_poll_rate_limit_retry_delay_secs
         data["image_poll_progress_persist_interval_secs"] = self.image_poll_progress_persist_interval_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs
