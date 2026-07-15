@@ -2,6 +2,8 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type ImagePoolState = "ready" | "probation" | "cooldown" | "exhausted" | "quarantined" | "disabled";
+export type ImageQuotaConfidence = "verified" | "estimated" | "unknown";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -36,6 +38,20 @@ export type Account = {
   fail: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  image_pool_state?: ImagePoolState;
+  image_pool_reason?: string | null;
+  image_quota_confidence?: ImageQuotaConfidence;
+  image_quota_updated_at?: string | null;
+  image_cooldown_until?: number | string | null;
+  image_next_probe_at?: number | string | null;
+  image_last_probe_at?: string | null;
+  image_last_probe_error?: string | null;
+  image_success_ema?: number;
+  image_latency_ema_ms?: number;
+  image_consecutive_failures?: number;
+  image_inflight?: number;
+  image_probe_inflight?: boolean;
+  created_at?: string | null;
 };
 
 export type AccountImportPayload = {
@@ -79,6 +95,15 @@ type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
   errors: Array<{ access_token: string; error: string }>;
+};
+
+type ImagePoolProbeResponse = {
+  checked: number;
+  healthy: number;
+  quarantined: number;
+  failures: Array<{ account_hash: string; error: string }>;
+  stats: Record<string, unknown>;
+  items: Account[];
 };
 
 type AccountUpdateResponse = {
@@ -350,6 +375,13 @@ export async function refreshAccounts(accessTokens: string[]) {
   return httpRequest<AccountRefreshResponse>("/api/accounts/refresh", {
     method: "POST",
     body: { access_tokens: accessTokens },
+  });
+}
+
+export async function probeImagePool(limit = 20) {
+  return httpRequest<ImagePoolProbeResponse>("/api/accounts/image-pool/probe", {
+    method: "POST",
+    body: { limit },
   });
 }
 

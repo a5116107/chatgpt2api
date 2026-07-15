@@ -36,8 +36,11 @@ class FakeBackend(OpenAIBackendAPI):
         self.calls = 0
         self.file_urls: dict[str, str] = {}
         self.sediment_urls: dict[str, str] = {}
+        self.image_deadline_monotonic = None
+        self.image_request_id = "multi-image-test"
+        self.progress_callback = None
 
-    def _get_conversation(self, conversation_id: str) -> dict:
+    def _get_conversation(self, conversation_id: str, **_kwargs) -> dict:
         self.calls += 1
         index = min(self.calls - 1, len(self.conversations) - 1)
         return self.conversations[index]
@@ -111,7 +114,7 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(file_ids, ["file-first", "file-second", "file-third"])
         self.assertEqual(sediment_ids, ["sed-first"])
 
-    def test_poll_waits_for_generated_asset_ids_to_settle(self) -> None:
+    def test_poll_returns_the_first_generated_asset_without_settle_delay(self) -> None:
         backend = FakeBackend([
             _conversation(["file-one"]),
             _conversation(["file-one", "file-two"], ["sed-one"]),
@@ -124,9 +127,9 @@ class MultiImageResultTests(unittest.TestCase):
         ):
             file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
 
-        self.assertEqual(file_ids, ["file-one", "file-two"])
-        self.assertEqual(sediment_ids, ["sed-one"])
-        self.assertEqual(backend.calls, 3)
+        self.assertEqual(file_ids, ["file-one"])
+        self.assertEqual(sediment_ids, [])
+        self.assertEqual(backend.calls, 1)
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()

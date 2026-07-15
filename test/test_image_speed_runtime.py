@@ -12,6 +12,7 @@ from unittest import mock
 
 from services.account_service import AccountService
 from services.config import config
+from services.image_account_pool import ImagePoolOutcome
 from services.image_task_service import (
     ImageTaskService,
     TASK_STATUS_ERROR,
@@ -489,6 +490,59 @@ class ImageRaceTests(unittest.TestCase):
 
 
 class ImageAccountFailoverTests(unittest.TestCase):
+    def test_exhausted_transient_retries_do_not_release_the_final_slot_twice(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            started_monotonic=started,
+            deadline_monotonic=started + 120.0,
+        )
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, *_args) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def tls_failure(*_args, **_kwargs):
+            raise conversation_module.ImageGenerationError("TLS connect error")
+            yield
+
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-1",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"access_token": "token-1", "email": "token-1@example.test"},
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "has_alternative_image_account",
+                return_value=True,
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result") as mark_result,
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=tls_failure),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+            mock.patch.object(conversation_module, "_sleep_with_image_deadline"),
+        ):
+            with self.assertRaisesRegex(conversation_module.ImageGenerationError, "TLS connect error"):
+                conversation_module._generate_single_image(request, 1, 1)
+
+        self.assertEqual(release_slot.call_count, 3)
+        mark_result.assert_called_once()
+
     def test_revoked_tokens_continue_to_a_healthy_account_within_configured_limit(self) -> None:
         started = time.monotonic()
         request = conversation_module.ConversationRequest(
@@ -692,7 +746,7 @@ class ImageAccountFailoverTests(unittest.TestCase):
                 side_effect=lambda token: {"access_token": token, "email": f"{token}@example.test"},
             ),
             mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
-            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "mark_image_result") as mark_result,
             mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
             mock.patch.object(conversation_module, "stream_image_outputs", side_effect=stream),
             mock.patch.object(conversation_module, "_record_runtime_risk"),
@@ -706,6 +760,10 @@ class ImageAccountFailoverTests(unittest.TestCase):
         self.assertEqual(len(deadlines), 2)
         self.assertLessEqual(max(deadlines), started + 55.1)
         self.assertLess(max(deadlines), request.deadline_monotonic)
+        self.assertEqual(
+            [call.kwargs.get("outcome") for call in mark_result.call_args_list],
+            [ImagePoolOutcome.TIMEOUT, ImagePoolOutcome.SUCCESS],
+        )
 
     def test_retry_does_not_start_without_a_useful_time_budget(self) -> None:
         started = time.monotonic()

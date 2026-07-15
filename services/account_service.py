@@ -14,6 +14,19 @@ from urllib.parse import urlencode
 
 from services.config import config
 from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+from services.image_account_pool import (
+    ImagePoolOutcome,
+    ImagePoolState,
+    apply_image_outcome,
+    apply_probe_result,
+    classify_image_outcome,
+    image_pool_score,
+    is_image_pool_schedulable,
+    is_terminal_image_token,
+    normalize_image_pool_fields,
+    probe_is_due,
+    quota_refresh_is_due,
+)
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -57,6 +70,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_inflight_meta: dict[str, list[float]] = {}
+        self._image_probe_inflight: set[str] = set()
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -156,59 +170,19 @@ class AccountService:
 
     @staticmethod
     def _access_token_hard_dead(account: dict | None) -> bool:
-        """True when access token itself is dead for API calls.
-
-        Chat-only soft signals (e.g. text_stream:token_revoked) must remain image-eligible.
-        Hard death from /backend-api/me or oauth invalidation must not burn image rotate budget.
-        # PATCH_MARKER image_skip_hard_dead_soft_r12
-        """
+        """Return whether an access token reached a terminal upstream state."""
         if not isinstance(account, dict):
             return True
-        blob = " ".join(
-            str(account.get(k) or "")
-            for k in (
-                "last_token_refresh_error",
-                "last_refresh_error",
-                "last_error",
-                "error",
-                "note",
-                "risk_status",
-            )
-        ).lower()
-        if not blob.strip():
-            return False
-        hard_markers = (
-            "token invalidated",
-            "token_invalidated",
-            "invalidated oauth",
-            "account_deactivated",
-            "refresh_token_invalidated",
-            "session has ended",
-            "invalid_grant",
-            "app_session_terminated",
-            "oauth_refresh_http_401",
-            "oauth_refresh_http_403",
-            # NOTE r25: bare "/backend-api/me" is NOT hard-dead; fresh free tokens can 403 me
-            # while image/chat still work. Only explicit token invalidation markers hard-kill.
-        )
-        # PATCH_MARKER hard_dead_markers_r23
-        # PATCH_MARKER me_not_hard_dead_r25
-# PATCH_MARKER hard_dead_refresh_disable_r24
-# PATCH_MARKER free_deactivated_disable_r24
-        # text_stream:token_revoked alone is chat-scoped soft; keep image.
-        if "text_stream:token_revoked" in blob and not any(m in blob for m in hard_markers if m != "token_revoked"):
-            # only soft chat marker
-            if "token invalidated" not in blob and "/backend-api/me" not in blob and "invalidated oauth" not in blob:
-                return False
-        return any(m in blob for m in hard_markers)
+        return is_terminal_image_token(account)
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
+        if not is_image_pool_schedulable(account, now_epoch=time.time()):
+            return False
         status = str(account.get("status") or "").strip()
-        # Hard blocks only. Soft 异常 (e.g. free text_stream token_revoked) must not
-        # permanently kill image selection while quota remains.
+        # Terminal token states are filtered by the caller before quota ranking.
         if status in {"禁用", "限流"}:
             return False
         if not str(account.get("access_token") or "").strip():
@@ -229,6 +203,8 @@ class AccountService:
         直接放行到生图链路，避免每次选号都同步打 /me + /conversation-init + /default-account。
         """
         if not isinstance(account, dict):
+            return False
+        if AccountService._access_token_hard_dead(account):
             return False
         if str(account.get("status") or "").strip() != "正常":
             return False
@@ -284,7 +260,6 @@ class AccountService:
             return True
 
     @staticmethod
-    @staticmethod
     def _is_free_account(account: dict | None) -> bool:
         """Free / unknown plan accounts die quickly under password rescue storms."""
         if not isinstance(account, dict):
@@ -295,8 +270,8 @@ class AccountService:
             return True
         return plan not in {"plus", "pro", "prolite", "team", "business", "enterprise"}
 
+    @staticmethod
     def _normalize_account_type(value: object) -> str | None:
-
         raw = str(value or "").strip()
         if not raw:
             return None
@@ -391,6 +366,7 @@ class AccountService:
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
+        normalized = normalize_image_pool_fields(normalized, now_epoch=time.time())
         normalized, _profile = runtime_profile_service.ensure_account_profile(normalized)
         return normalized
 
@@ -623,6 +599,13 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            was_revoked = self._access_token_hard_dead(current)
+            next_item["token_status"] = "active"
+            next_item["token_revoked"] = False
+            next_item.pop("token_revoked_at", None)
+            next_item.pop("token_revoked_source", None)
+            if was_revoked and str(next_item.get("status") or "").strip() == "禁用":
+                next_item["status"] = "正常"
 
             account = self._normalize_account(next_item)
             if account is None:
@@ -647,6 +630,7 @@ class AccountService:
             "refresh_token 已刷新 access_token",
             {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
         )
+        self._sync_risk_control_capabilities()
         return new_token
 
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
@@ -739,6 +723,7 @@ class AccountService:
                 new_access_token = result.get("access_token", "")
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
+
                 # 构建 token_data 供 _apply_refreshed_tokens 使用
                 token_data = {
                     "access_token": new_access_token,
@@ -1375,6 +1360,7 @@ class AccountService:
             token
             for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
             if int(self._image_inflight.get(token, 0)) < max_concurrency
+            and token not in getattr(self, "_image_probe_inflight", set())
         ]
         # Prefer healthy 正常 first, then soft 异常 as fallback.
         # Within each tier: no refresh/token error, lower invalid_count, newer created_at.
@@ -1419,6 +1405,7 @@ class AccountService:
             created_ts = created.timestamp() if created is not None else 0.0
             invalid = int(acc.get("invalid_count") or 0)
             image_inflight = int(self._image_inflight.get(tok, 0))
+            pool_score = image_pool_score(acc, inflight=image_inflight)
             image_samples = int(acc.get("image_health_samples") or 0)
             image_success_ema = float(acc.get("image_success_ema") if image_samples else 0.5)
             image_latency = float(acc.get("image_latency_ema_ms") or 60000.0)
@@ -1434,6 +1421,7 @@ class AccountService:
                 probe_rank = 2
             # sort ascending: smaller is better
             return (
+                *pool_score,
                 status_rank,
                 token_dead,
                 refresh_err,
@@ -1621,13 +1609,7 @@ class AccountService:
         return (status_penalty, refresh_error_penalty, invalid_count, fail_count, success_bonus, -created_ts)
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
-        """Pick a token for chat/text only.
-
-        Soft-abnormal free accounts (text_stream:token_revoked with remaining image quota)
-        must stay eligible for image selection, but they must NOT be selected for chat.
-        Otherwise rotate budgets are wasted on already-revoked text tokens and soft_chat
-        fails even when healthy 正常 accounts remain.
-        """
+        """Pick a non-terminal token for chat/text requests."""
         excluded = set(excluded_tokens or set())
         with self._lock:
             candidates = []
@@ -1638,6 +1620,8 @@ class AccountService:
                     continue
                 # Chat strictly uses healthy accounts. Soft 异常 free keep image only.
                 if status != "正常":
+                    continue
+                if self._access_token_hard_dead(account):
                     continue
                 if not self._capability_allows(account, "chat"):
                     continue
@@ -1705,14 +1689,12 @@ class AccountService:
                 "oauth_refresh_http_403",
             )
         )
-        chat_soft_only = (
-            ("text_stream:token_revoked" in low_event or low_event.strip() == "token_revoked")
-            and not hard_dead
-        )
-        # PATCH_MARKER hard_dead_free_disable_r23
-        # Hard-dead accounts must not stay as soft「异常」with fake quota.
-        # Disable them (keep row for audit). Chat-only soft revoke continues soft-keep path.
-        if hard_dead and not chat_soft_only:
+        if hard_dead:
+            already_quarantined = (
+                str(account.get("status") or "").strip() == "禁用"
+                and str(account.get("token_status") or "").strip().lower() == "revoked"
+            )
+            revoked_at = str(account.get("token_revoked_at") or "").strip() or datetime.now(timezone.utc).isoformat()
             try:
                 self.release_image_slot(access_token)
             except Exception:
@@ -1722,14 +1704,18 @@ class AccountService:
                 {
                     "status": "禁用",
                     "quota": 0,
+                    "token_status": "revoked",
+                    "token_revoked": True,
+                    "token_revoked_at": revoked_at,
+                    "token_revoked_source": str(account.get("token_revoked_source") or event or "upstream")[:200],
                     "last_refresh_error": str(event or "hard_dead")[:200],
                     "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
-                    "invalid_count": int(account.get("invalid_count") or 0) + 1,
+                    "invalid_count": int(account.get("invalid_count") or 0) + (0 if already_quarantined else 1),
                 },
                 quiet=quiet,
                 sync_capabilities=sync_capabilities,
             )
-            if not quiet:
+            if not quiet and not already_quarantined:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "hard-dead账号已禁用",
@@ -1854,10 +1840,12 @@ class AccountService:
         """
         with self._lock:
             result = []
+            now_epoch = time.time()
             for item in self._accounts.values():
-                account = dict(item)
+                account = normalize_image_pool_fields(item, now_epoch=now_epoch)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                account["image_probe_inflight"] = token in self._image_probe_inflight
                 result.append(account)
             return result
 
@@ -2035,7 +2023,7 @@ class AccountService:
                 if not quiet:
                     log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                     {"token": anonymize_token(access_token), "status": account.get("status")})
-        if not quiet and sync_capabilities:
+        if sync_capabilities:
             self._sync_risk_control_capabilities()
         return updated_account
 
@@ -2201,7 +2189,15 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool, duration_ms: int | None = None) -> dict | None:
+    def mark_image_result(
+        self,
+        access_token: str,
+        success: bool,
+        duration_ms: int | None = None,
+        *,
+        outcome: str | None = None,
+        error: str = "",
+    ) -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
@@ -2210,41 +2206,28 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
-            next_item = dict(current)
-            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            next_item["last_used_at"] = now_text
-            samples = int(next_item.get("image_health_samples") or 0)
-            previous_success_ema = float(next_item.get("image_success_ema") if samples else 0.5)
-            next_item["image_health_samples"] = samples + 1
-            next_item["image_success_ema"] = round(previous_success_ema * 0.8 + (1.0 if success else 0.0) * 0.2, 6)
-            if duration_ms is not None and duration_ms >= 0:
-                previous_latency = float(next_item.get("image_latency_ema_ms") or 0.0)
-                next_item["image_latency_ema_ms"] = round(
-                    float(duration_ms) if previous_latency <= 0 else previous_latency * 0.8 + float(duration_ms) * 0.2,
-                    2,
-                )
-            image_quota_unknown = bool(next_item.get("image_quota_unknown"))
+            resolved_outcome = outcome or (
+                ImagePoolOutcome.SUCCESS if success else ImagePoolOutcome.UPSTREAM_ERROR
+            )
+            next_item = apply_image_outcome(
+                current,
+                resolved_outcome,
+                now_epoch=time.time(),
+                duration_ms=duration_ms,
+                error=error,
+                healthy_interval_secs=config.image_account_probe_healthy_interval_secs,
+                probation_interval_secs=config.image_account_probe_probation_interval_secs,
+                rate_limit_base_secs=config.image_account_rate_limit_cooldown_secs,
+                timeout_base_secs=config.image_account_timeout_cooldown_secs,
+                max_cooldown_secs=config.image_account_max_cooldown_secs,
+                failure_threshold=config.image_account_failure_threshold,
+            )
             if success:
-                next_item["image_consecutive_failures"] = 0
-                next_item["image_last_success_at"] = now_text
-                next_item["success"] = int(next_item.get("success") or 0) + 1
-                if not image_quota_unknown:
-                    next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if not image_quota_unknown and next_item["quota"] == 0:
-                    next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
-                elif next_item.get("status") == "限流":
-                    next_item["status"] = "正常"
-                # PATCH_MARKER sticky_userinfo_clear_r26
                 for key in ("last_refresh_error", "last_token_refresh_error", "last_error", "note"):
                     if self._is_soft_sticky_refresh_error(next_item.get(key)):
                         next_item[key] = None
                 if self._is_soft_sticky_refresh_error(current.get("last_refresh_error")):
                     next_item["last_refresh_error_at"] = None
-            else:
-                next_item["image_consecutive_failures"] = int(next_item.get("image_consecutive_failures") or 0) + 1
-                next_item["image_last_failure_at"] = now_text
-                next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)
             if account is None:
                 return None
@@ -2265,6 +2248,7 @@ class AccountService:
         success: bool,
         duration_ms: int,
         error: str = "",
+        outcome: str | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -2273,21 +2257,18 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
-            next_item = dict(current)
-            samples = int(next_item.get("image_probe_samples") or 0)
-            previous_success = float(next_item.get("image_probe_success_ema") if samples else 0.5)
-            previous_latency = float(next_item.get("image_probe_latency_ema_ms") or 0.0)
-            next_item["image_probe_samples"] = samples + 1
-            next_item["image_probe_success_ema"] = round(
-                previous_success * 0.8 + (1.0 if success else 0.0) * 0.2,
-                6,
+            next_item = apply_probe_result(
+                current,
+                success=success,
+                now_epoch=time.time(),
+                duration_ms=duration_ms,
+                error=error,
+                outcome=outcome,
+                healthy_interval_secs=config.image_account_probe_healthy_interval_secs,
+                probation_interval_secs=config.image_account_probe_probation_interval_secs,
+                rate_limit_base_secs=config.image_account_rate_limit_cooldown_secs,
+                max_cooldown_secs=config.image_account_max_cooldown_secs,
             )
-            next_item["image_probe_latency_ema_ms"] = round(
-                float(duration_ms) if previous_latency <= 0 else previous_latency * 0.8 + float(duration_ms) * 0.2,
-                2,
-            )
-            next_item["image_last_probe_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            next_item["image_last_probe_error"] = None if success else str(error or "probe failed")[:240]
             account = self._normalize_account(next_item)
             if account is None:
                 return None
@@ -2295,57 +2276,190 @@ class AccountService:
             self._save_accounts()
             return dict(account)
 
+    def _select_image_probe_candidate_tokens_locked(self, limit: int) -> list[str]:
+        now_epoch = time.time()
+        tokens = [
+            token
+            for token, account in self._accounts.items()
+            if str(token or "").strip()
+            if int(self._image_inflight.get(token, 0)) == 0
+            and token not in getattr(self, "_image_probe_inflight", set())
+            and probe_is_due(account, now_epoch=now_epoch)
+        ]
+        stable_order = {token: index for index, token in enumerate(tokens)}
+
+        def probe_due_score(token: str) -> tuple[int, float, int]:
+            account = self._accounts.get(token) or {}
+            next_probe = account.get("image_next_probe_at")
+            try:
+                next_probe_at = float(next_probe) if next_probe is not None else None
+            except (TypeError, ValueError):
+                next_probe_at = None
+            last_probe = self._parse_time(account.get("image_last_probe_at"))
+            if next_probe_at is not None:
+                schedule_rank = 1
+                due_at = next_probe_at
+            elif last_probe is None:
+                schedule_rank = 0
+                due_at = 0.0
+            else:
+                schedule_rank = 2
+                due_at = last_probe.timestamp()
+            return schedule_rank, due_at, stable_order[token]
+
+        tokens.sort(key=probe_due_score)
+        return tokens[:max(1, int(limit))]
+
     def _list_image_probe_candidate_tokens(self, limit: int) -> list[str]:
-        """Select idle accounts that have never been probed or were probed least recently."""
+        """Select idle accounts whose state-aware probe deadline has arrived."""
         with self._lock:
-            tokens = [
+            return self._select_image_probe_candidate_tokens_locked(limit)
+
+    def _claim_image_probe_candidate_tokens(self, limit: int) -> list[str]:
+        """Atomically select and reserve accounts for one probe batch."""
+        with self._lock:
+            tokens = self._select_image_probe_candidate_tokens_locked(limit)
+            self._image_probe_inflight.update(tokens)
+            return tokens
+
+    def quarantine_persisted_terminal_tokens(self, source: str = "persisted_revocation") -> int:
+        """Persist terminal token evidence before any account can be selected."""
+        with self._lock:
+            terminal_tokens = [
                 token
-                for token in self._list_available_candidate_tokens()
-                if int(self._image_inflight.get(token, 0)) == 0
+                for token, item in self._accounts.items()
+                if str(item.get("status") or "").strip() != "禁用"
+                and self._access_token_hard_dead(item)
             ]
-            stable_order = {token: index for index, token in enumerate(tokens)}
-
-            def probe_due_score(token: str) -> tuple[int, float, int]:
-                account = self._accounts.get(token) or {}
-                last_probe = self._parse_time(account.get("image_last_probe_at"))
-                return (
-                    0 if last_probe is None else 1,
-                    last_probe.timestamp() if last_probe is not None else 0.0,
-                    stable_order[token],
-                )
-
-            tokens.sort(key=probe_due_score)
-            return tokens[:max(1, int(limit))]
+        quarantined = 0
+        for token in terminal_tokens:
+            account = self.get_account(token) or {}
+            evidence = str(
+                account.get("token_revoked_source")
+                or account.get("image_last_probe_error")
+                or account.get("last_refresh_error")
+                or account.get("last_token_refresh_error")
+                or "terminal_token_state"
+            )
+            self.remove_invalid_token(
+                token,
+                f"{source}:{evidence}",
+                quiet=True,
+                sync_capabilities=False,
+            )
+            quarantined += 1
+        if quarantined:
+            self._sync_risk_control_capabilities()
+        return quarantined
 
     def probe_image_candidates(self, limit: int = 3) -> dict[str, Any]:
-        """Probe chat requirements off the request path and persist image readiness signals."""
-        tokens = self._list_image_probe_candidate_tokens(limit)
+        """Probe due accounts concurrently and persist state-aware readiness signals."""
+        quarantined = self.quarantine_persisted_terminal_tokens("image_probe_sweep")
+        probe_quarantined = 0
+        tokens = self._claim_image_probe_candidate_tokens(limit)
+        if not tokens:
+            return {
+                "checked": 0,
+                "healthy": 0,
+                "quarantined": quarantined,
+                "failures": [],
+            }
         checked = 0
         healthy = 0
         failures: list[dict[str, str]] = []
-        for token in tokens:
+
+        def _probe(token: str) -> tuple[str, bool, int, str, str | None]:
             started = time.monotonic()
             error = ""
+            outcome: str | None = None
             try:
-                from services.openai_backend_api import OpenAIBackendAPI
+                account = self.get_account(token) or {}
+                refresh_quota = quota_refresh_is_due(
+                    account,
+                    now_epoch=time.time(),
+                    interval_secs=config.image_account_quota_refresh_interval_secs,
+                )
+                if refresh_quota:
+                    refreshed = self.fetch_remote_info(
+                        token,
+                        event="image_quota_probe",
+                        defer_invalid_removal=False,
+                    ) or {}
+                    success = is_image_pool_schedulable(
+                        refreshed,
+                        now_epoch=time.time(),
+                    ) and self._is_image_account_available(refreshed)
+                    if not success:
+                        state = str(refreshed.get("image_pool_state") or "").strip().lower()
+                        error = (
+                            "quota_exhausted"
+                            if state == ImagePoolState.EXHAUSTED
+                            else "account_not_schedulable"
+                        )
+                        outcome = (
+                            ImagePoolOutcome.QUOTA_EXHAUSTED
+                            if state == ImagePoolState.EXHAUSTED
+                            else ImagePoolOutcome.UPSTREAM_ERROR
+                        )
+                else:
+                    from services.openai_backend_api import OpenAIBackendAPI
 
-                with OpenAIBackendAPI(token) as backend:
-                    backend.set_image_request_context(
-                        f"probe-{anonymize_token(token).split(':')[-1]}",
-                        time.monotonic() + min(30.0, config.image_request_deadline_secs),
-                    )
-                    backend._bootstrap()
-                    backend._get_chat_requirements()
-                healthy += 1
-                success = True
+                    with OpenAIBackendAPI(token) as backend:
+                        backend.set_image_request_context(
+                            f"probe-{anonymize_token(token).split(':')[-1]}",
+                            time.monotonic() + min(30.0, config.image_request_deadline_secs),
+                        )
+                        backend._bootstrap()
+                        backend._get_chat_requirements()
+                    success = True
             except Exception as exc:
                 success = False
                 error = str(exc)
-                failures.append({"account_hash": anonymize_token(token), "error": error[:160]})
+                status_code = getattr(exc, "status_code", None)
+                try:
+                    status_code = int(status_code) if status_code is not None else None
+                except (TypeError, ValueError):
+                    status_code = None
+                outcome = classify_image_outcome(error, status_code=status_code)
             duration_ms = int((time.monotonic() - started) * 1000)
-            self.mark_image_probe_result(token, success, duration_ms, error)
-            checked += 1
-        return {"checked": checked, "healthy": healthy, "failures": failures}
+            return token, success, duration_ms, error, outcome
+
+        max_workers = max(1, min(len(tokens), config.image_account_probe_parallelism))
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="image-account-probe") as executor:
+                futures = [executor.submit(_probe, token) for token in tokens]
+                for future in as_completed(futures):
+                    token, success, duration_ms, error, outcome = future.result()
+                    updated = self.mark_image_probe_result(
+                        token,
+                        success,
+                        duration_ms,
+                        error,
+                        outcome,
+                    )
+                    if success:
+                        healthy += 1
+                    else:
+                        failures.append({"account_hash": anonymize_token(token), "error": error[:160]})
+                    if (
+                        not success
+                        and updated
+                        and updated.get("image_pool_state") == ImagePoolState.QUARANTINED
+                    ):
+                        quarantined += 1
+                        probe_quarantined += 1
+                    checked += 1
+        finally:
+            with self._lock:
+                getattr(self, "_image_probe_inflight", set()).difference_update(tokens)
+        if probe_quarantined:
+            self._sync_risk_control_capabilities()
+        return {
+            "checked": checked,
+            "healthy": healthy,
+            "quarantined": quarantined,
+            "failures": failures,
+        }
 
     def fetch_remote_info(
         self,
@@ -2404,6 +2518,13 @@ class AccountService:
             active_account = self.get_account(active_token) or {"access_token": active_token}
             self._record_runtime_risk_event(str(exc), account=active_account, raw={"phase": event, "kind": "fetch_remote_info_exception"})
             raise
+        if bool(result.get("image_quota_unknown")):
+            result["image_quota_confidence"] = "unknown"
+        elif result.get("limits_progress"):
+            result["image_quota_confidence"] = "verified"
+        else:
+            result["image_quota_confidence"] = "estimated"
+        result["image_quota_updated_at"] = datetime.now(timezone.utc).isoformat()
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result, quiet=True, sync_capabilities=False)
 
@@ -2710,7 +2831,10 @@ class AccountService:
 
     def get_stats(self) -> dict:
         with self._lock:
-            items = list(self._accounts.values())
+            items = [dict(account) for account in self._accounts.values()]
+            image_inflight = dict(self._image_inflight)
+            image_probe_inflight = set(self._image_probe_inflight)
+            cumulative_total = self._cumulative_total
         total = len(items)
         active = sum(1 for a in items if a.get("status") == "正常")
         limited = sum(1 for a in items if a.get("status") == "限流")
@@ -2720,13 +2844,53 @@ class AccountService:
         unlimited = sum(1 for a in items if a.get("status") == "正常" and bool(a.get("image_quota_unknown")))
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
+        now_epoch = time.time()
+        normalized_items = [
+            normalize_image_pool_fields(account, now_epoch=now_epoch)
+            for account in items
+        ]
+        image_pool_states = {state: 0 for state in ImagePoolState.ALL}
+        for account in normalized_items:
+            state = str(account.get("image_pool_state") or ImagePoolState.PROBATION)
+            image_pool_states[state] = image_pool_states.get(state, 0) + 1
+        schedulable = [
+            account
+            for account in normalized_items
+            if is_image_pool_schedulable(account, now_epoch=now_epoch)
+            and self._is_image_account_available(account)
+        ]
+        image_schedulable_quota = sum(max(0, int(a.get("quota") or 0)) for a in schedulable)
+        image_verified_quota = sum(
+            max(0, int(a.get("quota") or 0))
+            for a in schedulable
+            if a.get("image_quota_confidence") == "verified"
+        )
+        image_quota_confidence = {"verified": 0, "estimated": 0, "unknown": 0}
+        for account in schedulable:
+            confidence = str(account.get("image_quota_confidence") or "estimated")
+            image_quota_confidence[confidence] = image_quota_confidence.get(confidence, 0) + 1
+        image_probe_due = sum(
+            1
+            for account in normalized_items
+            if str(account.get("access_token") or "") not in image_probe_inflight
+            and probe_is_due(account, now_epoch=now_epoch)
+        )
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        image_available_slots = sum(
+            max(
+                0,
+                max_concurrency
+                - int(image_inflight.get(str(account.get("access_token") or ""), 0)),
+            )
+            for account in schedulable
+        )
         by_type = {}
         for a in items:
             t = a.get("type", "unknown")
             by_type[t] = by_type.get(t, 0) + 1
         return {
             "total": total,
-            "cumulative_total": self._cumulative_total,
+            "cumulative_total": cumulative_total,
             "active": active,
             "limited": limited,
             "abnormal": abnormal,
@@ -2736,13 +2900,21 @@ class AccountService:
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,
+            "image_pool_states": image_pool_states,
+            "image_schedulable_accounts": len(schedulable),
+            "image_schedulable_quota": image_schedulable_quota,
+            "image_verified_quota": image_verified_quota,
+            "image_quota_confidence": image_quota_confidence,
+            "image_probe_due": image_probe_due,
+            "image_probe_inflight": len(image_probe_inflight),
+            "image_available_slots": image_available_slots,
         }
 
     def account_health(self) -> dict:
         stats = self.get_stats()
         return {
-            "healthy": stats["active"] > 0 or stats["unlimited_quota_count"] > 0,
-            "status": "ok" if stats["active"] > 0 else "degraded",
+            "healthy": stats["image_schedulable_accounts"] > 0,
+            "status": "ok" if stats["image_schedulable_accounts"] > 0 else "degraded",
             **stats,
         }
 

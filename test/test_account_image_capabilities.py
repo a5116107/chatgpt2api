@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
+from services.image_account_pool import ImagePoolOutcome, ImagePoolState
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -17,12 +19,12 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "限流", "image_quota_unknown": True, "quota": 0}
+                {"access_token": "token-1", "status": "限流", "image_quota_unknown": True, "quota": 0}
             )
         )
         self.assertTrue(
             AccountService._is_image_account_available(
-                {"status": "正常", "image_quota_unknown": True, "quota": 0}
+                {"access_token": "token-1", "status": "正常", "image_quota_unknown": True, "quota": 0}
             )
         )
 
@@ -93,6 +95,248 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_legacy_account_is_migrated_to_probation_pool_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [{"access_token": "token-new", "status": "正常", "quota": 25}]
+            )
+
+            account = service.get_account("token-new")
+
+            self.assertIsNotNone(account)
+            self.assertEqual(account["image_pool_state"], ImagePoolState.PROBATION)
+            self.assertEqual(account["image_quota_confidence"], "estimated")
+
+    def test_manual_disable_and_chat_only_revoke_are_not_terminal_image_tokens(self) -> None:
+        self.assertFalse(AccountService._access_token_hard_dead({"status": "禁用"}))
+        self.assertFalse(
+            AccountService._access_token_hard_dead(
+                {"last_refresh_error": "text_stream:token_revoked"}
+            )
+        )
+        self.assertTrue(
+            AccountService._access_token_hard_dead(
+                {"last_refresh_error": "refresh_token_invalidated"}
+            )
+        )
+
+    def test_rate_limited_account_enters_cooldown_and_leaves_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-rate-limited",
+                        "status": "正常",
+                        "quota": 25,
+                        "image_pool_state": "ready",
+                    },
+                    {
+                        "access_token": "token-ready",
+                        "status": "正常",
+                        "quota": 25,
+                        "image_pool_state": "ready",
+                    },
+                ]
+            )
+
+            updated = service.mark_image_result(
+                "token-rate-limited",
+                success=False,
+                duration_ms=12_000,
+                outcome=ImagePoolOutcome.RATE_LIMITED,
+                error="poll returned 429",
+            )
+            candidates = service._list_available_candidate_tokens()
+
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated["status"], "正常")
+            self.assertEqual(updated["quota"], 25)
+            self.assertEqual(updated["image_pool_state"], ImagePoolState.COOLDOWN)
+            self.assertNotIn("token-rate-limited", candidates)
+            self.assertIn("token-ready", candidates)
+
+    def test_probe_scheduler_only_returns_due_nonterminal_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            future = int(time.time() + 3600)
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-due",
+                        "status": "正常",
+                        "quota": 25,
+                        "image_pool_state": "probation",
+                    },
+                    {
+                        "access_token": "token-later",
+                        "status": "正常",
+                        "quota": 25,
+                        "image_pool_state": "ready",
+                        "image_next_probe_at": future,
+                    },
+                    {
+                        "access_token": "token-revoked",
+                        "status": "禁用",
+                        "quota": 0,
+                        "token_status": "revoked",
+                        "token_revoked": True,
+                    },
+                ]
+            )
+
+            candidates = service._list_image_probe_candidate_tokens(10)
+
+            self.assertEqual(candidates, ["token-due"])
+
+    def test_probe_candidates_are_claimed_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-1", "status": "正常", "quota": 25},
+                    {"access_token": "token-2", "status": "正常", "quota": 25},
+                ]
+            )
+
+            first = service._claim_image_probe_candidate_tokens(1)
+            second = service._claim_image_probe_candidate_tokens(1)
+
+            self.assertEqual(first, ["token-1"])
+            self.assertEqual(second, ["token-2"])
+            self.assertEqual(service._list_available_candidate_tokens(), [])
+
+    def test_exhausted_probe_refreshes_remote_quota_and_reactivates_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-exhausted",
+                        "status": "限流",
+                        "quota": 0,
+                        "image_pool_state": ImagePoolState.EXHAUSTED,
+                    }
+                ]
+            )
+
+            def refresh_quota(token: str, **_kwargs):
+                return service.update_account(
+                    token,
+                    {
+                        "status": "正常",
+                        "quota": 5,
+                        "image_quota_confidence": "verified",
+                    },
+                    quiet=True,
+                )
+
+            service.fetch_remote_info = refresh_quota
+            result = service.probe_image_candidates(1)
+            account = service.get_account("token-exhausted")
+
+            self.assertEqual(result["checked"], 1)
+            self.assertEqual(result["healthy"], 1)
+            self.assertEqual(account["image_pool_state"], ImagePoolState.READY)
+            self.assertEqual(account["quota"], 5)
+
+    def test_stale_quota_is_reconciled_during_a_normal_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-stale-quota",
+                        "status": "正常",
+                        "quota": 8,
+                        "image_pool_state": ImagePoolState.READY,
+                        "image_quota_updated_at": "2000-01-01T00:00:00+00:00",
+                    }
+                ]
+            )
+            refresh_calls: list[str] = []
+
+            def refresh_quota(token: str, **_kwargs):
+                refresh_calls.append(token)
+                return service.update_account(
+                    token,
+                    {
+                        "status": "正常",
+                        "quota": 3,
+                        "image_quota_confidence": "verified",
+                        "image_quota_updated_at": "2099-01-01T00:00:00+00:00",
+                    },
+                    quiet=True,
+                )
+
+            service.fetch_remote_info = refresh_quota
+            result = service.probe_image_candidates(1)
+            account = service.get_account("token-stale-quota")
+
+            self.assertEqual(refresh_calls, ["token-stale-quota"])
+            self.assertEqual(result["healthy"], 1)
+            self.assertEqual(account["quota"], 3)
+            self.assertEqual(account["image_quota_confidence"], "verified")
+
+    def test_pool_stats_report_schedulable_capacity_and_quota_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-ready",
+                        "status": "正常",
+                        "quota": 10,
+                        "image_pool_state": "ready",
+                        "image_quota_confidence": "verified",
+                    },
+                    {
+                        "access_token": "token-probation",
+                        "status": "正常",
+                        "quota": 5,
+                        "image_pool_state": "probation",
+                    },
+                    {
+                        "access_token": "token-disabled",
+                        "status": "禁用",
+                        "quota": 0,
+                    },
+                ]
+            )
+
+            stats = service.get_stats()
+
+            self.assertEqual(stats["image_pool_states"]["ready"], 1)
+            self.assertEqual(stats["image_pool_states"]["probation"], 1)
+            self.assertEqual(stats["image_pool_states"]["disabled"], 1)
+            self.assertEqual(stats["image_schedulable_accounts"], 2)
+            self.assertEqual(stats["image_schedulable_quota"], 15)
+            self.assertEqual(stats["image_verified_quota"], 10)
+            self.assertEqual(stats["image_quota_confidence"], {"verified": 1, "estimated": 1, "unknown": 0})
+
+    def test_pool_stats_use_inflight_and_probe_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-ready",
+                        "status": "正常",
+                        "quota": 10,
+                        "image_pool_state": "ready",
+                    }
+                ]
+            )
+            service._image_inflight["token-ready"] = 2
+            service._image_probe_inflight.add("token-ready")
+
+            stats = service.get_stats()
+
+            self.assertEqual(stats["image_available_slots"], 1)
+            self.assertEqual(stats["image_probe_due"], 0)
+            self.assertEqual(stats["image_probe_inflight"], 1)
 
 
 class TokenLogTests(unittest.TestCase):

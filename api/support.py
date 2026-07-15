@@ -219,7 +219,8 @@ def start_image_account_probe(stop_event: Event) -> Thread:
                     result = account_service.probe_image_candidates(config.image_account_probe_batch_size)
                     print(
                         "[image-account-probe] "
-                        f"checked={result['checked']} healthy={result['healthy']} failures={len(result['failures'])}"
+                        f"checked={result['checked']} healthy={result['healthy']} "
+                        f"quarantined={result.get('quarantined', 0)} failures={len(result['failures'])}"
                     )
             except Exception as exc:
                 print(f"[image-account-probe] fail {exc}")

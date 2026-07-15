@@ -45,11 +45,13 @@ import {
   deleteAccounts,
   fetchAccounts,
   fetchModels,
+  probeImagePool,
   refreshAccounts,
   testProxy,
   updateAccount,
   type Account,
   type AccountStatus,
+  type ImagePoolState,
   type Model,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -65,6 +67,16 @@ const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = 
   { label: "禁用", value: "禁用" },
 ];
 
+const imagePoolStateOptions: { label: string; value: ImagePoolState | "all" }[] = [
+  { label: "全部调度状态", value: "all" },
+  { label: "就绪", value: "ready" },
+  { label: "观察", value: "probation" },
+  { label: "冷却", value: "cooldown" },
+  { label: "额度耗尽", value: "exhausted" },
+  { label: "隔离", value: "quarantined" },
+  { label: "停用", value: "disabled" },
+];
+
 const statusMeta: Record<
   AccountStatus,
   {
@@ -78,14 +90,38 @@ const statusMeta: Record<
   禁用: { icon: Ban, badge: "secondary" },
 };
 
+const imagePoolStateMeta: Record<
+  ImagePoolState,
+  { label: string; badge: ComponentProps<typeof Badge>["variant"] }
+> = {
+  ready: { label: "就绪", badge: "success" },
+  probation: { label: "观察", badge: "info" },
+  cooldown: { label: "冷却", badge: "warning" },
+  exhausted: { label: "额度耗尽", badge: "warning" },
+  quarantined: { label: "隔离", badge: "danger" },
+  disabled: { label: "停用", badge: "secondary" },
+};
+
 const metricCards = [
   { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
-  { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
-  { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
-  { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
-  { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "schedulable", label: "可调度账户", color: "text-emerald-600", icon: CheckCircle2 },
+  { key: "cooldown", label: "冷却账户", color: "text-orange-500", icon: CircleAlert },
+  { key: "exhausted", label: "额度耗尽", color: "text-orange-500", icon: RefreshCw },
+  { key: "quarantined", label: "隔离账户", color: "text-rose-500", icon: CircleOff },
+  { key: "quota", label: "可调度额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
+
+function imagePoolState(account: Account): ImagePoolState {
+  if (account.image_pool_state) return account.image_pool_state;
+  if (account.status === "禁用") return "disabled";
+  if (account.status === "限流") return "exhausted";
+  return "probation";
+}
+
+function isImagePoolSchedulable(account: Account) {
+  const state = imagePoolState(account);
+  return state === "ready" || state === "probation";
+}
 
 function isUnlimitedImageQuotaAccount(account: Account) {
   return account.type === "pro" || account.type === "prolite";
@@ -137,7 +173,7 @@ function formatRestoreAt(value?: string | null) {
 }
 
 function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
+  const availableAccounts = accounts.filter(isImagePoolSchedulable);
   if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
     return "∞";
   }
@@ -145,6 +181,22 @@ function formatQuotaSummary(accounts: Account[]) {
     return "未知";
   }
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function formatPoolTime(value?: number | string | null) {
+  if (value === null || value === undefined || value === "") return "—";
+  const numeric = typeof value === "number" ? value : Number(value);
+  const date = Number.isFinite(numeric) && String(value).trim() !== ""
+    ? new Date(numeric * 1000)
+    : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function maskToken(token?: string) {
@@ -187,6 +239,7 @@ function AccountsPageContent() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatus | "all">("all");
+  const [poolStateFilter, setPoolStateFilter] = useState<ImagePoolState | "all">("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("10");
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -196,6 +249,7 @@ function AccountsPageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isProbing, setIsProbing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
 
@@ -246,9 +300,10 @@ function AccountsPageContent() {
         normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
       const statusMatched = statusFilter === "all" || account.status === statusFilter;
-      return searchMatched && typeMatched && statusMatched;
+      const poolStateMatched = poolStateFilter === "all" || imagePoolState(account) === poolStateFilter;
+      return searchMatched && typeMatched && statusMatched && poolStateMatched;
     });
-  }, [accounts, query, statusFilter, typeFilter]);
+  }, [accounts, poolStateFilter, query, statusFilter, typeFilter]);
 
   const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / Number(pageSize)));
   const safePage = Math.min(page, pageCount);
@@ -259,13 +314,13 @@ function AccountsPageContent() {
 
   const summary = useMemo(() => {
     const total = accounts.length;
-    const active = accounts.filter((item) => item.status === "正常").length;
-    const limited = accounts.filter((item) => item.status === "限流").length;
-    const abnormal = accounts.filter((item) => item.status === "异常").length;
-    const disabled = accounts.filter((item) => item.status === "禁用").length;
+    const schedulable = accounts.filter(isImagePoolSchedulable).length;
+    const cooldown = accounts.filter((item) => imagePoolState(item) === "cooldown").length;
+    const exhausted = accounts.filter((item) => imagePoolState(item) === "exhausted").length;
+    const quarantined = accounts.filter((item) => imagePoolState(item) === "quarantined").length;
     const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, schedulable, cooldown, exhausted, quarantined, quota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -346,6 +401,20 @@ function AccountsPageContent() {
     }
   };
 
+  const handleProbeImagePool = async () => {
+    setIsProbing(true);
+    try {
+      const data = await probeImagePool(20);
+      setAccounts(data.items);
+      const failureText = data.failures.length > 0 ? `，失败 ${data.failures.length} 个` : "";
+      toast.success(`探测完成：检查 ${data.checked} 个，健康 ${data.healthy} 个${failureText}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "号池探测失败");
+    } finally {
+      setIsProbing(false);
+    }
+  };
+
   const openEditDialog = (account: Account) => {
     setEditingAccount(account);
     setEditStatus(account.status);
@@ -417,7 +486,7 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void loadAccounts()}
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
             刷新
@@ -425,14 +494,23 @@ function AccountsPageContent() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleProbeImagePool()}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
+          >
+            {isProbing ? <LoaderCircle className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+            执行待探测任务
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
           </Button>
           <AccountImportDialog
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting}
             onImported={(items) => {
               setAccounts(items);
               setSelectedIds([]);
@@ -637,6 +715,24 @@ function AccountsPageContent() {
                 ))}
               </SelectContent>
             </Select>
+            <Select
+              value={poolStateFilter}
+              onValueChange={(value) => {
+                setPoolStateFilter(value as ImagePoolState | "all");
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-10 w-full rounded-xl border-stone-200 bg-white/85 lg:w-[160px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {imagePoolStateOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </div>
 
@@ -699,7 +795,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1000px] text-left">
+              <table className="w-full min-w-[1240px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -711,10 +807,11 @@ function AccountsPageContent() {
                     <th className="w-56 px-4 py-3">token</th>
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">来源</th>
-                    <th className="w-24 px-4 py-3">状态</th>
+                    <th className="w-32 px-4 py-3">状态 / 调度</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
                     <th className="w-24 px-4 py-3">额度</th>
+                    <th className="w-32 px-4 py-3">健康表现</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">成功</th>
                     <th className="w-18 px-4 py-3">失败</th>
@@ -725,6 +822,8 @@ function AccountsPageContent() {
                   {currentRows.map((account) => {
                     const status = statusMeta[account.status];
                     const StatusIcon = status.icon;
+                    const poolState = imagePoolState(account);
+                    const poolStatus = imagePoolStateMeta[poolState];
 
                     return (
                       <tr
@@ -771,13 +870,22 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge
-                            variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
-                          >
-                            <StatusIcon className="size-3.5" />
-                            {account.status}
-                          </Badge>
+                          <div className="flex flex-col items-start gap-1">
+                            <Badge
+                              variant={status.badge}
+                              className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                            >
+                              <StatusIcon className="size-3.5" />
+                              {account.status}
+                            </Badge>
+                            <Badge
+                              variant={poolStatus.badge}
+                              className="rounded-md px-2 py-1"
+                              title={account.image_pool_reason || undefined}
+                            >
+                              {poolStatus.label}
+                            </Badge>
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
@@ -794,9 +902,29 @@ function AccountsPageContent() {
                           })()}
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="info" className="rounded-md">
-                            {formatQuota(account)}
-                          </Badge>
+                          <div className="space-y-1">
+                            <Badge variant="info" className="rounded-md">
+                              {formatQuota(account)}
+                            </Badge>
+                            <div className="text-[11px] text-stone-400">
+                              {account.image_quota_confidence === "verified"
+                                ? "已校准"
+                                : account.image_quota_confidence === "unknown"
+                                  ? "未知"
+                                  : "估算"}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                          <div>成功率 {Math.round((account.image_success_ema ?? 0.5) * 100)}%</div>
+                          <div>
+                            延迟 {account.image_latency_ema_ms
+                              ? `${(account.image_latency_ema_ms / 1000).toFixed(1)}s`
+                              : "—"}
+                          </div>
+                          {poolState === "cooldown" ? (
+                            <div className="text-amber-600">至 {formatPoolTime(account.image_cooldown_until)}</div>
+                          ) : null}
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {

@@ -8,9 +8,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from services.config import config
 
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 PNG_BYTES = b"\x89PNG\r\n\x1a\n"
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
@@ -68,11 +68,12 @@ class ImageTasksApiTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
+        self.auth_headers = {"Authorization": f"Bearer {config.auth_key}"}
 
     def test_create_generation_task(self):
         response = self.client.post(
             "/api/image-tasks/generations",
-            headers=AUTH_HEADERS,
+            headers=self.auth_headers,
             json={"client_task_id": "task-1", "prompt": "cat", "model": "gpt-image-2"},
         )
 
@@ -86,7 +87,7 @@ class ImageTasksApiTests(unittest.TestCase):
         """测试图片编辑任务接口支持多个上传图片。"""
         response = self.client.post(
             "/api/image-tasks/edits",
-            headers=AUTH_HEADERS,
+            headers=self.auth_headers,
             data={"client_task_id": "edit-1", "prompt": "edit", "model": "gpt-image-2"},
             files=[
                 ("image", ("one.png", b"one", "image/png")),
@@ -104,7 +105,7 @@ class ImageTasksApiTests(unittest.TestCase):
         """测试图片编辑任务接口支持表单 image_url 引用。"""
         response = self.client.post(
             "/api/image-tasks/edits",
-            headers=AUTH_HEADERS,
+            headers=self.auth_headers,
             data={
                 "client_task_id": "edit-url-1",
                 "prompt": "edit",
@@ -119,7 +120,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
 
     def test_list_tasks_reports_missing_ids(self):
-        response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)
+        response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=self.auth_headers)
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()

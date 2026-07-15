@@ -705,6 +705,62 @@ class ConfigStore:
             return 3
 
     @property
+    def image_account_probe_parallelism(self) -> int:
+        try:
+            return max(1, min(10, int(self.data.get("image_account_probe_parallelism", 4))))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
+    def image_account_probe_healthy_interval_secs(self) -> int:
+        try:
+            return max(300, min(86400, int(self.data.get("image_account_probe_healthy_interval_secs", 1800))))
+        except (TypeError, ValueError):
+            return 1800
+
+    @property
+    def image_account_quota_refresh_interval_secs(self) -> int:
+        try:
+            return max(300, min(86400, int(self.data.get("image_account_quota_refresh_interval_secs", 1800))))
+        except (TypeError, ValueError):
+            return 1800
+
+    @property
+    def image_account_probe_probation_interval_secs(self) -> int:
+        try:
+            return max(30, min(3600, int(self.data.get("image_account_probe_probation_interval_secs", 60))))
+        except (TypeError, ValueError):
+            return 60
+
+    @property
+    def image_account_rate_limit_cooldown_secs(self) -> int:
+        try:
+            return max(60, min(3600, int(self.data.get("image_account_rate_limit_cooldown_secs", 600))))
+        except (TypeError, ValueError):
+            return 600
+
+    @property
+    def image_account_timeout_cooldown_secs(self) -> int:
+        try:
+            return max(30, min(1800, int(self.data.get("image_account_timeout_cooldown_secs", 90))))
+        except (TypeError, ValueError):
+            return 90
+
+    @property
+    def image_account_max_cooldown_secs(self) -> int:
+        try:
+            return max(300, min(21600, int(self.data.get("image_account_max_cooldown_secs", 3600))))
+        except (TypeError, ValueError):
+            return 3600
+
+    @property
+    def image_account_failure_threshold(self) -> int:
+        try:
+            return max(1, min(10, int(self.data.get("image_account_failure_threshold", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
@@ -855,6 +911,14 @@ class ConfigStore:
         data["image_account_probe_enabled"] = self.image_account_probe_enabled
         data["image_account_probe_interval_secs"] = self.image_account_probe_interval_secs
         data["image_account_probe_batch_size"] = self.image_account_probe_batch_size
+        data["image_account_probe_parallelism"] = self.image_account_probe_parallelism
+        data["image_account_probe_healthy_interval_secs"] = self.image_account_probe_healthy_interval_secs
+        data["image_account_quota_refresh_interval_secs"] = self.image_account_quota_refresh_interval_secs
+        data["image_account_probe_probation_interval_secs"] = self.image_account_probe_probation_interval_secs
+        data["image_account_rate_limit_cooldown_secs"] = self.image_account_rate_limit_cooldown_secs
+        data["image_account_timeout_cooldown_secs"] = self.image_account_timeout_cooldown_secs
+        data["image_account_max_cooldown_secs"] = self.image_account_max_cooldown_secs
+        data["image_account_failure_threshold"] = self.image_account_failure_threshold
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts

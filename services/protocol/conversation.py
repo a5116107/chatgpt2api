@@ -12,6 +12,7 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
+from services.image_account_pool import ImagePoolOutcome, classify_image_outcome
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
     ImageContentPolicyError,
@@ -1606,11 +1607,23 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                    outcome=ImagePoolOutcome.NO_IMAGE,
+                    error="upstream returned a message instead of an image",
+                )
                 slot_settled = True
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                    outcome=ImagePoolOutcome.NO_IMAGE,
+                    error="upstream completed without generating images",
+                )
                 slot_settled = True
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
@@ -1623,14 +1636,29 @@ def _generate_single_image(
                         conversation_id=conv_id,
                     )
                 return outputs
-            account_service.mark_image_result(token, True, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            account_service.mark_image_result(
+                token,
+                True,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                outcome=ImagePoolOutcome.SUCCESS,
+            )
             slot_settled = True
             _record_runtime_success(backend)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
-            slot_settled = True
             rate_limited = isinstance(exc, ImagePollRateLimitError)
+            account_service.mark_image_result(
+                token,
+                False,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                outcome=(
+                    ImagePoolOutcome.RATE_LIMITED
+                    if rate_limited
+                    else ImagePoolOutcome.TIMEOUT
+                ),
+                error=str(exc),
+            )
+            slot_settled = True
             _record_runtime_risk(
                 backend,
                 str(exc),
@@ -1665,7 +1693,13 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            account_service.mark_image_result(
+                token,
+                False,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                outcome=ImagePoolOutcome.POLICY_REJECTED,
+                error=str(exc),
+            )
             slot_settled = True
             _record_runtime_risk(backend, str(exc), status_code=400, code="policy_rejected", scope="request", raw={"phase": "image_stream", "index": index})
             logger.warning({
@@ -1687,14 +1721,14 @@ def _generate_single_image(
             error_text = str(exc)
             # 连接/代理抖动可能被包装成 ImageGenerationError，按瞬时错误重试，不记硬失败
             if (is_tls_connection_error(error_text) or is_connection_timeout_error(error_text) or is_chat_requirements_transient_error(error_text)) and not returned_result:
-                try:
-                    account_service.release_image_slot(token)
-                except Exception:
-                    pass
-                slot_settled = True
                 if is_tls_connection_error(error_text):
                     tls_retry_count += 1
                     if tls_retry_count <= MAX_TLS_RETRIES:
+                        try:
+                            account_service.release_image_slot(token)
+                        except Exception:
+                            pass
+                        slot_settled = True
                         logger.warning({
                             "event": "image_stream_tls_retry",
                             "request_token": token,
@@ -1709,6 +1743,11 @@ def _generate_single_image(
                 if is_connection_timeout_error(error_text):
                     conn_timeout_retry_count += 1
                     if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                        try:
+                            account_service.release_image_slot(token)
+                        except Exception:
+                            pass
+                        slot_settled = True
                         wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
                         logger.warning({
                             "event": "image_stream_conn_timeout_retry",
@@ -1736,9 +1775,24 @@ def _generate_single_image(
                         "via": "ImageGenerationError",
                     })
                     if requirements_rotate_count <= MAX_REQUIREMENTS_ROTATES:
+                        try:
+                            account_service.release_image_slot(token)
+                        except Exception:
+                            pass
+                        slot_settled = True
                         _sleep_with_image_deadline(request, min(1.0 * requirements_rotate_count, 3.0))
                         continue
-            account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+            account_service.mark_image_result(
+                token,
+                False,
+                duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                outcome=classify_image_outcome(
+                    error_text,
+                    status_code=_exception_status_code(exc),
+                    code=getattr(exc, "code", ""),
+                ),
+                error=error_text,
+            )
             slot_settled = True
             _record_runtime_risk(backend, str(exc), status_code=_exception_status_code(exc), raw={"phase": "image_stream", "index": index, "kind": "image_generation_error"})
             if account_email and not getattr(exc, "account_email", ""):
@@ -1793,7 +1847,16 @@ def _generate_single_image(
             tls_transient = (not returned_result) and tls_hit
             conn_timeout = (not returned_result) and timeout_hit
             if not (requirements_transient or tls_transient or conn_timeout):
-                account_service.mark_image_result(token, False, duration_ms=int((time.monotonic() - attempt_started) * 1000))
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    duration_ms=int((time.monotonic() - attempt_started) * 1000),
+                    outcome=classify_image_outcome(
+                        last_error,
+                        status_code=_exception_status_code(exc),
+                    ),
+                    error=last_error,
+                )
                 slot_settled = True
                 _record_runtime_risk(backend, last_error, status_code=_exception_status_code(exc), raw={"phase": "image_stream", "index": index, "kind": "exception"})
             else:
