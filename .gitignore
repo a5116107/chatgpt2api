@@ -1,0 +1,27 @@
+# Runtime configuration and state
+.env
+config.json
+data/
+backups/
+.deploy/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Web build output
+web/node_modules/
+web/.next/
+web/out/
+
+# Local diagnostics and release artifacts
+EVIDENCE*
+_*.py
+_*.sh
+*.out
+*.tar.gz
+*.tgz
+*.log
