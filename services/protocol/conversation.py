@@ -1863,17 +1863,11 @@ def _generate_single_image(
                     "free": is_free,
                     "error": last_error[:200],
                 })
-                invalid_alternative_available = account_service.has_alternative_image_account(
-                    token,
-                    excluded_tokens=excluded_image_tokens,
-                    plan_type=plan_type,
-                    source_type="codex" if codex_model else None,
-                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                )
-                if (
-                    invalid_alternative_available
-                    and len(excluded_image_tokens) <= config.image_invalid_token_rotate_limit
-                ):
+                # Do not synchronously re-enter account candidate selection after
+                # remove_invalid_token() persisted account state. Under concurrent
+                # image requests that lock path can block the server event loop.
+                # The next acquire is the source of truth for candidate availability.
+                if len(excluded_image_tokens) <= config.image_invalid_token_rotate_limit:
                     continue
                 raise ImageGenerationError(
                     "all image accounts invalid or revoked; retry later",

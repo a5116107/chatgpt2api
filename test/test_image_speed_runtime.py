@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -527,6 +528,7 @@ class ImageAccountFailoverTests(unittest.TestCase):
                 data=[{"url": "https://example.test/image.png"}],
             )
 
+        alternative_mock = mock.Mock(return_value=True)
         with (
             mock.patch.object(conversation_module.account_service, "get_available_access_token", side_effect=select_token),
             mock.patch.object(
@@ -534,7 +536,11 @@ class ImageAccountFailoverTests(unittest.TestCase):
                 "get_account",
                 side_effect=lambda token: {"access_token": token, "email": f"{token}@example.test", "type": "free"},
             ),
-            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(
+                conversation_module.account_service,
+                "has_alternative_image_account",
+                alternative_mock,
+            ),
             mock.patch.object(conversation_module.account_service, "mark_image_result"),
             mock.patch.object(
                 conversation_module.account_service,
@@ -551,6 +557,93 @@ class ImageAccountFailoverTests(unittest.TestCase):
 
         self.assertEqual(outputs[-1].kind, "result")
         self.assertEqual(removed, revoked)
+        self.assertEqual(alternative_mock.call_count, len(candidates))
+
+    def test_concurrent_revoked_token_rotation_avoids_post_removal_candidate_recheck(self) -> None:
+        revoked = ["token-revoked-1", "token-revoked-2"]
+        candidates = [*revoked, "token-healthy"]
+        first_attempt_barrier = threading.Barrier(3)
+        removed: list[str] = []
+        removed_lock = threading.Lock()
+
+        def select_token(**kwargs) -> str:
+            excluded = set(kwargs.get("excluded_tokens") or set())
+            return next(token for token in candidates if token not in excluded)
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, *_args) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def stream(backend, _attempt_request, _index, _total):
+            if backend.access_token == revoked[0]:
+                first_attempt_barrier.wait(timeout=2.0)
+            if backend.access_token in revoked:
+                raise RuntimeError("Encountered invalidated oauth token for user")
+            yield conversation_module.ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                data=[{"url": "https://example.test/image.png"}],
+            )
+
+        def record_removal(token: str, _event: str) -> None:
+            with removed_lock:
+                removed.append(token)
+
+        def generate(index: int) -> list[conversation_module.ImageOutput]:
+            started = time.monotonic()
+            request = conversation_module.ConversationRequest(
+                model="gpt-image-2",
+                prompt=f"draw concurrent image {index}",
+                response_format="url",
+                started_monotonic=started,
+                deadline_monotonic=started + 120.0,
+            )
+            return conversation_module._generate_single_image(request, index, 3)
+
+        alternative_mock = mock.Mock(return_value=True)
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", side_effect=select_token),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                side_effect=lambda token: {
+                    "access_token": token,
+                    "email": f"{token}@example.test",
+                    "type": "free",
+                },
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "has_alternative_image_account",
+                alternative_mock,
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(
+                conversation_module.account_service,
+                "remove_invalid_token",
+                side_effect=record_removal,
+            ),
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=stream),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+            mock.patch.object(conversation_module, "_record_runtime_success"),
+            mock.patch.dict(config.data, {"image_invalid_token_rotate_limit": len(revoked)}),
+        ):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                outputs = list(executor.map(generate, range(1, 4)))
+
+        self.assertTrue(all(items[-1].kind == "result" for items in outputs))
+        self.assertEqual(len(removed), 3 * len(revoked))
+        self.assertEqual(alternative_mock.call_count, 3 * len(candidates))
 
     def test_poll_timeout_excludes_account_and_uses_per_attempt_deadline(self) -> None:
         started = time.monotonic()
