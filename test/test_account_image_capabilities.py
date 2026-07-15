@@ -132,12 +132,14 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "quota": 25,
                         "image_pool_state": "ready",
+                        "image_last_success_at": time.time() - 10,
                     },
                     {
                         "access_token": "token-ready",
                         "status": "正常",
                         "quota": 25,
                         "image_pool_state": "ready",
+                        "image_last_success_at": time.time() - 10,
                     },
                 ]
             )
@@ -176,6 +178,7 @@ class AccountCapabilityTests(unittest.TestCase):
                         "quota": 25,
                         "image_pool_state": "ready",
                         "image_next_probe_at": future,
+                        "image_last_success_at": time.time() - 10,
                     },
                     {
                         "access_token": "token-revoked",
@@ -239,7 +242,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(result["checked"], 1)
             self.assertEqual(result["healthy"], 1)
-            self.assertEqual(account["image_pool_state"], ImagePoolState.READY)
+            self.assertEqual(account["image_pool_state"], ImagePoolState.PROBATION)
             self.assertEqual(account["quota"], 5)
 
     def test_stale_quota_is_reconciled_during_a_normal_probe(self) -> None:
@@ -252,6 +255,7 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "quota": 8,
                         "image_pool_state": ImagePoolState.READY,
+                        "image_last_success_at": time.time() - 10,
                         "image_quota_updated_at": "2000-01-01T00:00:00+00:00",
                     }
                 ]
@@ -290,6 +294,7 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "quota": 10,
                         "image_pool_state": "ready",
+                        "image_last_success_at": time.time() - 10,
                         "image_quota_confidence": "verified",
                     },
                     {
@@ -326,6 +331,7 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "quota": 10,
                         "image_pool_state": "ready",
+                        "image_last_success_at": time.time() - 10,
                     }
                 ]
             )

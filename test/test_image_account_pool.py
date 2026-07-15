@@ -37,7 +37,7 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
             {"status": "正常", "quota": 25, "image_probe_samples": 0},
             now_epoch=NOW,
         )
-        healthy = normalize_image_pool_fields(
+        probed_only = normalize_image_pool_fields(
             {
                 "status": "正常",
                 "quota": 25,
@@ -46,11 +46,21 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
             },
             now_epoch=NOW,
         )
+        generation_verified = normalize_image_pool_fields(
+            {
+                "status": "正常",
+                "quota": 25,
+                "image_pool_state": ImagePoolState.READY,
+                "image_last_success_at": NOW - 10,
+            },
+            now_epoch=NOW,
+        )
 
         self.assertEqual(quarantined["image_pool_state"], ImagePoolState.QUARANTINED)
         self.assertEqual(exhausted["image_pool_state"], ImagePoolState.EXHAUSTED)
         self.assertEqual(unverified["image_pool_state"], ImagePoolState.PROBATION)
-        self.assertEqual(healthy["image_pool_state"], ImagePoolState.READY)
+        self.assertEqual(probed_only["image_pool_state"], ImagePoolState.PROBATION)
+        self.assertEqual(generation_verified["image_pool_state"], ImagePoolState.READY)
 
     def test_classifies_account_outcomes_without_conflating_policy_and_network_errors(self) -> None:
         self.assertEqual(
@@ -184,7 +194,7 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(recovered["image_pool_state"], ImagePoolState.PROBATION)
-        self.assertIsNone(recovered["image_pool_reason"])
+        self.assertEqual(recovered["image_pool_reason"], "quota_restored_awaiting_generation")
         self.assertTrue(is_image_pool_schedulable(recovered, now_epoch=NOW))
 
     def test_policy_rejection_does_not_reduce_account_health(self) -> None:
@@ -192,6 +202,7 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
             "status": "正常",
             "quota": 25,
             "image_pool_state": "ready",
+            "image_last_success_at": NOW - 1,
             "image_health_samples": 4,
             "image_success_ema": 0.8,
             "image_consecutive_failures": 0,
@@ -234,6 +245,49 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
         self.assertFalse(probe_is_due(transient, now_epoch=NOW + 59))
         self.assertTrue(probe_is_due(transient, now_epoch=NOW + 60))
 
+    def test_successful_probe_does_not_erase_a_real_generation_timeout(self) -> None:
+        timed_out = apply_image_outcome(
+            {
+                "status": "正常",
+                "quota": 25,
+                "image_pool_state": ImagePoolState.READY,
+                "image_last_success_at": NOW - 120,
+            },
+            ImagePoolOutcome.TIMEOUT,
+            now_epoch=NOW,
+            duration_ms=55_000,
+            probation_interval_secs=60,
+        )
+
+        probed = apply_probe_result(
+            timed_out,
+            success=True,
+            now_epoch=NOW + 60,
+            duration_ms=800,
+            healthy_interval_secs=1800,
+        )
+
+        self.assertEqual(probed["image_pool_state"], ImagePoolState.PROBATION)
+        self.assertEqual(probed["image_pool_reason"], ImagePoolOutcome.TIMEOUT)
+        self.assertEqual(probed["image_consecutive_failures"], 1)
+        self.assertEqual(probed["image_next_probe_at"], int(NOW + 1860))
+
+    def test_successful_probe_preserves_generation_verified_readiness(self) -> None:
+        probed = apply_probe_result(
+            {
+                "status": "正常",
+                "quota": 25,
+                "image_pool_state": ImagePoolState.READY,
+                "image_last_success_at": NOW - 10,
+            },
+            success=True,
+            now_epoch=NOW,
+            duration_ms=500,
+        )
+
+        self.assertEqual(probed["image_pool_state"], ImagePoolState.READY)
+        self.assertIsNone(probed["image_pool_reason"])
+
     def test_successful_probe_of_exhausted_account_keeps_a_bounded_recheck_schedule(self) -> None:
         updated = apply_probe_result(
             {
@@ -267,7 +321,7 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
 
         self.assertEqual(updated["image_next_probe_at"], int(NOW + 7200))
 
-    def test_candidate_score_recognizes_successfully_probed_legacy_account(self) -> None:
+    def test_candidate_score_does_not_treat_a_light_probe_as_generation_ready(self) -> None:
         probed = {
             "image_probe_samples": 1,
             "image_last_probe_error": None,
@@ -275,10 +329,8 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
         }
         unknown = {"image_probe_samples": 0, "quota": 10}
 
-        self.assertLess(
-            image_pool_score(probed, inflight=0),
-            image_pool_score(unknown, inflight=0),
-        )
+        self.assertEqual(image_pool_score(probed, inflight=0)[0], 1)
+        self.assertEqual(image_pool_score(unknown, inflight=0)[0], 1)
 
     def test_candidate_score_prefers_proven_fast_healthy_capacity(self) -> None:
         fast = {

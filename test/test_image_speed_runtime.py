@@ -993,7 +993,7 @@ class ImageAccountScoreTests(unittest.TestCase):
 
         self.assertEqual(tokens, ["fast", "slow"])
 
-    def test_successful_requirements_probe_precedes_an_unknown_account(self) -> None:
+    def test_requirements_probe_does_not_override_real_image_failures(self) -> None:
         service = AccountService.__new__(AccountService)
         service._lock = threading.Lock()
         service._image_slot_condition = threading.Condition(service._lock)
@@ -1022,7 +1022,7 @@ class ImageAccountScoreTests(unittest.TestCase):
         service._capability_allows = mock.Mock(return_value=True)
         service._access_token_hard_dead = mock.Mock(return_value=False)
 
-        self.assertEqual(service._list_available_candidate_tokens(), ["probed", "unknown"])
+        self.assertEqual(service._list_available_candidate_tokens(), ["unknown", "probed"])
 
     def test_probe_candidates_prioritize_unknown_then_oldest_probe(self) -> None:
         service = AccountService.__new__(AccountService)

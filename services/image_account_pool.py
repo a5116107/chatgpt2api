@@ -148,6 +148,24 @@ def quota_refresh_is_due(
     return updated_at + max(300, int(interval_secs)) <= now_epoch
 
 
+def _has_current_generation_success(account: dict[str, Any]) -> bool:
+    """Return whether real image traffic last proved this account ready."""
+    last_success = _timestamp(account.get("image_last_success_at"))
+    if last_success is None:
+        return False
+    last_failure = _timestamp(account.get("image_last_failure_at"))
+    if last_failure is not None and last_failure > last_success:
+        return False
+    last_outcome = str(account.get("image_last_outcome") or "").strip().lower()
+    last_outcome_at = _timestamp(account.get("image_last_outcome_at"))
+    return not (
+        last_outcome
+        and last_outcome != ImagePoolOutcome.SUCCESS
+        and last_outcome_at is not None
+        and last_outcome_at > last_success
+    )
+
+
 def normalize_image_pool_fields(
     account: dict[str, Any],
     *,
@@ -173,7 +191,7 @@ def normalize_image_pool_fields(
     status = str(normalized.get("status") or "正常").strip()
     state = str(normalized.get("image_pool_state") or "").strip().lower()
     cooldown_until = _timestamp(normalized.get("image_cooldown_until"))
-    recovered_from_exhausted = False
+    probation_reason: str | None = None
     if is_terminal_image_token(normalized):
         state = ImagePoolState.QUARANTINED
     elif status == "禁用":
@@ -184,29 +202,29 @@ def normalize_image_pool_fields(
         bool(normalized.get("image_quota_unknown"))
         or max(0, _as_int(normalized.get("quota"))) > 0
     ):
-        probe_samples = max(0, _as_int(normalized.get("image_probe_samples")))
-        probe_error = str(normalized.get("image_last_probe_error") or "").strip()
-        state = (
-            ImagePoolState.READY
-            if probe_samples > 0 and not probe_error
-            else ImagePoolState.PROBATION
-        )
-        recovered_from_exhausted = True
+        state = ImagePoolState.PROBATION
+        probation_reason = "quota_restored_awaiting_generation"
     elif state == ImagePoolState.COOLDOWN and cooldown_until is not None:
         if cooldown_until <= now_epoch:
             state = ImagePoolState.PROBATION
+            probation_reason = "cooldown_elapsed_awaiting_generation"
+    elif state == ImagePoolState.READY and not _has_current_generation_success(normalized):
+        state = ImagePoolState.PROBATION
+        probation_reason = "awaiting_generation_success"
     elif state not in ImagePoolState.ALL:
-        probe_samples = max(0, _as_int(normalized.get("image_probe_samples")))
-        probe_error = str(normalized.get("image_last_probe_error") or "").strip()
         state = (
             ImagePoolState.READY
-            if probe_samples > 0 and not probe_error
+            if _has_current_generation_success(normalized)
             else ImagePoolState.PROBATION
         )
+        if state == ImagePoolState.PROBATION:
+            probation_reason = "awaiting_generation_success"
 
     normalized["image_pool_state"] = state
-    normalized["image_pool_reason"] = None if recovered_from_exhausted else (
-        str(normalized.get("image_pool_reason") or "").strip() or None
+    normalized["image_pool_reason"] = (
+        probation_reason
+        or str(normalized.get("image_pool_reason") or "").strip()
+        or None
     )
     if cooldown_until is not None and state == ImagePoolState.COOLDOWN:
         normalized["image_cooldown_until"] = int(cooldown_until)
@@ -488,9 +506,20 @@ def apply_probe_result(
             ImagePoolState.QUARANTINED,
             ImagePoolState.DISABLED,
         }:
-            updated["image_pool_state"] = ImagePoolState.READY
-            updated["image_pool_reason"] = None
-            updated["image_rate_limit_streak"] = 0
+            generation_ready = _has_current_generation_success(updated)
+            updated["image_pool_state"] = (
+                ImagePoolState.READY
+                if generation_ready
+                else ImagePoolState.PROBATION
+            )
+            if generation_ready:
+                updated["image_pool_reason"] = None
+                updated["image_rate_limit_streak"] = 0
+            else:
+                updated["image_pool_reason"] = (
+                    str(updated.get("image_pool_reason") or "").strip()
+                    or "probe_passed_awaiting_generation"
+                )
             updated["image_cooldown_until"] = None
             updated["image_next_probe_at"] = int(
                 now_epoch + max(60, healthy_interval_secs)
@@ -568,11 +597,9 @@ def probe_is_due(account: dict[str, Any], *, now_epoch: float) -> bool:
 def image_pool_score(account: dict[str, Any], *, inflight: int) -> tuple[Any, ...]:
     state = str(account.get("image_pool_state") or "").strip().lower()
     if state not in ImagePoolState.ALL:
-        probe_samples = max(0, _as_int(account.get("image_probe_samples")))
-        probe_error = str(account.get("image_last_probe_error") or "").strip()
         state = (
             ImagePoolState.READY
-            if probe_samples > 0 and not probe_error
+            if _has_current_generation_success(account)
             else ImagePoolState.PROBATION
         )
     state_rank = 0 if state == ImagePoolState.READY else 1
