@@ -363,10 +363,12 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
                     "image_account_timeout_cooldown_secs": 99999,
                     "image_account_max_cooldown_secs": 1,
                     "image_account_failure_threshold": 999,
+                    "auto_remove_rate_limited_accounts": True,
                 }
             )
 
             exported = store.get()
+            updated = store.update({"auto_remove_rate_limited_accounts": True})
 
         self.assertEqual(exported["image_account_probe_parallelism"], 10)
         self.assertEqual(exported["image_account_probe_healthy_interval_secs"], 300)
@@ -376,6 +378,9 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
         self.assertEqual(exported["image_account_timeout_cooldown_secs"], 1800)
         self.assertEqual(exported["image_account_max_cooldown_secs"], 300)
         self.assertEqual(exported["image_account_failure_threshold"], 10)
+        self.assertNotIn("auto_remove_rate_limited_accounts", exported)
+        self.assertNotIn("auto_remove_rate_limited_accounts", updated)
+        self.assertNotIn("auto_remove_rate_limited_accounts", store.data)
 
 
 if __name__ == "__main__":

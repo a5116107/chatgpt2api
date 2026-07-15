@@ -27,7 +27,6 @@ export function ConfigCard() {
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
-  const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
@@ -169,19 +168,18 @@ export function ConfigCard() {
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
           </div>
-          <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+          <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox
               checked={Boolean(config?.auto_remove_invalid_accounts)}
               onCheckedChange={(checked) => setAutoRemoveInvalidAccounts(Boolean(checked))}
+              className="mt-0.5"
             />
-            自动移除异常账号
-          </label>
-          <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
-            <Checkbox
-              checked={Boolean(config?.auto_remove_rate_limited_accounts)}
-              onCheckedChange={(checked) => setAutoRemoveRateLimitedAccounts(Boolean(checked))}
-            />
-            自动移除限流账号
+            <span>
+              <span className="block">自动移除永久失效账号</span>
+              <span className="mt-1 block text-xs text-stone-500">
+                仅删除已确认撤销或停用的 Token；额度耗尽、限流和超时账号会等待恢复。
+              </span>
+            </span>
           </label>
           <div className="space-y-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
             <div>

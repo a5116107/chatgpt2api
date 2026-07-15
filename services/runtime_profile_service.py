@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import time
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -563,10 +562,25 @@ class RuntimeProfileService:
             return removed
 
     def delete_by_account(self, account: dict[str, Any]) -> bool:
-        profile_id = _clean((account or {}).get("runtime_profile_id"))
-        if not profile_id:
-            return False
-        return self.delete_profile(profile_id)
+        return bool(self.delete_by_accounts([account]))
+
+    def delete_by_accounts(self, accounts: list[dict[str, Any]]) -> int:
+        profile_ids = {
+            _clean((account or {}).get("runtime_profile_id"))
+            for account in accounts
+            if isinstance(account, dict)
+        }
+        profile_ids.discard("")
+        if not profile_ids:
+            return 0
+        with self._lock:
+            removed = sum(
+                self._profiles.pop(profile_id, None) is not None
+                for profile_id in profile_ids
+            )
+            if removed:
+                self._save_locked()
+            return removed
 
     def cleanup_orphan_profiles(self, accounts: list[dict[str, Any]]) -> dict[str, Any]:
         accounts = [item for item in accounts if isinstance(item, dict)]

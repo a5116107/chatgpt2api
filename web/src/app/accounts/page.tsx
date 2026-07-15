@@ -407,7 +407,8 @@ function AccountsPageContent() {
       const data = await probeImagePool(20);
       setAccounts(data.items);
       const failureText = data.failures.length > 0 ? `，失败 ${data.failures.length} 个` : "";
-      toast.success(`探测完成：检查 ${data.checked} 个，健康 ${data.healthy} 个${failureText}`);
+      const removedText = data.removed > 0 ? `，移除永久失效 ${data.removed} 个` : "";
+      toast.success(`探测完成：检查 ${data.checked} 个，健康 ${data.healthy} 个${removedText}${failureText}`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "号池探测失败");
     } finally {

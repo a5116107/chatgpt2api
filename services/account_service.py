@@ -1690,15 +1690,33 @@ class AccountService:
             )
         )
         if hard_dead:
+            try:
+                self.release_image_slot(access_token)
+            except Exception:
+                pass
+            if config.auto_remove_invalid_accounts:
+                removed = bool(
+                    self.delete_accounts(
+                        [access_token],
+                        sync_capabilities=sync_capabilities,
+                    )["removed"]
+                )
+                if removed and not quiet:
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "永久失效账号已移除",
+                        {
+                            "source": event,
+                            "token": anonymize_token(access_token),
+                            "email": email,
+                        },
+                    )
+                return removed
             already_quarantined = (
                 str(account.get("status") or "").strip() == "禁用"
                 and str(account.get("token_status") or "").strip().lower() == "revoked"
             )
             revoked_at = str(account.get("token_revoked_at") or "").strip() or datetime.now(timezone.utc).isoformat()
-            try:
-                self.release_image_slot(access_token)
-            except Exception:
-                pass
             self.update_account(
                 access_token,
                 {
@@ -1786,43 +1804,29 @@ class AccountService:
                 pass
             return False
 
-        # Prefer soft-disable over hard delete. Hard delete is too aggressive under
-        # token/proxy jitter and can empty the account pool quickly.
-        # Even when auto_remove_invalid_accounts=true, keep password accounts for relogin.
-        if (not config.auto_remove_invalid_accounts) or (email and password):
-            self.update_account(
-                access_token,
-                {
-                    "status": "异常",
-                    "quota": int(account.get("quota") or 0),
-                    "invalid_count": int(account.get("invalid_count") or 0) + 1,
-                },
-                quiet=quiet,
-                sync_capabilities=sync_capabilities,
+        # Ambiguous auth/proxy failures remain recoverable. Only terminal evidence
+        # reaches the removal branch above.
+        self.update_account(
+            access_token,
+            {
+                "status": "异常",
+                "quota": int(account.get("quota") or 0),
+                "invalid_count": int(account.get("invalid_count") or 0) + 1,
+            },
+            quiet=quiet,
+            sync_capabilities=sync_capabilities,
+        )
+        try:
+            self.release_image_slot(access_token)
+        except Exception:
+            pass
+        if not quiet:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "标记异常账号-等待恢复",
+                {"source": event, "token": anonymize_token(access_token), "email": email},
             )
-            try:
-                self.release_image_slot(access_token)
-            except Exception:
-                pass
-            if not quiet:
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "标记异常账号-暂不删除",
-                    {"source": event, "token": anonymize_token(access_token), "email": email},
-                )
-            return False
-        removed = bool(self.delete_accounts([access_token], sync_capabilities=sync_capabilities)["removed"])
-        if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
-                            {"source": event, "token": anonymize_token(access_token)})
-        elif access_token:
-            self.update_account(
-                access_token,
-                {"status": "异常", "quota": 0},
-                quiet=quiet,
-                sync_capabilities=sync_capabilities,
-            )
-        return removed
+        return False
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -1961,10 +1965,13 @@ class AccountService:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
-            for token in target_set:
-                current = self._accounts.get(token)
-                if current is not None:
-                    runtime_profile_service.delete_by_account(current)
+            runtime_profile_service.delete_by_accounts(
+                [
+                    self._accounts[token]
+                    for token in target_set
+                    if token in self._accounts
+                ]
+            )
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
@@ -2010,19 +2017,12 @@ class AccountService:
             account = self._normalize_account({**current, **safe_updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                runtime_profile_service.delete_by_account(current)
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                updated_account = None
-            else:
-                self._accounts[access_token] = account
-                self._save_accounts()
-                updated_account = dict(account)
-                if not quiet:
-                    log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                    {"token": anonymize_token(access_token), "status": account.get("status")})
+            self._accounts[access_token] = account
+            self._save_accounts()
+            updated_account = dict(account)
+            if not quiet:
+                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
+                                {"token": anonymize_token(access_token), "status": account.get("status")})
         if sync_capabilities:
             self._sync_risk_control_capabilities()
         return updated_account
@@ -2231,12 +2231,6 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                runtime_profile_service.delete_by_account(current)
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                return None
             self._accounts[access_token] = account
             self._save_accounts()
             return dict(account)
@@ -2322,18 +2316,44 @@ class AccountService:
             self._image_probe_inflight.update(tokens)
             return tokens
 
-    def quarantine_persisted_terminal_tokens(self, source: str = "persisted_revocation") -> int:
-        """Persist terminal token evidence before any account can be selected."""
+    def cleanup_persisted_terminal_accounts(
+        self,
+        source: str = "persisted_revocation",
+    ) -> dict[str, int]:
+        """Remove terminal accounts or quarantine them when removal is disabled."""
         with self._lock:
             terminal_tokens = [
                 token
                 for token, item in self._accounts.items()
-                if str(item.get("status") or "").strip() != "禁用"
-                and self._access_token_hard_dead(item)
+                if self._access_token_hard_dead(item)
             ]
+        if config.auto_remove_invalid_accounts:
+            token_samples = [anonymize_token(token) for token in terminal_tokens[:20]]
+            removed = int(
+                self.delete_accounts(
+                    terminal_tokens,
+                    sync_capabilities=False,
+                )["removed"]
+            )
+            if removed:
+                self._sync_risk_control_capabilities()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "批量移除永久失效账号",
+                    {
+                        "source": source,
+                        "removed": removed,
+                        "token_samples": token_samples,
+                        "truncated": max(0, len(terminal_tokens) - len(token_samples)),
+                    },
+                )
+            return {"removed": removed, "quarantined": 0}
+
         quarantined = 0
         for token in terminal_tokens:
             account = self.get_account(token) or {}
+            if str(account.get("status") or "").strip() == "禁用":
+                continue
             evidence = str(
                 account.get("token_revoked_source")
                 or account.get("image_last_probe_error")
@@ -2350,17 +2370,21 @@ class AccountService:
             quarantined += 1
         if quarantined:
             self._sync_risk_control_capabilities()
-        return quarantined
+        return {"removed": 0, "quarantined": quarantined}
 
     def probe_image_candidates(self, limit: int = 3) -> dict[str, Any]:
         """Probe due accounts concurrently and persist state-aware readiness signals."""
-        quarantined = self.quarantine_persisted_terminal_tokens("image_probe_sweep")
+        cleanup = self.cleanup_persisted_terminal_accounts("image_probe_sweep")
+        removed = int(cleanup["removed"])
+        quarantined = int(cleanup["quarantined"])
         probe_quarantined = 0
+        probe_terminal_tokens: list[str] = []
         tokens = self._claim_image_probe_candidate_tokens(limit)
         if not tokens:
             return {
                 "checked": 0,
                 "healthy": 0,
+                "removed": removed,
                 "quarantined": quarantined,
                 "failures": [],
             }
@@ -2446,17 +2470,35 @@ class AccountService:
                         and updated
                         and updated.get("image_pool_state") == ImagePoolState.QUARANTINED
                     ):
-                        quarantined += 1
-                        probe_quarantined += 1
+                        if config.auto_remove_invalid_accounts:
+                            probe_terminal_tokens.append(token)
+                        else:
+                            quarantined += 1
+                            probe_quarantined += 1
+                    elif (
+                        not success
+                        and outcome == ImagePoolOutcome.TOKEN_INVALID
+                        and self.get_account(token) is None
+                    ):
+                        # fetch_remote_info may remove a terminal account immediately.
+                        removed += 1
                     checked += 1
         finally:
             with self._lock:
                 getattr(self, "_image_probe_inflight", set()).difference_update(tokens)
-        if probe_quarantined:
+        if probe_terminal_tokens:
+            removed += int(
+                self.delete_accounts(
+                    probe_terminal_tokens,
+                    sync_capabilities=False,
+                )["removed"]
+            )
+        if probe_quarantined or probe_terminal_tokens:
             self._sync_risk_control_capabilities()
         return {
             "checked": checked,
             "healthy": healthy,
+            "removed": removed,
             "quarantined": quarantined,
             "failures": failures,
         }

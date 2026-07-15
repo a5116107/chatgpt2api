@@ -100,6 +100,7 @@ type AccountRefreshResponse = {
 type ImagePoolProbeResponse = {
   checked: number;
   healthy: number;
+  removed: number;
   quarantined: number;
   failures: Array<{ account_hash: string; error: string }>;
   stats: Record<string, unknown>;
@@ -128,7 +129,6 @@ export type SettingsConfig = {
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
   auto_remove_invalid_accounts?: boolean;
-  auto_remove_rate_limited_accounts?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   backup?: BackupSettings;

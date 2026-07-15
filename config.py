@@ -541,13 +541,6 @@ class ConfigStore:
         return bool(value)
 
     @property
-    def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
     def auto_relogin_after_refresh(self) -> bool:
         value = self.data.get("auto_relogin_after_refresh", False)
         if isinstance(value, str):
@@ -628,7 +621,7 @@ class ConfigStore:
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
-        data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
+        data.pop("auto_remove_rate_limited_accounts", None)
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
@@ -669,6 +662,7 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data.pop("auto_remove_rate_limited_accounts", None)
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

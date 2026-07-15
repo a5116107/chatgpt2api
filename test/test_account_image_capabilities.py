@@ -5,17 +5,36 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
+from services.config import config
 from services.image_account_pool import ImagePoolOutcome, ImagePoolState
+from services.runtime_profile_service import RuntimeProfileService
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_runtime_profiles_are_deleted_in_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_service = RuntimeProfileService(Path(tmp_dir) / "profiles.json")
+            first = profile_service.create_profile(profile_id="profile-1")
+            second = profile_service.create_profile(profile_id="profile-2")
+
+            removed = profile_service.delete_by_accounts(
+                [
+                    {"runtime_profile_id": first["id"]},
+                    {"runtime_profile_id": second["id"]},
+                ]
+            )
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(profile_service.list_profiles(), [])
+
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
@@ -122,6 +141,72 @@ class AccountCapabilityTests(unittest.TestCase):
             )
         )
 
+    def test_terminal_account_is_removed_but_ambiguous_failure_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-terminal", "status": "正常", "quota": 25},
+                    {"access_token": "token-recoverable", "status": "正常", "quota": 25},
+                ]
+            )
+
+            with mock.patch.object(
+                type(config),
+                "auto_remove_invalid_accounts",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ):
+                removed = service.remove_invalid_token(
+                    "token-terminal",
+                    "image_stream:token_revoked",
+                )
+                retained = service.remove_invalid_token(
+                    "token-recoverable",
+                    "upstream proxy timeout",
+                )
+
+            self.assertTrue(removed)
+            self.assertIsNone(service.get_account("token-terminal"))
+            self.assertFalse(retained)
+            self.assertEqual(service.get_account("token-recoverable")["status"], "异常")
+
+    def test_terminal_sweep_removes_only_terminal_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-terminal",
+                        "status": "禁用",
+                        "quota": 0,
+                        "token_status": "revoked",
+                        "token_revoked": True,
+                    },
+                    {
+                        "access_token": "token-exhausted",
+                        "status": "限流",
+                        "quota": 0,
+                        "image_pool_state": ImagePoolState.EXHAUSTED,
+                    },
+                ]
+            )
+
+            with mock.patch.object(
+                type(config),
+                "auto_remove_invalid_accounts",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ):
+                result = service.cleanup_persisted_terminal_accounts("test_sweep")
+
+            self.assertEqual(result, {"removed": 1, "quarantined": 0})
+            self.assertIsNone(service.get_account("token-terminal"))
+            self.assertEqual(
+                service.get_account("token-exhausted")["image_pool_state"],
+                ImagePoolState.EXHAUSTED,
+            )
+
     def test_rate_limited_account_enters_cooldown_and_leaves_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -144,13 +229,17 @@ class AccountCapabilityTests(unittest.TestCase):
                 ]
             )
 
-            updated = service.mark_image_result(
-                "token-rate-limited",
-                success=False,
-                duration_ms=12_000,
-                outcome=ImagePoolOutcome.RATE_LIMITED,
-                error="poll returned 429",
-            )
+            with mock.patch.dict(
+                config.data,
+                {"auto_remove_rate_limited_accounts": True},
+            ):
+                updated = service.mark_image_result(
+                    "token-rate-limited",
+                    success=False,
+                    duration_ms=12_000,
+                    outcome=ImagePoolOutcome.RATE_LIMITED,
+                    error="poll returned 429",
+                )
             candidates = service._list_available_candidate_tokens()
 
             self.assertIsNotNone(updated)

@@ -20,6 +20,7 @@ class ImageAccountProbeApiTests(unittest.TestCase):
         probe_result = {
             "checked": 2,
             "healthy": 1,
+            "removed": 1,
             "quarantined": 1,
             "failures": [{"account_hash": "token:abc", "error": "token invalid"}],
         }
@@ -37,6 +38,7 @@ class ImageAccountProbeApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["checked"], 2)
+        self.assertEqual(response.json()["removed"], 1)
         self.assertEqual(response.json()["items"], items)
         probe.assert_called_once_with(12)
 
