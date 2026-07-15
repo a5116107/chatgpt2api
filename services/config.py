@@ -543,17 +543,25 @@ class ConfigStore:
     @property
     def image_poll_interval_secs(self) -> float:
         try:
-            return max(0.5, float(self.data.get("image_poll_interval_secs", 2.0)))
+            return max(0.5, float(self.data.get("image_poll_interval_secs", 0.5)))
         except (TypeError, ValueError):
-            return 2.0
+            return 0.5
 
     @property
     def image_poll_initial_wait_secs(self) -> float:
         """Short commit grace before the first conversation poll."""
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 1.0)))
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 0.25)))
         except (TypeError, ValueError):
-            return 1.0
+            return 0.25
+
+    @property
+    def image_poll_request_timeout_secs(self) -> float:
+        """Per-request timeout for low-latency conversation polling."""
+        try:
+            return min(5.0, max(0.5, float(self.data.get("image_poll_request_timeout_secs", 2.0))))
+        except (TypeError, ValueError):
+            return 2.0
 
     @property
     def image_poll_fast_window_secs(self) -> float:
@@ -582,6 +590,14 @@ class ConfigStore:
             return max(0.5, float(self.data.get("image_tasks_timeout_secs", 0.75)))
         except (TypeError, ValueError):
             return 0.75
+
+    @property
+    def image_png_compress_level(self) -> int:
+        """PNG compression is lossless; lower levels trade file size for latency."""
+        try:
+            return min(9, max(0, int(self.data.get("image_png_compress_level", 1))))
+        except (TypeError, ValueError):
+            return 1
 
     @property
     def image_heartbeat_interval_secs(self) -> float:
@@ -744,10 +760,12 @@ class ConfigStore:
         data["image_stream_close_timeout_secs"] = self.image_stream_close_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_poll_request_timeout_secs"] = self.image_poll_request_timeout_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs
         data["image_tasks_check_every"] = self.image_tasks_check_every
         data["image_tasks_timeout_secs"] = self.image_tasks_timeout_secs
+        data["image_png_compress_level"] = self.image_png_compress_level
         data["image_heartbeat_interval_secs"] = self.image_heartbeat_interval_secs
         data["image_account_probe_enabled"] = self.image_account_probe_enabled
         data["image_account_probe_interval_secs"] = self.image_account_probe_interval_secs

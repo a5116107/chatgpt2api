@@ -406,8 +406,11 @@ class ImageTaskService:
                 if account_email:
                     setattr(error, "account_email", account_email)
                 raise error
+            progress_callback("source_ready")
             if payload.get("_web_image_output"):
+                progress_callback("output_processing")
                 data = [self.output_handler(data[0], payload.get("size"), _clean(payload.get("base_url")) or None)]
+                progress_callback("output_ready")
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
             if not self._transition_task(
@@ -708,13 +711,14 @@ class ImageTaskService:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            requested_size = task.get("size", "")
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, requested_size),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -729,6 +733,7 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        requested_size: object,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -748,7 +753,11 @@ class ImageTaskService:
                     )
 
                 image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                    poll=False,
+                    limit=1 if not is_codex_image_model(model) else None,
                 )
                 if not image_urls:
                     raise RuntimeError("图片 URL 解析失败")
@@ -765,7 +774,10 @@ class ImageTaskService:
                 "b64_json",
                 "",
                 int(time.time()),
+                persist=is_codex_image_model(model),
             )["data"]
+            if not is_codex_image_model(model):
+                data = [self.output_handler(data[0], requested_size, None)]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,

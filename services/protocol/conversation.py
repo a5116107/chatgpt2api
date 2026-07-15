@@ -358,6 +358,8 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    *,
+    persist: bool = True,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
@@ -366,11 +368,13 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
-            data.append({
+            result_item = {
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
+            if persist:
+                result_item["url"] = save_image_bytes(base64.b64decode(b64_json), base_url)
+            data.append(result_item)
         else:
             data.append({
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
@@ -399,6 +403,7 @@ class ConversationRequest:
     started_monotonic: float = field(default_factory=time.monotonic)
     deadline_monotonic: float | None = None
     single_result: bool = False
+    defer_storage: bool = False
 
 
 @dataclass
@@ -1111,7 +1116,11 @@ def stream_image_outputs(
 
     try:
         image_urls = backend.resolve_conversation_image_urls(
-            conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
+            conversation_id,
+            file_ids,
+            sediment_ids,
+            poll_timeout_secs=poll_timeout,
+            limit=1 if request.single_result else None,
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
@@ -1152,6 +1161,7 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            persist=not request.defer_storage,
         )["data"]
         if data:
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1234,7 +1244,11 @@ def stream_image_outputs(
 
             if file_ids or sediment_ids:
                 image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                    poll=False,
+                    limit=1 if request.single_result else None,
                 )
                 if image_urls:
                     image_urls = _select_image_result_urls(image_urls, request, conversation_id)
@@ -1250,6 +1264,7 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        persist=not request.defer_storage,
                     )["data"]
                     if data:
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1347,7 +1362,11 @@ def stream_image_outputs(
 
         if file_ids or sediment_ids:
             image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
+                conversation_id,
+                file_ids,
+                sediment_ids,
+                poll=False,
+                limit=1 if request.single_result else None,
             )
             if image_urls:
                 image_urls = _select_image_result_urls(image_urls, request, conversation_id)
@@ -1363,6 +1382,7 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    persist=not request.defer_storage,
                 )["data"]
                 if data:
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
@@ -1423,6 +1443,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        persist=not request.defer_storage,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)

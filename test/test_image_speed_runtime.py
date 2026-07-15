@@ -19,6 +19,7 @@ from services.image_task_service import (
 )
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import conversation as conversation_module
+from utils.helper import UpstreamHTTPError
 
 
 FILE_ID = "file_00000000" + "a" * 24
@@ -64,6 +65,50 @@ class ImagePollingTests(unittest.TestCase):
         self.assertEqual(file_ids, [FILE_ID])
         self.assertEqual(sediment_ids, [])
         backend._query_backend_tasks.assert_not_called()
+
+    def test_low_latency_polling_defaults_are_bounded(self) -> None:
+        with mock.patch.dict(config.data, {}, clear=True):
+            self.assertEqual(config.image_poll_initial_wait_secs, 0.25)
+            self.assertEqual(config.image_poll_interval_secs, 0.5)
+            self.assertEqual(config.image_poll_request_timeout_secs, 2.0)
+            self.assertEqual(config.image_png_compress_level, 1)
+
+    def test_transient_conversation_404_is_retried_without_aborting_polling(self) -> None:
+        backend = self.backend()
+        backend._get_conversation = mock.Mock(side_effect=[
+            UpstreamHTTPError("conversation", 404, {"detail": "not ready"}),
+            image_conversation(FILE_ID),
+        ])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+
+        with mock.patch("services.openai_backend_api.time.sleep", return_value=None):
+            file_ids, _ = backend._poll_image_results(
+                "conversation-eventually-consistent",
+                timeout_secs=2,
+                initial_wait_secs=0,
+            )
+
+        self.assertEqual(file_ids, [FILE_ID])
+        self.assertEqual(backend._get_conversation.call_count, 2)
+        self.assertLessEqual(backend._get_conversation.call_args.kwargs["timeout_secs"], 2.0)
+
+    def test_single_result_url_resolution_stops_after_first_valid_file(self) -> None:
+        backend = self.backend()
+        backend._get_file_download_url = mock.Mock(return_value="https://example.test/first.png")
+        backend._get_attachment_download_url = mock.Mock(
+            side_effect=AssertionError("single-result resolution must stop after the first URL")
+        )
+
+        urls = backend._resolve_image_urls(
+            "conversation-1",
+            [FILE_ID, f"{FILE_ID}b"],
+            ["sediment-1"],
+            limit=1,
+        )
+
+        self.assertEqual(urls, ["https://example.test/first.png"])
+        backend._get_file_download_url.assert_called_once_with(FILE_ID)
+        backend._get_attachment_download_url.assert_not_called()
 
     def test_tasks_is_checked_only_as_bounded_side_channel(self) -> None:
         backend = self.backend()
@@ -171,7 +216,8 @@ class ImageRaceTests(unittest.TestCase):
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
         backend.image_request_id = "race-test"
         backend.image_deadline_monotonic = time.monotonic() + 2
-        backend.progress_callback = None
+        stages: list[str] = []
+        backend.progress_callback = stages.append
         poll_backend = PollBackend()
         backend._clone_for_image_poll = mock.Mock(return_value=poll_backend)
         response = BlockingResponse()
@@ -184,6 +230,9 @@ class ImageRaceTests(unittest.TestCase):
         self.assertIn(FILE_ID, json.dumps(synthetic))
         self.assertTrue(response.closed.is_set())
         self.assertTrue(poll_backend.closed)
+        self.assertIn("sse_first_event", stages)
+        self.assertIn("conversation_ready", stages)
+        self.assertIn("result_pointer_ready", stages)
         self.assertFalse(any(t.name == "image-sse-reader-race-test" for t in threading.enumerate()))
 
     def test_slow_response_close_does_not_delay_a_poll_winner(self) -> None:
@@ -249,6 +298,9 @@ class ImageTaskLifecycleTests(unittest.TestCase):
             self.assertEqual(item["account_hash"], "token:abc123")
             self.assertIn("getting_account", item["stage_metrics"])
             self.assertIn("starting_generation", item["stage_metrics"])
+            self.assertIn("source_ready", item["stage_metrics"])
+            self.assertIn("output_processing", item["stage_metrics"])
+            self.assertIn("output_ready", item["stage_metrics"])
 
     def test_terminal_compare_and_set_rejects_late_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -415,6 +467,21 @@ class ImageQualityTests(unittest.TestCase):
 
         self.assertEqual(captured, [original])
         self.assertEqual(result["data"][0]["url"], "https://example.test/original.png")
+
+    def test_web_task_can_defer_original_storage_to_output_processor(self) -> None:
+        original = b"exact-upstream-image-bytes"
+
+        with mock.patch.object(conversation_module, "save_image_bytes") as save_image_bytes:
+            result = conversation_module.format_image_result(
+                [{"b64_json": base64.b64encode(original).decode("ascii")}],
+                "prompt",
+                "b64_json",
+                persist=False,
+            )
+
+        save_image_bytes.assert_not_called()
+        self.assertNotIn("url", result["data"][0])
+        self.assertEqual(base64.b64decode(result["data"][0]["b64_json"]), original)
 
 
 if __name__ == "__main__":

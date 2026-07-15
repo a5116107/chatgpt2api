@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.image_task_service import ImageTaskService
 
@@ -106,6 +107,69 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(task["data"][0]["url"], "https://example.test/codex.png")
         self.assertEqual(captured["response_format"], "url")
         self.assertFalse(captured["_single_result"])
+
+    def test_resume_poll_reuses_web_output_processor_and_single_result_limit(self):
+        captured = {}
+
+        class FakeBackend:
+            def _poll_image_results(self, *_args, **_kwargs):
+                return ["file-1", "file-2"], []
+
+            def resolve_conversation_image_urls(self, *_args, **kwargs):
+                captured["limit"] = kwargs.get("limit")
+                return ["https://example.test/source.png"]
+
+            def download_image_bytes(self, _urls):
+                return [b"source-bytes"]
+
+            def close(self):
+                return None
+
+        def output_handler(item, size, base_url):
+            captured["item"] = item
+            captured["size"] = size
+            captured["base_url"] = base_url
+            return {"url": "https://example.test/1536.png", "width": 1536, "height": 1536}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                output_handler=output_handler,
+                retention_days_getter=lambda: 30,
+            )
+            key = "owner-1:resume-task"
+            service._tasks[key] = {
+                "id": "resume-task",
+                "owner_id": "owner-1",
+                "status": "running",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "size": "1536x1536",
+                "created_at": "2026-07-15 00:00:00",
+                "updated_at": "2026-07-15 00:00:00",
+            }
+            with (
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=FakeBackend()),
+                mock.patch.object(service, "_log_call"),
+            ):
+                service._run_resume_poll(
+                    key,
+                    "conversation-1",
+                    30,
+                    OWNER,
+                    "generate",
+                    "gpt-image-2",
+                    "1536x1536",
+                )
+
+            task = service._tasks[key]
+
+        self.assertEqual(task["status"], "success")
+        self.assertEqual(task["data"][0]["url"], "https://example.test/1536.png")
+        self.assertEqual(captured["limit"], 1)
+        self.assertEqual(captured["size"], "1536x1536")
+        self.assertIsNone(captured["base_url"])
+        self.assertNotIn("url", captured["item"])
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
