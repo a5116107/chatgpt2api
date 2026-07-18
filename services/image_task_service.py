@@ -79,6 +79,44 @@ def _stale_heartbeat_secs() -> float:
     return max(DEFAULT_STALE_HEARTBEAT_SECS, timeout + 60.0)
 
 
+def _compact_stage_metrics(metrics: object) -> dict[str, dict[str, int]]:
+    if not isinstance(metrics, dict):
+        return {}
+    compacted: dict[str, dict[str, int]] = {}
+    polling_metric: dict[str, int] | None = None
+    polling_attempts = 0
+    for raw_step, raw_metric in metrics.items():
+        if not isinstance(raw_metric, dict):
+            continue
+        step = str(raw_step)
+        metric: dict[str, int] = {}
+        for key in ("elapsed_ms", "stage_ms"):
+            try:
+                metric[key] = max(0, int(raw_metric.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        if "attempts" in raw_metric:
+            try:
+                metric["attempts"] = max(0, int(raw_metric.get("attempts") or 0))
+            except (TypeError, ValueError):
+                pass
+        if step == "polling" or step.startswith("polling:"):
+            if step.startswith("polling:"):
+                try:
+                    polling_attempts = max(polling_attempts, int(step.partition(":")[2]))
+                except ValueError:
+                    pass
+            polling_attempts = max(polling_attempts, metric.get("attempts", 0))
+            if polling_metric is None or metric.get("elapsed_ms", 0) >= polling_metric.get("elapsed_ms", 0):
+                polling_metric = metric
+            continue
+        compacted[step] = metric
+    if polling_metric is not None:
+        polling_metric["attempts"] = polling_attempts
+        compacted["polling"] = polling_metric
+    return compacted
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -148,6 +186,7 @@ class ImageTaskService:
         output_handler: Callable[[dict[str, Any], object, str | None], dict[str, Any]] = image_output_service.prepare_web_output,
         retention_days_getter: Callable[[], int] | None = None,
         heartbeat_interval_getter: Callable[[], float] | None = None,
+        progress_persist_interval_getter: Callable[[], float] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
@@ -155,13 +194,17 @@ class ImageTaskService:
         self.output_handler = output_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self.heartbeat_interval_getter = heartbeat_interval_getter or (lambda: config.image_heartbeat_interval_secs)
+        self.progress_persist_interval_getter = progress_persist_interval_getter or (
+            lambda: config.image_poll_progress_persist_interval_secs
+        )
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
-            changed = self._recover_unfinished_locked()
+            changed = self._compact_stage_metrics_locked()
+            changed = self._recover_unfinished_locked() or changed
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
@@ -332,7 +375,9 @@ class ImageTaskService:
             self._cancel_events[key] = stop_heartbeat
         _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress="running")
         previous_stage_at = started_monotonic
+        last_progress_persisted_at = started_monotonic
         stage_metrics: dict[str, dict[str, int]] = {}
+        progress_lock = threading.Lock()
 
         def heartbeat_worker() -> None:
             try:
@@ -351,35 +396,54 @@ class ImageTaskService:
         heartbeat_thread.start()
 
         def progress_callback(step: str) -> None:
-            nonlocal previous_stage_at
+            nonlocal previous_stage_at, last_progress_persisted_at
             now = time.time()
             if step == "__heartbeat__":
                 self._heartbeat_task(key, lease_id)
                 return
-            now_monotonic = time.monotonic()
-            stage_metrics[step] = {
-                "elapsed_ms": int((now_monotonic - started_monotonic) * 1000),
-                "stage_ms": int((now_monotonic - previous_stage_at) * 1000),
-            }
-            previous_stage_at = now_monotonic
-            updates: dict[str, Any] = {
-                "progress": step,
-                "last_heartbeat_ts": now,
-                "stage_metrics": dict(stage_metrics),
-            }
-            if self._transition_task(
-                key,
-                expected_statuses={TASK_STATUS_RUNNING},
-                expected_lease_id=lease_id,
-                **updates,
-            ):
-                _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress=step)
-                logger.info({
-                    "event": "image_task_stage",
-                    "task_id": task_id,
-                    "stage": step,
-                    **stage_metrics[step],
-                })
+            with progress_lock:
+                now_monotonic = time.monotonic()
+                metric = {
+                    "elapsed_ms": int((now_monotonic - started_monotonic) * 1000),
+                    "stage_ms": int((now_monotonic - previous_stage_at) * 1000),
+                }
+                previous_stage_at = now_monotonic
+                polling = step.startswith("polling:")
+                metric_key = step
+                if polling:
+                    metric_key = "polling"
+                    try:
+                        metric["attempts"] = max(1, int(step.partition(":")[2]))
+                    except ValueError:
+                        metric["attempts"] = int(stage_metrics.get("polling", {}).get("attempts") or 0) + 1
+                stage_metrics[metric_key] = metric
+                try:
+                    persist_interval = max(0.5, float(self.progress_persist_interval_getter()))
+                except (TypeError, ValueError):
+                    persist_interval = 2.0
+                should_persist = not polling or now_monotonic - last_progress_persisted_at >= persist_interval
+                if should_persist:
+                    last_progress_persisted_at = now_monotonic
+                if not should_persist:
+                    return
+                updates: dict[str, Any] = {
+                    "progress": step,
+                    "last_heartbeat_ts": now,
+                    "stage_metrics": dict(stage_metrics),
+                }
+                if self._transition_task(
+                    key,
+                    expected_statuses={TASK_STATUS_RUNNING},
+                    expected_lease_id=lease_id,
+                    **updates,
+                ):
+                    _sync_unified_task(task_id, status=TASK_STATUS_RUNNING, mode=mode, owner_id=owner_id, progress=step)
+                    logger.info({
+                        "event": "image_task_stage",
+                        "task_id": task_id,
+                        "stage": step,
+                        **metric,
+                    })
 
         payload_with_progress = {
             **payload,
@@ -406,8 +470,11 @@ class ImageTaskService:
                 if account_email:
                     setattr(error, "account_email", account_email)
                 raise error
+            progress_callback("source_ready")
             if payload.get("_web_image_output"):
+                progress_callback("output_processing")
                 data = [self.output_handler(data[0], payload.get("size"), _clean(payload.get("base_url")) or None)]
+                progress_callback("output_ready")
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
             if not self._transition_task(
@@ -625,6 +692,16 @@ class ImageTaskService:
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(self.path)
 
+    def _compact_stage_metrics_locked(self) -> bool:
+        changed = False
+        for task in self._tasks.values():
+            raw_metrics = task.get("stage_metrics")
+            compacted = _compact_stage_metrics(raw_metrics)
+            if compacted != raw_metrics:
+                task["stage_metrics"] = compacted
+                changed = True
+        return changed
+
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         for task in self._tasks.values():
@@ -708,13 +785,14 @@ class ImageTaskService:
                 raise ValueError("task has no conversation_id")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            requested_size = task.get("size", "")
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, requested_size),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -729,6 +807,7 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        requested_size: object,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -748,7 +827,11 @@ class ImageTaskService:
                     )
 
                 image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
+                    conversation_id,
+                    file_ids,
+                    sediment_ids,
+                    poll=False,
+                    limit=1 if not is_codex_image_model(model) else None,
                 )
                 if not image_urls:
                     raise RuntimeError("图片 URL 解析失败")
@@ -765,7 +848,10 @@ class ImageTaskService:
                 "b64_json",
                 "",
                 int(time.time()),
+                persist=is_codex_image_model(model),
             )["data"]
+            if not is_codex_image_model(model):
+                data = [self.output_handler(data[0], requested_size, None)]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,

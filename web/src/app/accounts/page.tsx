@@ -51,6 +51,7 @@ import {
   fetchReLoginProgress,
   reLoginAccounts,
   refreshAccounts,
+  probeImagePool,
   testProxy,
   updateAccount,
   type Account,
@@ -188,6 +189,15 @@ function displayAccountSource(account: Account) {
   return source;
 }
 
+const imagePoolStateLabels: Record<string, string> = {
+  ready: "可调度",
+  probation: "观察中",
+  cooldown: "冷却中",
+  exhausted: "额度耗尽",
+  quarantined: "已隔离",
+  disabled: "已禁用",
+};
+
 function shortProfileId(value?: string | null) {
   const text = String(value || "").trim();
   if (!text) return "—";
@@ -220,6 +230,7 @@ function AccountsPageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isProbing, setIsProbing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -270,6 +281,21 @@ function AccountsPageContent() {
       toast.error(message);
     } finally {
       setIsLoadingModels(false);
+    }
+  };
+
+  const handleProbeImagePool = async () => {
+    setIsProbing(true);
+    try {
+      const data = await probeImagePool(20);
+      setAccounts(data.items);
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      const failureText = data.failures.length > 0 ? `，失败 ${data.failures.length} 个` : "";
+      toast.success(`号池探测完成：检查 ${data.checked} 个，健康 ${data.healthy} 个${failureText}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "号池探测失败");
+    } finally {
+      setIsProbing(false);
     }
   };
 
@@ -802,7 +828,7 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void loadAccounts()}
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
             刷新
@@ -810,8 +836,17 @@ function AccountsPageContent() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleProbeImagePool()}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
+          >
+            {isProbing ? <LoaderCircle className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+            执行号池探测
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
@@ -826,7 +861,7 @@ function AccountsPageContent() {
             {selectedTokens.length > 0 ? "回填所选画像" : "回填全部画像"}
           </Button>
           <AccountImportDialog
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isRefreshing || isProbing || isDeleting}
             onImported={(items) => {
               setAccounts(items);
               setSelectedIds([]);
@@ -1200,13 +1235,24 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge
-                            variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
-                          >
-                            <StatusIcon className="size-3.5" />
-                            {account.status}
-                          </Badge>
+                          <div className="flex flex-col items-start gap-1">
+                            <Badge
+                              variant={status.badge}
+                              className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                            >
+                              <StatusIcon className="size-3.5" />
+                              {account.status}
+                            </Badge>
+                            {account.image_pool_state ? (
+                              <Badge
+                                variant={account.image_pool_state === "ready" ? "success" : account.image_pool_state === "cooldown" ? "warning" : "secondary"}
+                                className="rounded-md px-2 py-1"
+                                title={account.image_pool_reason || undefined}
+                              >
+                                {imagePoolStateLabels[account.image_pool_state] || account.image_pool_state}
+                              </Badge>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
@@ -1257,9 +1303,22 @@ function AccountsPageContent() {
                           })()}
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="info" className="rounded-md">
-                            {formatQuota(account)}
-                          </Badge>
+                          <div className="space-y-1">
+                            <Badge variant="info" className="rounded-md">
+                              {formatQuota(account)}
+                            </Badge>
+                            {account.image_quota_confidence ? (
+                              <div className="text-[11px] text-stone-400">
+                                {account.image_quota_confidence === "verified" ? "已校准" : account.image_quota_confidence === "unknown" ? "未知" : "估算"}
+                              </div>
+                            ) : null}
+                            {typeof account.image_success_ema === "number" ? (
+                              <div className="text-[11px] text-stone-400">
+                                健康 {Math.round(account.image_success_ema * 100)}%
+                                {account.image_latency_ema_ms ? ` · ${(account.image_latency_ema_ms / 1000).toFixed(1)}s` : ""}
+                              </div>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {

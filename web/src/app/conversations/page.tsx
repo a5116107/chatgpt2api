@@ -91,7 +91,7 @@ function ConversationsContent() {
         conversation = await createConversation({ title: content.slice(0, 40), model, source: "playground" });
         setActiveId(conversation.id);
       }
-      await sendChatMessage({
+      const response = await sendChatMessage({
         conversation_id: conversation.id,
         model,
         messages: [...(conversation.messages || []).map((m) => ({ role: m.role, content: m.content })), { role: "user", content }],
@@ -101,7 +101,7 @@ function ConversationsContent() {
       setItems((current) => [fresh, ...current.filter((item) => item.id !== fresh.id)]);
       setPrompt("");
       const latest = fresh.messages?.slice().reverse().find((m) => m.role === "assistant")?.content || "";
-      toast.success(latest || assistantText);
+      toast.success(latest || assistantText(response) || "回复已完成");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "发送失败");
     } finally {

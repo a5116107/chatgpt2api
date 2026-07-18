@@ -115,45 +115,58 @@ class FlareSolverrClearanceProvider:
             return None
 
         timeout = _coerce_timeout(timeout_sec)
-        payload: dict[str, object] = {
-            "cmd": "request.get",
-            "url": str(target_url or ""),
-            "maxTimeout": int(timeout * 1000),
-        }
-        proxy_url = normalize_proxy_url(proxy_url)
-        if proxy_url:
-            payload["proxy"] = {"url": proxy_url}
+        requested_proxy = normalize_proxy_url(proxy_url)
+        # Prefer same-egress proxy first (cf_clearance often IP-bound). If that fails
+        # (docker/glider path breaks FlareSolverr), fall back to direct browser path
+        # but still bind the returned bundle to the requested proxy for cache matching.
+        proxy_candidates: list[str] = []
+        if requested_proxy:
+            proxy_candidates.append(requested_proxy)
+        proxy_candidates.append("")
 
         endpoint = f"{self.flaresolverr_url}/v1"
-        try:
-            body = json.dumps(payload).encode("utf-8")
-            raw_response = self._request_method(
-                endpoint,
-                body,
-                {"Content-Type": "application/json"},
-                timeout,
-            )
-            data = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
-        except Exception:
-            return None
-
-        if not isinstance(data, dict) or str(data.get("status") or "").lower() != "ok":
-            return None
-        solution = data.get("solution")
-        if not isinstance(solution, dict):
-            return None
-
         target_host = _host_from_url(target_url)
-        cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
-        user_agent = str(solution.get("userAgent") or "").strip()
-        if not cookies:
-            return None
-        return ClearanceBundle(
-            target_host=target_host,
-            proxy_url=proxy_url,
-            cookies=cookies,
-            user_agent=user_agent,
-        )
+        best: ClearanceBundle | None = None
+        for candidate in proxy_candidates:
+            payload: dict[str, object] = {
+                "cmd": "request.get",
+                "url": str(target_url or ""),
+                "maxTimeout": int(timeout * 1000),
+            }
+            if candidate:
+                payload["proxy"] = {"url": candidate}
+            try:
+                body = json.dumps(payload).encode("utf-8")
+                raw_response = self._request_method(
+                    endpoint,
+                    body,
+                    {"Content-Type": "application/json"},
+                    timeout,
+                )
+                data = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or str(data.get("status") or "").lower() != "ok":
+                continue
+            solution = data.get("solution")
+            if not isinstance(solution, dict):
+                continue
+            cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
+            user_agent = str(solution.get("userAgent") or "").strip()
+            if not cookies:
+                continue
+            bundle = ClearanceBundle(
+                target_host=target_host,
+                # Keep cache key aligned with the runtime egress used by OpenAI traffic.
+                proxy_url=requested_proxy,
+                cookies=cookies,
+                user_agent=user_agent,
+            )
+            if "cf_clearance" in cookies:
+                return bundle
+            if best is None:
+                best = bundle
+        return best
 
     @staticmethod
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:

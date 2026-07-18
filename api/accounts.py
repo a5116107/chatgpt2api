@@ -58,6 +58,10 @@ class AccountRefreshRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
 
 
+class ImagePoolProbeRequest(BaseModel):
+    limit: int = Field(default=20, ge=1, le=100)
+
+
 class AccountExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     format: Literal["json", "zip"] = "json"
@@ -274,6 +278,19 @@ def create_router() -> APIRouter:
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
         return progress
+
+    @router.post("/api/accounts/image-pool/probe")
+    async def probe_image_pool(
+        body: ImagePoolProbeRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        result = await run_in_threadpool(account_service.probe_image_candidates, body.limit)
+        return {
+            **result,
+            "stats": account_service.get_stats(),
+            "items": account_service.list_accounts(),
+        }
 
     @router.post("/api/accounts/re-login")
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):

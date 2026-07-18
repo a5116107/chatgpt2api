@@ -107,7 +107,12 @@ def account_key(account: dict[str, Any]) -> str:
 
 
 def _account_plan(account: dict[str, Any]) -> str:
-    """Normalize account plan without promoting free accounts from quota alone."""
+    """Normalize plan for capability derivation.
+
+    IMPORTANT: free automation accounts often carry positive image quota.
+    Never promote free/unknown to plus solely because quota>0 — that causes
+    token_invalid events to fully wipe image capability and empty the pool.
+    """
     raw = str(
         account.get("plan")
         or account.get("account_plan")
@@ -117,18 +122,22 @@ def _account_plan(account: dict[str, Any]) -> str:
         or ""
     ).strip().lower().replace("-", "_").replace(" ", "_")
     compact = raw.replace("_", "")
-    known = {"free", "plus", "team", "enterprise", "pro", "prolite", "business"}
-    if raw in known or compact in known:
-        if compact == "business":
+    if raw in {"free", "plus", "team", "enterprise", "pro", "prolite", "business"} or compact in {
+        "free", "plus", "team", "enterprise", "pro", "prolite", "business"
+    }:
+        if compact in {"business"}:
             return "team"
-        if compact == "prolite":
+        if compact in {"prolite"}:
             return "pro"
-        return compact
+        return "free" if compact == "free" else (compact if compact in {"plus", "team", "enterprise", "pro"} else raw)
+    # chatgptfreeplan / freeplan style
     if "free" in raw:
         return "free"
-    for plan in ("enterprise", "team", "plus", "pro"):
-        if plan in raw:
-            return plan
+    if any(k in raw for k in ("plus", "team", "enterprise", "pro")):
+        for k in ("enterprise", "team", "plus", "pro"):
+            if k in raw:
+                return k
+    # Unknown plan: keep unknown. Do NOT upgrade to plus on quota alone.
     return "unknown"
 
 
@@ -166,17 +175,6 @@ def _default_capability(account: dict[str, Any]) -> dict[str, Any]:
         "last_probe_at": _now(),
         "updated_at": _now(),
     }
-
-
-def _account_is_terminal(account: dict[str, Any]) -> bool:
-    status = str(account.get("status") or "").strip().lower()
-    token_status = str(account.get("token_status") or "").strip().lower()
-    return (
-        status in {"禁用", "disabled"}
-        or token_status in {"revoked", "invalidated", "disabled"}
-        or bool(account.get("token_revoked"))
-        or bool(account.get("token_revoked_at"))
-    )
 
 
 def classify_error(message: str, status_code: int | None = None) -> dict[str, Any]:
@@ -273,7 +271,7 @@ class RiskControlService:
                 derived = _default_capability(account)
                 old = existing.get(key)
                 old_source = str((old or {}).get("source") or "").strip().lower()
-                if old and old_source and old_source != "derived" and not _account_is_terminal(account):
+                if old and old_source and old_source != "derived":
                     merged = {**derived, **{k: old[k] for k in old if k not in {"runtime_profile_id", "quota", "updated_at"}}}
                     merged["runtime_profile_id"] = derived["runtime_profile_id"]
                     merged["quota"] = derived["quota"]
@@ -316,28 +314,33 @@ class RiskControlService:
         raise KeyError(key)
 
     def capability_allows(self, account: dict[str, Any], capability: str) -> bool:
-        """Read capability snapshot and heal stale free-account image flags."""
+        """Return whether the given account may use the named capability.
+
+        Reads capability snapshot when present, but self-heals free/unknown soft
+        revoke cases: positive image quota must keep image/* even if a stale
+        risk_event previously wiped the snapshot (plan mislabeled as plus).
+        """
         name = str(capability or "").strip()
         if name not in CAPABILITY_NAMES:
             return True
-        if _account_is_terminal(account):
-            return False
         try:
             key = account_key(account)
             capability_item = self._load_capability_index().get(key)
             if not isinstance(capability_item, dict):
                 capability_item = _default_capability(account)
-            if bool(capability_item.get(name)):
+            allowed = bool(capability_item.get(name))
+            if allowed:
                 return True
+            # Self-heal soft free image after stale full wipe snapshots.
             plan = _account_plan(account)
             status = str(account.get("status") or "").strip()
             quota = int(account.get("quota") or 0) if str(account.get("quota") or "0").isdigit() else 0
-            soft_free = (
-                plan in {"free", "unknown"}
-                and status in {"正常", "异常", "active", "ok", "healthy", ""}
-                and quota > 0
-            )
-            return soft_free and name in {"image", "image_edit", "image_variation", "audio_tts"}
+            soft_free = plan in {"free", "unknown"} and status in {"正常", "异常", "active", "ok", "healthy", ""} and quota > 0
+            if soft_free and name in {"image", "image_edit", "image_variation", "audio_tts"}:
+                return True
+            # Chat stays strict: soft/abnormal free text tokens are selected only via
+            # account_service.get_text_access_token (status=正常 gate).
+            return False
         except Exception:
             return bool(_default_capability(account).get(name))
 
@@ -354,23 +357,22 @@ class RiskControlService:
             if item.get("account_key") != key:
                 continue
             if code == "token_invalid":
+                # Soft-disable chat first. Free/unknown accounts with remaining image quota
+                # keep image/* — including snapshots historically mislabeled as plus.
                 plan = str(item.get("plan") or "").strip().lower()
                 quota = int(item.get("quota") or 0) if str(item.get("quota") or "0").isdigit() else 0
                 msg = str(event.get("message") or "").lower()
                 soft_free_like = (
                     plan in {"free", "unknown", ""}
-                    or (
-                        quota > 0
-                        and plan not in {"team", "enterprise", "pro"}
-                        and any(marker in msg for marker in ("token_revoked", "invalidated oauth", "text_stream", "image_stream"))
-                    )
+                    or (quota > 0 and plan not in {"team", "enterprise", "pro"} and ("token_revoked" in msg or "invalidated oauth" in msg or "text_stream" in msg or "image_stream" in msg))
                 )
                 if soft_free_like and quota > 0:
                     for name in ("chat", "responses", "raw_conversation", "search", "file", "audio_stt", "audio_translation"):
                         item[name] = False
+                    # ensure image remains usable
                     for name in ("image", "image_edit", "image_variation", "audio_tts"):
                         item[name] = True
-                    item["plan"] = "free" if plan in {"", "unknown", "plus"} else plan
+                    item["plan"] = "free" if plan in {"", "unknown", "plus"} and quota > 0 else (plan or "free")
                     item["risk_status"] = "soft_token_invalid"
                 else:
                     for name in CAPABILITY_NAMES:
@@ -708,6 +710,7 @@ class RiskControlService:
             return {"rebuilt": count, "total": len(self.list_proxies())}
 
     def sync_task_center(self) -> dict[str, Any]:
+        # PATCH_MARKER conversation_status_repair_r28
         try:
             from services.conversation_store import conversation_store
             conversation_store.repair_statuses()
@@ -810,6 +813,7 @@ class RiskControlService:
             if not isinstance(conversation_items, list):
                 conversation_items = []
             for item in conversation_items:
+                # PATCH_MARKER chat_task_terminal_r27
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 tid = str(item["id"])
@@ -819,29 +823,29 @@ class RiskControlService:
                 existing = tasks.get(tid, {})
                 raw_status = str(item.get("status") or "").strip().lower()
                 has_assistant = any(
-                    isinstance(message, dict)
-                    and str(message.get("role") or "").strip().lower() == "assistant"
-                    and str(message.get("content") or "").strip()
-                    for message in messages
+                    isinstance(m, dict)
+                    and str(m.get("role") or "").strip().lower() == "assistant"
+                    and str(m.get("content") or "").strip()
+                    for m in messages
                 )
                 has_failed = any(
-                    isinstance(message, dict)
-                    and str((message.get("metadata") or {}).get("status") or "").lower() == "failed"
-                    for message in messages
+                    isinstance(m, dict)
+                    and str((m.get("metadata") or {}).get("status") or "").lower() == "failed"
+                    for m in messages
                 )
                 if raw_status in {"succeeded", "success", "failed", "error", "cancelled", "stale", "idle"}:
-                    derived_status = raw_status
+                    derived = raw_status
                 elif has_failed:
-                    derived_status = "failed"
+                    derived = "failed"
                 elif has_assistant:
-                    derived_status = "succeeded"
+                    derived = "succeeded"
                 else:
-                    derived_status = raw_status or "active"
+                    derived = raw_status or "active"
                 tasks[tid] = {
                     **existing,
                     "id": tid,
                     "type": "chat",
-                    "status": normalize_task_status(derived_status),
+                    "status": normalize_task_status(derived),
                     "progress": f"{len(messages)} messages",
                     "created_at": item.get("created_at"),
                     "updated_at": item.get("updated_at"),
@@ -972,3 +976,4 @@ class RiskControlService:
 risk_control_service = RiskControlService()
 
 # PATCH_MARKER free_soft_revoked_capability_r8
+# PATCH_MARKER soft_image_capability_heal_r10

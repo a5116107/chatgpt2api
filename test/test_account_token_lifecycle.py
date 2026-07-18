@@ -62,12 +62,13 @@ class AccountTokenLifecycleTests(unittest.TestCase):
     def service(self, *accounts: dict) -> AccountService:
         return AccountService(MemoryStorage(list(accounts)))
 
-    def test_stream_revocation_is_hard_dead_for_chat_and_image(self) -> None:
-        for value in (
-            "text_stream:token_revoked",
-            "image_stream:token_revoked",
-            "status=401 code=token_revoked",
-        ):
+    def test_chat_only_revocation_is_recoverable_but_image_revocation_is_terminal(self) -> None:
+        self.assertFalse(
+            AccountService._access_token_hard_dead(
+                {"last_refresh_error": "text_stream:token_revoked"}
+            )
+        )
+        for value in ("image_stream:token_revoked", "status=401 code=token_revoked"):
             with self.subTest(value=value):
                 self.assertTrue(AccountService._access_token_hard_dead({"last_refresh_error": value}))
 
@@ -76,7 +77,13 @@ class AccountTokenLifecycleTests(unittest.TestCase):
 
         self.assertEqual(service._list_ready_candidate_tokens(), [])
         self.assertEqual(service.get_text_access_token(), "")
-        result = service.probe_image_candidates(limit=1)
+        with mock.patch.object(
+            type(account_service_config),
+            "auto_remove_invalid_accounts",
+            new_callable=mock.PropertyMock,
+            return_value=False,
+        ):
+            result = service.probe_image_candidates(limit=1)
         self.assertEqual(result["checked"], 0)
         self.assertEqual(result["quarantined"], 1)
         self.assertEqual(service.get_account("revoked")["status"], "禁用")
@@ -129,7 +136,7 @@ class AccountTokenLifecycleTests(unittest.TestCase):
         self.assertEqual(set(visited), {"token-0", "token-1", "token-2", "token-3"})
 
     def test_probe_quarantines_explicit_revocation(self) -> None:
-        service = self.service(account("revoked"))
+        service = self.service(account("revoked", image_quota_updated_at=time.time()))
 
         class RevokedBackend:
             def __init__(self, _token: str) -> None:
@@ -150,7 +157,15 @@ class AccountTokenLifecycleTests(unittest.TestCase):
             def _get_chat_requirements(self) -> None:
                 raise RuntimeError("status=401 code=token_revoked")
 
-        with mock.patch("services.openai_backend_api.OpenAIBackendAPI", RevokedBackend):
+        with (
+            mock.patch("services.openai_backend_api.OpenAIBackendAPI", RevokedBackend),
+            mock.patch.object(
+                type(account_service_config),
+                "auto_remove_invalid_accounts",
+                new_callable=mock.PropertyMock,
+                return_value=False,
+            ),
+        ):
             result = service.probe_image_candidates(limit=1)
 
         self.assertEqual(result["quarantined"], 1)

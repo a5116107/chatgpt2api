@@ -550,26 +550,83 @@ class ConfigStore:
 
     @property
     def image_stream_close_timeout_secs(self) -> float:
-        """Maximum wait for image stream worker cleanup after a result is resolved."""
+        """Maximum wait per stream cleanup thread after an image result is available."""
         try:
-            return max(0.1, float(self.data.get("image_stream_close_timeout_secs", 0.5)))
+            return min(5.0, max(0.1, float(self.data.get("image_stream_close_timeout_secs", 0.5))))
         except (TypeError, ValueError):
             return 0.5
 
     @property
     def image_poll_interval_secs(self) -> float:
         try:
-            return max(0.5, float(self.data.get("image_poll_interval_secs", 2.0)))
+            return max(0.5, float(self.data.get("image_poll_interval_secs", 0.5)))
         except (TypeError, ValueError):
-            return 2.0
+            return 0.5
 
     @property
     def image_poll_initial_wait_secs(self) -> float:
         """Short commit grace before the first conversation poll."""
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 1.0)))
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 0.25)))
+        except (TypeError, ValueError):
+            return 0.25
+
+    @property
+    def image_poll_request_timeout_secs(self) -> float:
+        """Per-request timeout for low-latency conversation polling."""
+        try:
+            return min(5.0, max(0.5, float(self.data.get("image_poll_request_timeout_secs", 2.0))))
+        except (TypeError, ValueError):
+            return 2.0
+
+    @property
+    def image_poll_rate_limit_failover_threshold(self) -> int:
+        """Consecutive poll 429s required before switching to a healthy alternative account."""
+        try:
+            return min(10, max(1, int(self.data.get("image_poll_rate_limit_failover_threshold", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
+    def image_poll_rate_limit_retry_delay_secs(self) -> float:
+        """Short retry delay for a first poll 429 when account failover is available."""
+        try:
+            return min(
+                10.0,
+                max(0.25, float(self.data.get("image_poll_rate_limit_retry_delay_secs", 1.0))),
+            )
         except (TypeError, ValueError):
             return 1.0
+
+    @property
+    def image_poll_rate_limit_failover_min_elapsed_secs(self) -> float:
+        """Minimum poll age before repeated 429s may abandon a still-viable SSE stream."""
+        try:
+            return min(
+                60.0,
+                max(0.0, float(self.data.get("image_poll_rate_limit_failover_min_elapsed_secs", 10.0))),
+            )
+        except (TypeError, ValueError):
+            return 10.0
+
+    @property
+    def image_invalid_token_rotate_limit(self) -> int:
+        """Maximum revoked image accounts skipped before failing one request."""
+        try:
+            return min(64, max(1, int(self.data.get("image_invalid_token_rotate_limit", 24))))
+        except (TypeError, ValueError):
+            return 24
+
+    @property
+    def image_poll_progress_persist_interval_secs(self) -> float:
+        """Minimum interval between durable polling-progress updates."""
+        try:
+            return min(
+                30.0,
+                max(0.5, float(self.data.get("image_poll_progress_persist_interval_secs", 2.0))),
+            )
+        except (TypeError, ValueError):
+            return 2.0
 
     @property
     def image_poll_fast_window_secs(self) -> float:
@@ -600,6 +657,26 @@ class ConfigStore:
             return 0.75
 
     @property
+    def image_png_compress_level(self) -> int:
+        """PNG compression is lossless; lower levels trade file size for latency."""
+        try:
+            return min(9, max(0, int(self.data.get("image_png_compress_level", 1))))
+        except (TypeError, ValueError):
+            return 1
+
+    @property
+    def image_fetch_direct_hosts(self) -> list[str]:
+        """Exact image URL hosts that bypass the upstream proxy, for example the app's own CDN."""
+        raw = self.data.get("image_fetch_direct_hosts", [])
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        hosts: list[str] = []
+        for value in values:
+            host = str(value or "").strip().lower().rstrip(".")
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    @property
     def image_heartbeat_interval_secs(self) -> float:
         try:
             return max(1.0, float(self.data.get("image_heartbeat_interval_secs", 10.0)))
@@ -626,6 +703,62 @@ class ConfigStore:
             return max(1, min(20, int(self.data.get("image_account_probe_batch_size", 3))))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def image_account_probe_parallelism(self) -> int:
+        try:
+            return max(1, min(10, int(self.data.get("image_account_probe_parallelism", 4))))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
+    def image_account_probe_healthy_interval_secs(self) -> int:
+        try:
+            return max(300, min(86400, int(self.data.get("image_account_probe_healthy_interval_secs", 1800))))
+        except (TypeError, ValueError):
+            return 1800
+
+    @property
+    def image_account_quota_refresh_interval_secs(self) -> int:
+        try:
+            return max(300, min(86400, int(self.data.get("image_account_quota_refresh_interval_secs", 1800))))
+        except (TypeError, ValueError):
+            return 1800
+
+    @property
+    def image_account_probe_probation_interval_secs(self) -> int:
+        try:
+            return max(30, min(3600, int(self.data.get("image_account_probe_probation_interval_secs", 60))))
+        except (TypeError, ValueError):
+            return 60
+
+    @property
+    def image_account_rate_limit_cooldown_secs(self) -> int:
+        try:
+            return max(60, min(3600, int(self.data.get("image_account_rate_limit_cooldown_secs", 600))))
+        except (TypeError, ValueError):
+            return 600
+
+    @property
+    def image_account_timeout_cooldown_secs(self) -> int:
+        try:
+            return max(30, min(1800, int(self.data.get("image_account_timeout_cooldown_secs", 90))))
+        except (TypeError, ValueError):
+            return 90
+
+    @property
+    def image_account_max_cooldown_secs(self) -> int:
+        try:
+            return max(300, min(21600, int(self.data.get("image_account_max_cooldown_secs", 3600))))
+        except (TypeError, ValueError):
+            return 3600
+
+    @property
+    def image_account_failure_threshold(self) -> int:
+        try:
+            return max(1, min(10, int(self.data.get("image_account_failure_threshold", 2))))
+        except (TypeError, ValueError):
+            return 2
 
     @property
     def image_account_concurrency(self) -> int:
@@ -668,13 +801,6 @@ class ConfigStore:
     @property
     def auto_remove_invalid_accounts(self) -> bool:
         value = self.data.get("auto_remove_invalid_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -762,18 +888,34 @@ class ConfigStore:
         data["image_stream_close_timeout_secs"] = self.image_stream_close_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_poll_request_timeout_secs"] = self.image_poll_request_timeout_secs
+        data["image_poll_rate_limit_failover_threshold"] = self.image_poll_rate_limit_failover_threshold
+        data["image_poll_rate_limit_retry_delay_secs"] = self.image_poll_rate_limit_retry_delay_secs
+        data["image_poll_rate_limit_failover_min_elapsed_secs"] = self.image_poll_rate_limit_failover_min_elapsed_secs
+        data["image_invalid_token_rotate_limit"] = self.image_invalid_token_rotate_limit
+        data["image_poll_progress_persist_interval_secs"] = self.image_poll_progress_persist_interval_secs
         data["image_poll_fast_window_secs"] = self.image_poll_fast_window_secs
         data["image_poll_slow_interval_secs"] = self.image_poll_slow_interval_secs
         data["image_tasks_check_every"] = self.image_tasks_check_every
         data["image_tasks_timeout_secs"] = self.image_tasks_timeout_secs
+        data["image_png_compress_level"] = self.image_png_compress_level
+        data["image_fetch_direct_hosts"] = self.image_fetch_direct_hosts
         data["image_heartbeat_interval_secs"] = self.image_heartbeat_interval_secs
         data["image_account_probe_enabled"] = self.image_account_probe_enabled
         data["image_account_probe_interval_secs"] = self.image_account_probe_interval_secs
         data["image_account_probe_batch_size"] = self.image_account_probe_batch_size
+        data["image_account_probe_parallelism"] = self.image_account_probe_parallelism
+        data["image_account_probe_healthy_interval_secs"] = self.image_account_probe_healthy_interval_secs
+        data["image_account_quota_refresh_interval_secs"] = self.image_account_quota_refresh_interval_secs
+        data["image_account_probe_probation_interval_secs"] = self.image_account_probe_probation_interval_secs
+        data["image_account_rate_limit_cooldown_secs"] = self.image_account_rate_limit_cooldown_secs
+        data["image_account_timeout_cooldown_secs"] = self.image_account_timeout_cooldown_secs
+        data["image_account_max_cooldown_secs"] = self.image_account_max_cooldown_secs
+        data["image_account_failure_threshold"] = self.image_account_failure_threshold
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
-        data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
+        data.pop("auto_remove_rate_limited_accounts", None)
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
@@ -815,6 +957,7 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data.pop("auto_remove_rate_limited_accounts", None)
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

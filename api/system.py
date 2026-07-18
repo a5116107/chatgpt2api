@@ -602,7 +602,7 @@ def create_router(app_version: str) -> APIRouter:
         stats = acct_svc.get_stats()
         storage = config.get_storage_backend()
         storage_health = storage.health_check()
-        healthy = stats["active"] > 0 or stats["unlimited_quota_count"] > 0
+        healthy = stats["image_schedulable_accounts"] > 0
 
         stats_json = {
             "status": "ok" if healthy else "degraded",
@@ -650,14 +650,22 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 <div class="card"><div class="label">号池状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '异常'}</div></div>
 <div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
 <div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
-<div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
+<div class="card"><div class="label">可调度账号</div><div class="value green">{stats['image_schedulable_accounts']}</div></div>
+<div class="card"><div class="label">可用槽位</div><div class="value green">{stats['image_available_slots']}</div></div>
+<div class="card"><div class="label">探测中 / 待探测</div><div class="value">{stats['image_probe_inflight']} / {stats['image_probe_due']}</div></div>
 <div class="card"><div class="label">无限额</div><div class="value">{stats['unlimited_quota_count']}</div></div>
-<div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
+<div class="card"><div class="label">可调度额度</div><div class="value">{stats['image_schedulable_quota']}</div></div>
+<div class="card"><div class="label">可信额度</div><div class="value">{stats['image_verified_quota']}</div></div>
 <div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
 <div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>
 <div class="card"><div class="label">禁用</div><div class="value">{stats['disabled']}</div></div>
 <div class="card"><div class="label">成功/失败</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
 </div>
+<h2 style="margin-bottom:12px;font-size:16px">图片号池状态</h2>
+<table style="margin-bottom:24px">
+<tr><th>就绪</th><th>观察</th><th>冷却</th><th>额度耗尽</th><th>隔离</th><th>停用</th></tr>
+<tr><td>{stats['image_pool_states'].get('ready', 0)}</td><td>{stats['image_pool_states'].get('probation', 0)}</td><td>{stats['image_pool_states'].get('cooldown', 0)}</td><td>{stats['image_pool_states'].get('exhausted', 0)}</td><td>{stats['image_pool_states'].get('quarantined', 0)}</td><td>{stats['image_pool_states'].get('disabled', 0)}</td></tr>
+</table>
 <h2 style="margin-bottom:12px;font-size:16px">账号类型分布</h2>
 <table>
 <tr><th>类型</th><th>数量</th></tr>

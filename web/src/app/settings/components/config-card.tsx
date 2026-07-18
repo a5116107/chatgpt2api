@@ -30,7 +30,6 @@ export function ConfigCard() {
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
-  const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
   const setAutoReloginAfterRefresh = useSettingsStore((state) => state.setAutoReloginAfterRefresh);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
@@ -229,13 +228,12 @@ export function ConfigCard() {
             </div>
             <div className="flex-1" aria-hidden="true" />
           </div>
-          <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
-            <Checkbox
-              checked={Boolean(config?.auto_remove_rate_limited_accounts)}
-              onCheckedChange={(checked) => setAutoRemoveRateLimitedAccounts(Boolean(checked))}
-            />
-            自动移除限流账号
-          </label>
+          <div className="rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+            <div className="font-medium">限流账号处理</div>
+            <p className="mt-1 text-xs leading-5 text-stone-500">
+              限流和额度耗尽账号进入冷却，恢复后自动回到号池；永久失效账号按“自动移除永久失效账号”设置处理。
+            </p>
+          </div>
           <div className="space-y-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
             <div>
               <label className="text-sm text-stone-700">控制台日志级别</label>

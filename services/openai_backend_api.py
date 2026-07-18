@@ -38,6 +38,10 @@ class ImagePollTimeoutError(RuntimeError):
     pass
 
 
+class ImagePollRateLimitError(ImagePollTimeoutError):
+    """Raised when repeated poll throttling should trigger account failover."""
+
+
 class ImageContentPolicyError(RuntimeError):
     """Raised when image generation is blocked by content policy moderation."""
     pass
@@ -182,6 +186,7 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self.image_request_id = ""
         self.image_deadline_monotonic: float | None = None
+        self.image_rate_limit_failover_enabled = False
         self.session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             upstream=True,
@@ -1064,7 +1069,7 @@ class OpenAIBackendAPI:
         }
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, context: ImagePrepareContext, model: str,
-                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -2230,6 +2235,11 @@ class OpenAIBackendAPI:
         initial_wait = float(config.image_poll_initial_wait_secs if initial_wait_secs is None else initial_wait_secs)
         tasks_every = int(config.image_tasks_check_every)
         tasks_timeout = float(config.image_tasks_timeout_secs)
+        request_timeout = float(config.image_poll_request_timeout_secs)
+        rate_limit_threshold = int(config.image_poll_rate_limit_failover_threshold)
+        rate_limit_retry_delay = float(config.image_poll_rate_limit_retry_delay_secs)
+        rate_limit_failover_min_elapsed = float(config.image_poll_rate_limit_failover_min_elapsed_secs)
+        rate_limit_streak = 0
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -2243,6 +2253,7 @@ class OpenAIBackendAPI:
             "fast_interval_secs": fast_interval,
             "slow_interval_secs": slow_interval,
             "tasks_every": tasks_every,
+            "request_timeout_secs": request_timeout,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
         })
@@ -2267,8 +2278,18 @@ class OpenAIBackendAPI:
         if initial_wait > 0 and not _wait(initial_wait):
             raise ImagePollTimeoutError("image polling cancelled or deadline exceeded")
 
-        def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
-            base = retry_after if retry_after is not None else min(2 ** min(attempt, 3), 8)
+        def _retry_sleep(
+            reason: str,
+            status_code: int | None,
+            error: str | None,
+            retry_after: int | None,
+            preferred_delay: float | None = None,
+        ) -> bool:
+            base = (
+                preferred_delay
+                if preferred_delay is not None
+                else retry_after if retry_after is not None else min(2 ** min(attempt, 3), 8)
+            )
             sleep_for = min(float(base), _remaining())
             log_payload: Dict[str, Any] = {
                 "event": "image_poll_retry",
@@ -2290,17 +2311,57 @@ class OpenAIBackendAPI:
             attempt += 1
             self._report_progress(f"polling:{attempt}")
             try:
-                conversation = self._get_conversation(conversation_id, timeout_secs=min(5.0, _remaining()))
+                conversation = self._get_conversation(
+                    conversation_id,
+                    timeout_secs=min(request_timeout, _remaining()),
+                )
             except UpstreamHTTPError as exc:
-                if exc.status_code in (429, 500, 502, 503, 504):
-                    if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
+                if exc.status_code in (404, 429, 500, 502, 503, 504):
+                    if exc.status_code == 429:
+                        rate_limit_streak += 1
+                        poll_elapsed = time.monotonic() - start
+                        if (
+                            self.image_rate_limit_failover_enabled
+                            and rate_limit_streak >= rate_limit_threshold
+                            and poll_elapsed >= rate_limit_failover_min_elapsed
+                        ):
+                            logger.warning({
+                                "event": "image_poll_rate_limit_failover",
+                                "request_id": self.image_request_id,
+                                "conversation_id": conversation_id,
+                                "attempt": attempt,
+                                "consecutive_429s": rate_limit_streak,
+                                "threshold": rate_limit_threshold,
+                                "elapsed_secs": round(poll_elapsed, 3),
+                                "minimum_elapsed_secs": rate_limit_failover_min_elapsed,
+                            })
+                            error = ImagePollRateLimitError(
+                                f"image polling received {rate_limit_streak} consecutive 429 responses"
+                            )
+                            setattr(error, "status_code", 429)
+                            setattr(error, "conversation_id", conversation_id or "")
+                            raise error from exc
+                        preferred_delay = rate_limit_retry_delay if self.image_rate_limit_failover_enabled else None
+                    else:
+                        rate_limit_streak = 0
+                        preferred_delay = fast_interval if exc.status_code == 404 else None
+                    if _retry_sleep(
+                        "conversation_not_ready" if exc.status_code == 404 else "upstream_status",
+                        exc.status_code,
+                        None,
+                        exc.retry_after,
+                        preferred_delay,
+                    ):
                         continue
                     break
                 raise
             except requests.exceptions.RequestException as exc:
+                rate_limit_streak = 0
                 if _retry_sleep("network", None, str(exc), None):
                     continue
                 break
+
+            rate_limit_streak = 0
 
             for record in self._extract_image_tool_records(conversation):
                 self._add_unique(file_ids, record["file_ids"])
@@ -2494,10 +2555,35 @@ class OpenAIBackendAPI:
 
         return is_error, error_msg, metadata
 
-    def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
+    def _resolve_image_urls(
+        self,
+        conversation_id: str,
+        file_ids: list[str],
+        sediment_ids: list[str],
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
-        urls = []
+        urls: list[str] = []
         resolved_reference_ids: set[str] = set()
+        max_results = max(1, int(limit)) if limit is not None else None
+        self._report_progress("resolving_image_url")
+
+        def complete() -> bool:
+            return max_results is not None and len(urls) >= max_results
+
+        def finish() -> list[str]:
+            self._report_progress("image_url_ready")
+            logger.debug({
+                "event": "image_urls_resolved",
+                "conversation_id": conversation_id,
+                "file_ids": file_ids,
+                "sediment_ids": sediment_ids,
+                "urls": urls,
+                "limit": max_results,
+            })
+            return urls
+
         skip_patterns = {"file_upload"}
         for file_id in file_ids:
             if file_id in skip_patterns:
@@ -2522,7 +2608,9 @@ class OpenAIBackendAPI:
             if url:
                 if url not in urls:
                     urls.append(url)
-                resolved_reference_ids.add(file_id)
+                    resolved_reference_ids.add(file_id)
+                    if complete():
+                        return finish()
             else:
                 logger.debug({
                     "event": "image_download_url_empty",
@@ -2531,17 +2619,8 @@ class OpenAIBackendAPI:
                     "id": file_id,
                 })
         if not conversation_id or not sediment_ids:
-            logger.debug({
-                "event": "image_urls_resolved",
-                "conversation_id": conversation_id,
-                "file_ids": file_ids,
-                "sediment_ids": sediment_ids,
-                "urls": urls,
-            })
-            return urls
+            return finish()
         for sediment_id in sediment_ids:
-            # The same generated image is frequently emitted as both a file and a
-            # sediment reference. Keep attachment resolution as a fallback only.
             if sediment_id in resolved_reference_ids:
                 continue
             try:
@@ -2558,6 +2637,8 @@ class OpenAIBackendAPI:
             if url:
                 if url not in urls:
                     urls.append(url)
+                    if complete():
+                        return finish()
             else:
                 logger.debug({
                     "event": "image_download_url_empty",
@@ -2565,14 +2646,7 @@ class OpenAIBackendAPI:
                     "conversation_id": conversation_id,
                     "id": sediment_id,
                 })
-        logger.debug({
-            "event": "image_urls_resolved",
-            "conversation_id": conversation_id,
-            "file_ids": file_ids,
-            "sediment_ids": sediment_ids,
-            "urls": urls,
-        })
-        return urls
+        return finish()
 
     def resolve_conversation_image_urls(
             self,
@@ -2581,6 +2655,7 @@ class OpenAIBackendAPI:
             sediment_ids: list[str],
             poll: bool = True,
             poll_timeout_secs: float | None = None,
+            limit: int | None = None,
     ) -> list[str]:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
@@ -2593,7 +2668,7 @@ class OpenAIBackendAPI:
                 "file_ids": file_ids,
                 "sediment_ids": sediment_ids,
             })
-            return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+            return self._resolve_image_urls(conversation_id, file_ids, sediment_ids, limit=limit)
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",
@@ -2636,7 +2711,7 @@ class OpenAIBackendAPI:
             else:
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
-        return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+        return self._resolve_image_urls(conversation_id, file_ids, sediment_ids, limit=limit)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         """下载图片内容。
@@ -2644,6 +2719,7 @@ class OpenAIBackendAPI:
         estuary/content 经代理时偶发长时间无响应。使用 connect/read 分拆超时，
         并对 TLS/代理瞬时错误做有限次重试，避免客户端先超时、服务端仍占 image_inflight。
         """
+        self._report_progress("image_download_started")
         images = []
         max_attempts = 3
         for url in urls:
@@ -2703,6 +2779,7 @@ class OpenAIBackendAPI:
                 raise RuntimeError("image_download failed without content")
             if content not in images:
                 images.append(content)
+        self._report_progress("source_downloaded")
         return images
 
     def stream_conversation(
@@ -2742,9 +2819,10 @@ class OpenAIBackendAPI:
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
-        if self.progress_callback:
+        callback = getattr(self, "progress_callback", None)
+        if callback:
             try:
-                self.progress_callback(step)
+                callback(step)
             except Exception:
                 pass
 
@@ -2770,6 +2848,7 @@ class OpenAIBackendAPI:
     def _clone_for_image_poll(self) -> "OpenAIBackendAPI":
         backend = OpenAIBackendAPI(access_token=self.access_token)
         backend.set_image_request_context(self.image_request_id, self.image_deadline_monotonic)
+        backend.image_rate_limit_failover_enabled = self.image_rate_limit_failover_enabled
         backend.progress_callback = self.progress_callback
         try:
             backend.session.headers.clear()
@@ -2832,6 +2911,7 @@ class OpenAIBackendAPI:
         last_heartbeat = started
         sse_done = False
         sse_error: Exception | None = None
+        first_sse_event = False
 
         def read_sse() -> None:
             try:
@@ -2901,6 +2981,7 @@ class OpenAIBackendAPI:
                     poll_value = None
                 if poll_kind == "result":
                     file_ids, sediment_ids = poll_value
+                    self._report_progress("result_pointer_ready")
                     logger.info({
                         "event": "image_result_race_winner",
                         "request_id": self.image_request_id,
@@ -2912,7 +2993,15 @@ class OpenAIBackendAPI:
                     yield "[DONE]"
                     return
                 if poll_kind == "error":
-                    if isinstance(poll_value, ImageContentPolicyError):
+                    if isinstance(poll_value, (ImageContentPolicyError, ImagePollRateLimitError)):
+                        logger.warning({
+                            "event": "image_result_race_aborted",
+                            "request_id": self.image_request_id,
+                            "conversation_id": conversation_id,
+                            "reason": "rate_limit_failover"
+                            if isinstance(poll_value, ImagePollRateLimitError)
+                            else "content_policy",
+                        })
                         raise poll_value
                     sse_error = poll_value
 
@@ -2925,9 +3014,13 @@ class OpenAIBackendAPI:
 
                 if kind == "payload":
                     payload = str(value)
+                    if not first_sse_event:
+                        first_sse_event = True
+                        self._report_progress("sse_first_event")
                     match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
                     if match and not conversation_id:
                         conversation_id = match.group(1)
+                        self._report_progress("conversation_ready")
                         start_poll(conversation_id)
                     file_ids = REAL_IMAGE_FILE_ID_RE.findall(payload)
                     sediment_ids = SEDIMENT_ID_RE.findall(payload)
@@ -2941,6 +3034,7 @@ class OpenAIBackendAPI:
                         continue
                     yield payload
                     if file_ids or sediment_ids:
+                        self._report_progress("result_pointer_ready")
                         logger.info({
                             "event": "image_result_race_winner",
                             "request_id": self.image_request_id,

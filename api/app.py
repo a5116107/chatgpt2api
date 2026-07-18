@@ -22,9 +22,13 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         stop_event = Event()
-        quarantined = account_service.quarantine_persisted_terminal_tokens("startup_reconcile")
-        if quarantined:
-            print(f"[startup-account-reconcile] quarantined={quarantined}")
+        cleanup = account_service.cleanup_persisted_terminal_accounts("startup_reconcile")
+        if cleanup.get("removed") or cleanup.get("quarantined"):
+            print(
+                "[startup-account-reconcile] "
+                f"removed={cleanup.get('removed', 0)} "
+                f"quarantined={cleanup.get('quarantined', 0)}"
+            )
         thread = start_limited_account_watcher(stop_event)
         image_probe_thread = start_image_account_probe(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)

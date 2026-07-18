@@ -5,12 +5,15 @@ import binascii
 import io
 import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
+from services.config import config
 from services.image_storage_service import ImageStorageService, image_storage_service
+from utils.log import logger
 
 MAX_OUTPUT_EDGE = 4096
 MAX_OUTPUT_PIXELS = 4096 * 4096
@@ -79,7 +82,10 @@ def _resize_png(payload: bytes, output_size: TargetSize) -> bytes:
             if image.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
                 image = image.convert("RGB")
             resized = image.resize((output_size.width, output_size.height), Image.Resampling.LANCZOS)
-            save_options: dict[str, Any] = {"format": "PNG", "compress_level": 6}
+            save_options: dict[str, Any] = {
+                "format": "PNG",
+                "compress_level": config.image_png_compress_level,
+            }
             icc_profile = image.info.get("icc_profile")
             if isinstance(icc_profile, bytes) and icc_profile:
                 save_options["icc_profile"] = icc_profile
@@ -100,6 +106,7 @@ class ImageOutputService:
         requested_size: object,
         base_url: str | None = None,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         target = parse_target_size(requested_size)
         source_payload = _decode_image(item)
         try:
@@ -111,15 +118,53 @@ class ImageOutputService:
         source = TargetSize(source_width, source_height)
         output = _output_dimensions(source, target)
         original_url = str(item.get("url") or "").strip()
-        if not original_url:
-            original_url = self.storage.save(source_payload, base_url).url
-
-        output_url = original_url
+        resize_started = time.perf_counter()
+        output_payload: bytes | None = None
         transform = "original"
         if output != source:
             output_payload = _resize_png(source_payload, output)
-            output_url = self.storage.save(output_payload, base_url).url
             transform = "lanczos_upscale"
+        resize_ms = int((time.perf_counter() - resize_started) * 1000)
+
+        entries: list[tuple[bytes, tuple[int, int] | None]] = []
+        original_index: int | None = None
+        output_index: int | None = None
+        if not original_url:
+            original_index = len(entries)
+            entries.append((source_payload, (source.width, source.height)))
+        if output_payload is not None:
+            output_index = len(entries)
+            entries.append((output_payload, (output.width, output.height)))
+
+        storage_started = time.perf_counter()
+        if entries:
+            save_many = getattr(self.storage, "save_many", None)
+            if callable(save_many):
+                stored = save_many(entries, base_url)
+            else:
+                # Keep the output service compatible with lightweight storage
+                # adapters while the built-in service uses one batched write.
+                stored = [self.storage.save(payload, base_url) for payload, _ in entries]
+        else:
+            stored = []
+        storage_ms = int((time.perf_counter() - storage_started) * 1000)
+        if original_index is not None:
+            original_url = stored[original_index].url
+        output_url = stored[output_index].url if output_index is not None else original_url
+        logger.info({
+            "event": "web_image_output_ready",
+            "source_width": source.width,
+            "source_height": source.height,
+            "output_width": output.width,
+            "output_height": output.height,
+            "transform": transform,
+            "compress_level": config.image_png_compress_level,
+            "resize_ms": resize_ms,
+            "storage_ms": storage_ms,
+            "total_ms": int((time.perf_counter() - started) * 1000),
+            "source_bytes": len(source_payload),
+            "output_bytes": len(output_payload) if output_payload is not None else len(source_payload),
+        })
 
         return {
             "url": output_url,

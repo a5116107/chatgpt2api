@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from services.config import config
 from services.proxy_service import proxy_settings
 
 ImageInput = tuple[bytes, str, str]
@@ -168,7 +169,7 @@ def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
 
 async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
     """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。
-    
+
     返回 (payload, image_sources, mask_sources)
     """
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -263,13 +264,19 @@ def _download_image_url(url: str) -> ImageInput:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    hostname = str(parsed.hostname or "").strip().lower().rstrip(".")
+    session_kwargs = (
+        {}
+        if hostname and hostname in set(config.image_fetch_direct_hosts)
+        else proxy_settings.build_session_kwargs()
+    )
     try:
         response = requests.get(
             source,
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
             allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
+            **session_kwargs,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc

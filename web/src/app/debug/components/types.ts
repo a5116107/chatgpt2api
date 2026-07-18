@@ -11,6 +11,7 @@ export type ChatMessage = {
 };
 
 export type ChatCompletionResponse = {
+  conversation_id?: string;
   choices?: Array<{ message?: { role?: string; content?: string } }>;
 };
 

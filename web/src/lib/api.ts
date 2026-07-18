@@ -2,6 +2,8 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type ImagePoolState = "ready" | "probation" | "cooldown" | "exhausted" | "quarantined" | "disabled";
+export type ImageQuotaConfidence = "verified" | "estimated" | "unknown";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -36,6 +38,18 @@ export type Account = {
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
+  image_pool_state?: ImagePoolState;
+  image_pool_reason?: string | null;
+  image_quota_confidence?: ImageQuotaConfidence;
+  image_quota_updated_at?: string | null;
+  image_cooldown_until?: number | string | null;
+  image_next_probe_at?: number | string | null;
+  image_last_probe_at?: string | null;
+  image_last_probe_error?: string | null;
+  image_success_ema?: number;
+  image_latency_ema_ms?: number;
+  image_consecutive_failures?: number;
+  image_probe_inflight?: boolean;
   last_used_at?: string | null;
   proxy?: string | null;
   runtime_profile_id?: string | null;
@@ -274,7 +288,6 @@ export type SettingsConfig = {
   image_settle_secs?: number | string;
   image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;
-  auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
@@ -493,6 +506,23 @@ export async function login(authKey: string) {
 
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
+}
+
+export type ImagePoolProbeResponse = {
+  checked: number;
+  healthy: number;
+  removed: number;
+  quarantined: number;
+  failures: Array<{ account_hash: string; error: string }>;
+  stats?: Record<string, unknown>;
+  items: Account[];
+};
+
+export async function probeImagePool(limit = 20) {
+  return httpRequest<ImagePoolProbeResponse>("/api/accounts/image-pool/probe", {
+    method: "POST",
+    body: { limit },
+  });
 }
 
 export async function fetchModels() {

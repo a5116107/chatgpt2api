@@ -23,7 +23,7 @@ def _composite_mask(
     masks: list[tuple[bytes, str, str]],
 ) -> list[tuple[bytes, str, str]]:
     """将 mask 的 alpha 通道合成到图片中，标识需要编辑的区域。
-    
+
     mask 的透明区域（低 alpha）= 需要编辑的区域，
     mask 的不透明区域（高 alpha）= 保留的区域。
     如果无 mask 则返回原图。
@@ -79,6 +79,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         started_monotonic=float(body.get("_request_started_monotonic") or time.monotonic()),
         deadline_monotonic=float(body.get("_request_deadline_monotonic") or 0) or None,
         single_result=bool(body.get("_single_result")),
+        defer_storage=bool(body.get("_web_image_output")),
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)
