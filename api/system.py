@@ -591,6 +591,7 @@ def create_router(app_version: str) -> APIRouter:
         synced = await run_in_threadpool(risk_control_service.sync_task_center)
         return {"ok": True, "repair": repaired, "tasks": synced}
 
+    @router.get("/api/status", response_model=None)
     @router.get("/api/health", response_model=None)
     @router.get("/health", response_model=None)
     async def health_dashboard(request: Request, format: str = Query(default="")):
@@ -598,7 +599,7 @@ def create_router(app_version: str) -> APIRouter:
         from services.account_service import account_service as acct_svc
         if not str(format or "").strip():
             path = str(getattr(getattr(request, "url", None), "path", "") or "")
-            format = "json" if path.rstrip("/").endswith("/api/health") else "html"
+            format = "json" if path.rstrip("/").endswith(("/api/health", "/api/status")) else "html"
         stats = acct_svc.get_stats()
         storage = config.get_storage_backend()
         storage_health = storage.health_check()

@@ -76,6 +76,13 @@ class ImageAccountHealthApiTests(unittest.TestCase):
         self.assertIn("可调度账号", response.text)
         self.assertIn("图片号池状态", response.text)
 
+    def test_status_alias_returns_json_for_legacy_monitors(self) -> None:
+        response = self._client().get("/api/status")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn(payload["status"], {"ok", "degraded"})
+        self.assertIn("accounts", payload)
+
 
 if __name__ == "__main__":
     unittest.main()
