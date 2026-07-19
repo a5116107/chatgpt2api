@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Callable, Mapping
 from urllib import request as urllib_request
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from curl_cffi.requests import Session
 
@@ -19,6 +19,10 @@ from services.config import config
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
 _DYNAMIC_PROXY_PORTS = {17283, 17284, 17285, 17286}
+_PARAMETERIZED_PROXY_SESSION_RE = re.compile(
+    r"^(?P<prefix>.+-sid-)(?P<session>.+)(?P<suffix>-ttl-\d+)$",
+    flags=re.IGNORECASE,
+)
 
 
 def normalize_proxy_url(url: str) -> str:
@@ -510,10 +514,35 @@ def _dynamic_proxy_session_key(runtime_profile_id: str, profile_identity_key: st
 
 def _apply_dynamic_proxy_session(url: str, session_key: str) -> str:
     candidate = normalize_proxy_url(url)
-    if not candidate or not session_key or not _is_dynamic_proxy_endpoint(candidate):
+    if not candidate or not session_key:
         return candidate
     parsed = urlparse(candidate)
     if parsed.username:
+        username = unquote(parsed.username)
+        match = _PARAMETERIZED_PROXY_SESSION_RE.fullmatch(username)
+        if not match:
+            return candidate
+        userinfo, separator, host_port = parsed.netloc.rpartition("@")
+        if not separator or not host_port:
+            return candidate
+        _, password_separator, encoded_password = userinfo.partition(":")
+        rotated_username = (
+            f"{match.group('prefix')}{session_key[:80]}{match.group('suffix')}"
+        )
+        rotated_userinfo = quote(rotated_username, safe="")
+        if password_separator:
+            rotated_userinfo = f"{rotated_userinfo}:{encoded_password}"
+        return urlunparse(
+            (
+                parsed.scheme,
+                f"{rotated_userinfo}@{host_port}",
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+    if not _is_dynamic_proxy_endpoint(candidate):
         return candidate
     host = parsed.hostname or ""
     if not host:

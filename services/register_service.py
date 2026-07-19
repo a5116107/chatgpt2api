@@ -10,7 +10,7 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
-from services.register import mail_provider, openai_register
+from services.register import mail_provider, openai_register, openai_signup_primitives
 try:
     from services.register.openai_signup_compat.route_stats import summarize_route_stats, suggest_route_retirement
 except Exception:  # pragma: no cover
@@ -22,6 +22,13 @@ except Exception:  # pragma: no cover
 
 REGISTER_FILE = DATA_DIR / "register.json"
 OUTLOOK_POOL_PREVIEW_LIMIT = 20
+OPENAI_REGISTER_CONFIG_FIELDS = (
+    "mail",
+    "proxy",
+    "total",
+    "threads",
+    "max_attempts",
+)
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -53,6 +60,9 @@ def _normalize(raw: dict) -> dict:
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
+    cfg["max_attempts"] = openai_signup_primitives.registration_max_attempts(
+        cfg.get("max_attempts")
+    )
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
@@ -183,7 +193,9 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update(
+                {k: self._config[k] for k in OPENAI_REGISTER_CONFIG_FIELDS}
+            )
             self._save()
             return self.get()
 
@@ -200,7 +212,9 @@ class RegisterService:
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             if self._finish_target_reached(self._config, 0):
                 return self.get()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update(
+                {k: self._config[k] for k in OPENAI_REGISTER_CONFIG_FIELDS}
+            )
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
@@ -231,7 +245,9 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                openai_register.config.update(
+                    {k: self._config[k] for k in OPENAI_REGISTER_CONFIG_FIELDS}
+                )
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
@@ -297,7 +313,6 @@ class RegisterService:
                     elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds())
                 except Exception:
                     elapsed = 0.0
-                done = int(stats.get("done") or 0)
                 success = int(stats.get("success") or 0)
                 fail = int(stats.get("fail") or 0)
                 stats["elapsed_seconds"] = round(elapsed, 1)
@@ -401,7 +416,6 @@ class RegisterService:
 
         # 2) optional disable mail providers with zero success
         if disable_mail_providers:
-            providers = ((self._config.get("mail") or {}).get("providers") or []) if isinstance(self._config.get("mail"), dict) else []
             bad_providers = sorted({
                 str(c.get("mail_provider") or "").strip()
                 for c in candidates

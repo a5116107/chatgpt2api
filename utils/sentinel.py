@@ -11,6 +11,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
+from curl_cffi.const import CurlHttpVersion
+
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
 
@@ -93,6 +95,11 @@ DEFAULT_SENTINEL_USER_AGENT = (
 DEFAULT_SENTINEL_SEC_CH_UA = '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"'
 
 
+def _is_tls_handshake_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "curl: (35)" in message or "tls connect error" in message
+
+
 def build_sentinel_token(
     session: "Session",
     device_id: str,
@@ -119,10 +126,9 @@ def build_sentinel_token(
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     generator = SentinelTokenGenerator(device_id, ua)
-    resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
-        headers={
+    request_kwargs = {
+        "data": json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        "headers": {
             "Content-Type": "text/plain;charset=UTF-8",
             "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
             "Origin": "https://sentinel.openai.com",
@@ -131,9 +137,20 @@ def build_sentinel_token(
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
         },
-        timeout=20,
-        verify=False,
-    )
+        "timeout": 20,
+        "verify": False,
+    }
+    url = "https://sentinel.openai.com/backend-api/sentinel/req"
+    try:
+        resp = session.post(url, **request_kwargs)
+    except Exception as exc:
+        if not _is_tls_handshake_error(exc):
+            raise
+        resp = session.post(
+            url,
+            http_version=CurlHttpVersion.V1_1,
+            **request_kwargs,
+        )
 
     try:
         data = resp.json() if resp.text else {}

@@ -9,9 +9,14 @@ import re
 import string
 import time
 from datetime import datetime, timezone
-from email import message_from_bytes, message_from_string, policy
-from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email import (
+    header as email_header,
+    message_from_bytes,
+    message_from_string,
+    policy,
+    utils as email_utils,
+)
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, TypeVar
 
@@ -19,6 +24,7 @@ from curl_cffi import requests
 
 
 from services.config import DATA_DIR
+from services.register import outlook_account_selection, random_mail_domain_health
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -309,7 +315,10 @@ def _save_mailfree_domain_health(state: dict[str, dict[str, Any]]) -> None:
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "items": {key: state[key] for key in sorted(state)},
     }
-    MAILFREE_DOMAIN_HEALTH_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    MAILFREE_DOMAIN_HEALTH_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _mailfree_domain_key(provider_ref: str, api_base: str, domain_index: int) -> str:
@@ -460,7 +469,7 @@ def _parse_received_at(value: Any) -> datetime | None:
     except Exception:
         pass
     try:
-        date = parsedate_to_datetime(text)
+        date = email_utils.parsedate_to_datetime(text)
         return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
     except Exception:
         return None
@@ -516,7 +525,7 @@ def _extract_text_candidates(value: Any) -> list[str]:
 def _message_matches_email(data: dict[str, Any], email: str) -> bool:
     target = str(email or "").strip().lower()
     candidates: list[str] = []
-    for key in ("to", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
+    for key in ("to", "toAddr", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
         if key in data:
             candidates.extend(_extract_text_candidates(data.get(key)))
     return not target or not candidates or any(target in str(item).strip().lower() for item in candidates if str(item).strip())
@@ -1105,6 +1114,27 @@ class TempMailLolProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_key = str(entry.get("api_key") or "").strip()
         self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
+        self.has_provider_fallback = bool(entry.get("_has_provider_fallback"))
+        self.random_domain_attempts = random_mail_domain_health.bounded_provider_integer(
+            entry.get("random_domain_attempts"),
+            random_mail_domain_health.RANDOM_MAIL_DOMAIN_ATTEMPTS,
+            1,
+            20,
+        )
+        self.domain_family_labels = random_mail_domain_health.bounded_provider_integer(
+            entry.get("domain_family_labels"), 2, 2, 4
+        )
+        self.domain_cooldown_seconds = random_mail_domain_health.bounded_provider_integer(
+            entry.get("domain_cooldown_seconds"),
+            random_mail_domain_health.RANDOM_MAIL_DOMAIN_REJECT_COOLDOWN_SECONDS,
+            300,
+            24 * 3600,
+        )
+        self.denied_domains = {
+            str(denied_domain or "").strip().lower().lstrip("@")
+            for denied_domain in (entry.get("_denied_domains") or [])
+            if str(denied_domain or "").strip()
+        }
         self.session = _create_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
         if self.api_key:
@@ -1121,14 +1151,24 @@ class TempMailLolProvider(BaseMailProvider):
         last_error = ""
         attempts = max(1, int(retries) + 1)
         for attempt in range(1, attempts + 1):
-            resp = self.session.request(
-                method.upper(),
-                f"https://api.tempmail.lol/v2{path}",
-                params=params,
-                json=payload,
-                timeout=self.conf["request_timeout"],
-                verify=False,
-            )
+            try:
+                resp = self.session.request(
+                    method.upper(),
+                    f"https://api.tempmail.lol/v2{path}",
+                    params=params,
+                    json=payload,
+                    timeout=self.conf["request_timeout"],
+                    verify=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - transport failures are retryable.
+                last_error = (
+                    f"TempMail.lol {method} {path} transport error: "
+                    f"{type(exc).__name__}: {str(exc)[:240]}"
+                )
+                if attempt < attempts:
+                    time.sleep(min(1.5 * attempt, 4.0))
+                    continue
+                raise RuntimeError(last_error) from exc
             body = getattr(resp, "text", "") or ""
             if resp.status_code not in expected:
                 last_error = f"TempMail.lol 请求失败: {method} {path}, HTTP {resp.status_code}, body={body[:300]}"
@@ -1155,21 +1195,137 @@ class TempMailLolProvider(BaseMailProvider):
             return data
         raise RuntimeError(last_error or f"TempMail.lol {method} {path} failed")
 
+    def _random_mailbox_result(
+        self,
+        address: str,
+        token: str,
+        skipped_domains: list[str],
+        *,
+        half_open: bool = False,
+    ) -> dict[str, Any]:
+        effective_skipped = list(dict.fromkeys(skipped_domains))
+        if half_open:
+            selected_family = random_mail_domain_health.random_mail_domain_family(
+                address.partition("@")[2], self.domain_family_labels
+            )
+            effective_skipped = [
+                domain
+                for domain in effective_skipped
+                if random_mail_domain_health.random_mail_domain_family(
+                    domain, self.domain_family_labels
+                )
+                != selected_family
+            ]
+        result = {
+            **random_mail_domain_health.random_mailbox_metadata(
+                provider=self.name,
+                provider_ref=self.provider_ref,
+                address=address,
+                family_labels=self.domain_family_labels,
+                cooldown_seconds=self.domain_cooldown_seconds,
+                skipped_domains=effective_skipped,
+            ),
+            "token": token,
+        }
+        if half_open:
+            result["domain_health_half_open"] = True
+        return result
+
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if self.domain:
-            domain, force_random_prefix = self._resolve_domain(random.choice(self.domain))
-            payload["domain"] = domain
-            if force_random_prefix:
-                payload["prefix"] = _random_mailbox_name()
-        if username and "prefix" not in payload:
-            payload["prefix"] = username
-        data = self._request("POST", "/inbox/create", payload=payload, expected=(200, 201))
-        address = str(data.get("address") or "").strip()
-        token = str(data.get("token") or "").strip()
-        if not address or not token:
-            raise RuntimeError("TempMail.lol 缺少 address 或 token")
-        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+        random_domain = not self.domain
+        attempts = self.random_domain_attempts if random_domain else 1
+        skipped_domains: list[str] = []
+        cooling_mailboxes: dict[str, dict[str, str]] = {}
+        known_cooling_families = (
+            random_mail_domain_health.random_mail_domain_cooling_families(
+                self.name, self.provider_ref
+            )
+            if random_domain
+            else []
+        )
+        preferred_half_open = random_mail_domain_health.select_random_mail_domain_half_open(
+            self.name,
+            self.provider_ref,
+            known_cooling_families,
+            self.domain_family_labels,
+        )
+        for _ in range(attempts):
+            payload: dict[str, Any] = {}
+            if self.domain:
+                domain, force_random_prefix = self._resolve_domain(random.choice(self.domain))
+                payload["domain"] = domain
+                if force_random_prefix:
+                    payload["prefix"] = _random_mailbox_name()
+            if username and "prefix" not in payload:
+                payload["prefix"] = username
+            data = self._request("POST", "/inbox/create", payload=payload, expected=(200, 201))
+            address = str(data.get("address") or "").strip()
+            token = str(data.get("token") or "").strip()
+            if not address or not token:
+                raise RuntimeError("TempMail.lol 缺少 address 或 token")
+            address_domain = address.partition("@")[2].lower()
+            domain_family = random_mail_domain_health.random_mail_domain_family(
+                address_domain, self.domain_family_labels
+            )
+            if address_domain in self.denied_domains or domain_family in self.denied_domains:
+                skipped_domains.append(address_domain)
+                continue
+            if random_domain and random_mail_domain_health.random_mail_domain_is_cooling(
+                self.name, self.provider_ref, domain_family
+            ):
+                skipped_domains.append(address_domain)
+                cooling_mailboxes.setdefault(
+                    domain_family,
+                    {"address": address, "token": token},
+                )
+                if (
+                    len(cooling_mailboxes)
+                    >= random_mail_domain_health.RANDOM_MAIL_DOMAIN_HALF_OPEN_MIN_FAMILIES
+                    and preferred_half_open in cooling_mailboxes
+                    and not self.has_provider_fallback
+                ):
+                    preferred = cooling_mailboxes[preferred_half_open]
+                    return self._random_mailbox_result(
+                        preferred["address"],
+                        preferred["token"],
+                        skipped_domains,
+                        half_open=True,
+                    )
+                continue
+            if random_domain:
+                return self._random_mailbox_result(address, token, skipped_domains)
+            return {
+                "provider": self.name,
+                "provider_ref": self.provider_ref,
+                "address": address,
+                "token": token,
+                "domain": address_domain,
+                "label": f"{self.name}:{address_domain}" if address_domain else self.name,
+            }
+        if random_domain and cooling_mailboxes and not self.has_provider_fallback:
+            selected_family = random_mail_domain_health.select_random_mail_domain_half_open(
+                self.name,
+                self.provider_ref,
+                list(cooling_mailboxes),
+                self.domain_family_labels,
+            )
+            selected = cooling_mailboxes.get(selected_family)
+            if selected:
+                return self._random_mailbox_result(
+                    selected["address"],
+                    selected["token"],
+                    skipped_domains,
+                    half_open=True,
+                )
+        families = sorted(
+            {
+                random_mail_domain_health.random_mail_domain_family(
+                    item, self.domain_family_labels
+                )
+                for item in skipped_domains
+            }
+        )
+        raise RuntimeError(f"TempMail.lol 随机域名均处于冷却: {','.join(families)}")
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/inbox", params={"token": mailbox["token"]})
@@ -1736,7 +1892,9 @@ class OutlookTokenProvider(BaseMailProvider):
     def _parse_imap_message(self, mailbox: dict[str, Any], raw: bytes) -> dict[str, Any]:
         message = message_from_bytes(raw, policy=policy.default)
         try:
-            received = _parse_received_at(parsedate_to_datetime(str(message.get("Date") or "")))
+            received = _parse_received_at(
+                email_utils.parsedate_to_datetime(str(message.get("Date") or ""))
+            )
         except Exception:
             received = None
         plain: list[str] = []
@@ -1759,7 +1917,7 @@ class OutlookTokenProvider(BaseMailProvider):
             if not value:
                 return ""
             try:
-                return str(make_header(decode_header(value)))
+                return str(email_header.make_header(email_header.decode_header(value)))
             except Exception:
                 return value
 
@@ -1862,6 +2020,8 @@ class OutlookExternalApiProvider(BaseMailProvider):
         self.top = max(1, min(50, int(entry.get("top") or 20)))
         self.use_plus_alias = bool(entry.get("use_plus_alias", True))
         self.prefer_alias = bool(entry.get("prefer_alias", True))
+        self.realtime_preflight = bool(entry.get("realtime_preflight", True))
+        self.preflight_attempts = max(1, min(20, int(entry.get("preflight_attempts") or 8)))
         if not self.api_key:
             raise RuntimeError("outlook_external 缺少 api_key（mail.acica.top 对外 API Key）")
         self.session = _create_session(conf)
@@ -1932,24 +2092,47 @@ class OutlookExternalApiProvider(BaseMailProvider):
         accounts = self._list_accounts()
         if not accounts:
             raise RuntimeError("outlook_external 账号池为空")
-        active = [a for a in accounts if str(a.get("status") or "active").lower() in {"active", "ok", "normal", ""}]
-        pool = active or accounts
         used = _load_outlook_external_used()
         # OpenAI 会把 local+tag@outlook.com 归一到主邮箱，主邮箱一旦注册过就不能再靠 plus 别名新建
-        fresh = []
-        for a in pool:
-            main = str(a.get("email") or "").strip().lower()
-            if main and main not in used:
-                fresh.append(a)
-        if not fresh:
+        candidates, pool_stats = outlook_account_selection.eligible_outlook_accounts(
+            accounts, used
+        )
+        if not candidates:
             raise RuntimeError(
-                f"outlook_external 可用主邮箱已耗尽（池={len(pool)} used={len(used)}），请扩充 mail.acica.top 分组或重置 used 记录"
+                "outlook_external 可取信主邮箱已耗尽"
+                f"（池={pool_stats['pool']} healthy={pool_stats['healthy']} "
+                f"unverified={pool_stats['unverified']} used={pool_stats['used']}），"
+                "请扩充 mail.acica.top 分组或重置 used 记录"
             )
         global provider_index
         with provider_lock:
-            idx = provider_index % len(fresh)
-            provider_index = (provider_index + 1) % max(1, len(fresh))
-        account = fresh[idx]
+            idx = provider_index % len(candidates)
+            provider_index = (provider_index + 1) % len(candidates)
+        candidates = outlook_account_selection.rotate_outlook_accounts(candidates, idx)
+        account = candidates[0]
+        preflight_errors: list[str] = []
+        if self.realtime_preflight:
+            def probe_account(candidate_email: str) -> None:
+                self._request(
+                    "GET",
+                    "/api/external/emails",
+                    params={"email": candidate_email, "folder": "inbox", "top": 1},
+                )
+
+            readable_account, preflight_errors = (
+                outlook_account_selection.first_readable_outlook_account(
+                    candidates,
+                    self.preflight_attempts,
+                    probe_account,
+                )
+            )
+            account = readable_account or {}
+            if not account:
+                raise RuntimeError(
+                    "outlook_external 实时取信预检失败"
+                    f"（候选={min(len(candidates), self.preflight_attempts)}）: "
+                    f"{preflight_errors[-1] if preflight_errors else 'no readable account'}"
+                )
         main = str(account.get("email") or "").strip()
         if not main:
             raise RuntimeError("outlook_external 账号缺少 email")
@@ -1974,6 +2157,8 @@ class OutlookExternalApiProvider(BaseMailProvider):
             "mode": mode,
             "api_base": self.api_base,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "preflight_checked": bool(self.realtime_preflight),
+            "preflight_skipped": len(preflight_errors),
         }
 
     def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2179,35 +2364,39 @@ def _next_entry(mail_config: dict) -> dict:
         return value
 
 
+def _instantiate_provider(entry: dict[str, Any], conf: dict[str, Any]) -> BaseMailProvider:
+    provider_type = str(entry.get("type") or "").strip()
+    if provider_type == "dropmail":
+        from services.register.dropmail_provider import DropMailProvider
+
+        return DropMailProvider(entry, conf)
+    provider_classes: dict[str, type[BaseMailProvider]] = {
+        "cloudmail_gen": CloudMailGenProvider,
+        "cloudflare_temp_email": CloudflareTempMailProvider,
+        "ddg_mail": DDGMailProvider,
+        "mailfree": MailfreeProvider,
+        "tempmail_lol": TempMailLolProvider,
+        "duckmail": DuckMailProvider,
+        "gptmail": GptMailProvider,
+        "moemail": MoEmailProvider,
+        "inbucket": InbucketMailProvider,
+        "yyds_mail": YydsMailProvider,
+        "outlook_token": OutlookTokenProvider,
+        "outlook_external": OutlookExternalApiProvider,
+        "outlook_alias": OutlookExternalApiProvider,
+        "outlook_api": OutlookExternalApiProvider,
+    }
+    provider_class = provider_classes.get(provider_type)
+    if provider_class is None:
+        raise RuntimeError(f"不支持的 mail.provider: {provider_type}")
+    return provider_class(entry, conf)
+
+
 def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
     entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
     entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
-    conf = _config(mail_config)
-    if entry["type"] == "cloudmail_gen":
-        return CloudMailGenProvider(entry, conf)
-    if entry["type"] == "cloudflare_temp_email":
-        return CloudflareTempMailProvider(entry, conf)
-    if entry["type"] == "ddg_mail":
-        return DDGMailProvider(entry, conf)
-    if entry["type"] == "mailfree":
-        return MailfreeProvider(entry, conf)
-    if entry["type"] == "tempmail_lol":
-        return TempMailLolProvider(entry, conf)
-    if entry["type"] == "duckmail":
-        return DuckMailProvider(entry, conf)
-    if entry["type"] == "gptmail":
-        return GptMailProvider(entry, conf)
-    if entry["type"] == "moemail":
-        return MoEmailProvider(entry, conf)
-    if entry["type"] == "inbucket":
-        return InbucketMailProvider(entry, conf)
-    if entry["type"] == "yyds_mail":
-        return YydsMailProvider(entry, conf)
-    if entry["type"] == "outlook_token":
-        return OutlookTokenProvider(entry, conf)
-    if entry["type"] in {"outlook_external", "outlook_alias", "outlook_api"}:
-        return OutlookExternalApiProvider(entry, conf)
-    raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
+    entry["_denied_domains"] = sorted(_denied_domains(mail_config))
+    return _instantiate_provider(entry, _config(mail_config))
 
 
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
@@ -2233,38 +2422,17 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
 
     tried: set[str] = set()
     errors: list[str] = []
-    for entry in order:
+    for position, entry in enumerate(order):
         conf = _config(mail_config)
         provider_type = str(entry.get("type") or "")
         entry = _filter_provider_domains(dict(entry), denied)
+        entry["_denied_domains"] = sorted(denied)
+        # A provider may half-open only when another provider remains after it
+        # in this attempt's traversal order. A preceding provider has already
+        # failed and is not a usable fallback for the current attempt.
+        entry["_has_provider_fallback"] = position < len(order) - 1
         try:
-            if provider_type == "cloudmail_gen":
-                provider = CloudMailGenProvider(entry, conf)
-            elif provider_type == "cloudflare_temp_email":
-                provider = CloudflareTempMailProvider(entry, conf)
-            elif provider_type == "ddg_mail":
-                provider = DDGMailProvider(entry, conf)
-            elif provider_type == "mailfree":
-                provider = MailfreeProvider(entry, conf)
-            elif provider_type == "tempmail_lol":
-                provider = TempMailLolProvider(entry, conf)
-            elif provider_type == "duckmail":
-                provider = DuckMailProvider(entry, conf)
-            elif provider_type == "gptmail":
-                provider = GptMailProvider(entry, conf)
-            elif provider_type == "moemail":
-                provider = MoEmailProvider(entry, conf)
-            elif provider_type == "inbucket":
-                provider = InbucketMailProvider(entry, conf)
-            elif provider_type == "yyds_mail":
-                provider = YydsMailProvider(entry, conf)
-            elif provider_type == "outlook_token":
-                provider = OutlookTokenProvider(entry, conf)
-            elif provider_type in {"outlook_external", "outlook_alias", "outlook_api"}:
-                provider = OutlookExternalApiProvider(entry, conf)
-            else:
-                errors.append(f"{provider_type}: unsupported")
-                continue
+            provider = _instantiate_provider(entry, conf)
         except Exception as error:  # noqa: BLE001
             errors.append(f"{provider_type}: init {error}"[:220])
             continue
@@ -2326,10 +2494,21 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     if provider == MailfreeProvider.name:
         _record_mailfree_domain_result(mailbox, success=success, error=error)
         return
+    if provider in {TempMailLolProvider.name, "dropmail"} and mailbox.get("random_domain"):
+        random_mail_domain_health.record_random_mailbox_result(
+            mailbox, success=success, error=error
+        )
+        return
     if provider in {OutlookExternalApiProvider.name, "outlook_external", "outlook_alias", "outlook_api"}:
         main = str(mailbox.get("resolved_email") or mailbox.get("address") or "").strip()
         reason = str(error or "").lower()
-        if success or "user_already_exists" in reason or "already exists" in reason or "existing_account" in reason:
+        if (
+            success
+            or "user_already_exists" in reason
+            or "already exists" in reason
+            or "existing_account" in reason
+            or "invalid_auth_step" in reason
+        ):
             mark_outlook_external_main_used(main, reason=str(error or ("success" if success else ""))[:200])
         return
     if provider != OutlookTokenProvider.name:

@@ -5,7 +5,7 @@ import json
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 
 def _b64(data) -> str:
@@ -13,7 +13,7 @@ def _b64(data) -> str:
 
 
 def generate_fingerprint_data(device_id: str, user_agent: str, sentinel_sv: str, attempt: int = 1, elapsed_ms: float = 0) -> list:
-    now = datetime.utcnow().strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+    now = datetime.now(UTC).strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
     perf_now = random.uniform(1000, 50000)
     time_origin = time.time() * 1000 - perf_now
     return [

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +15,7 @@ logger = logging.getLogger(__name__)
 _CREATE_ACCOUNT_PATH = "/api/accounts/create_account"
 _SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 _DEFAULT_OBSERVER_WAIT_MS = 5000
+_LEGACY_AB_ERROR_CODES = frozenset({"registration_disallowed"})
 
 
 def _module_project_root() -> Path:
@@ -44,6 +43,10 @@ def _error_code(resp: Any) -> str:
 
 def _is_create_account_url(url: Any) -> bool:
     return _CREATE_ACCOUNT_PATH in str(url or "")
+
+
+def _should_try_legacy_after_sdk(resp: Any) -> bool:
+    return _error_code(resp) in _LEGACY_AB_ERROR_CODES
 
 
 def _get_header(headers: dict[str, Any], name: str) -> str:
@@ -237,8 +240,10 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
     """Install a narrow create_account fallback on a requests/curl_cffi session.
 
     Prefer SDK+SO first for create_account (route_stats: sdk >> legacy). If the request
-    already carries SO token, leave as-is. On non-200 we may fall back once to the
-    original legacy headers; registration_disallowed without SO still gets one SDK retry.
+    already carries SO token, leave as-is. A protocol-level rejection may fall back
+    once to the original legacy headers; rate limits and server failures are returned
+    directly so create_account is not duplicated. A legacy registration_disallowed
+    response without SO still gets one SDK retry.
     Token values are never logged; route_stats records only lengths and booleans.
     """
 
@@ -259,7 +264,73 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
     original_post = session.post
     original_request = getattr(session, "request", None)
 
-    def _handle(url: Any, resp: Any, req_headers: dict[str, Any], retry_send: Callable[..., Any], create_kwargs: dict[str, Any]) -> Any:
+    def _prepare_sdk_first(
+        url: Any,
+        req_headers: dict[str, Any],
+        request_kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], SentinelHeaders | None]:
+        prepared_kwargs = dict(request_kwargs)
+        if not _is_create_account_url(url) or _get_header(
+            req_headers,
+            "openai-sentinel-so-token",
+        ):
+            return prepared_kwargs, None
+
+        active_owner = getattr(
+            session,
+            "_openai_create_account_fallback_owner",
+            owner,
+        )
+        active_root = Path(
+            getattr(session, "_openai_create_account_fallback_root", root)
+        ).resolve()
+        try:
+            sdk_headers = _sdk_headers_for_retry(
+                original_post,
+                project_root=active_root,
+                owner=active_owner,
+                session=session,
+                base_headers=req_headers,
+                create_kwargs=prepared_kwargs,
+            )
+        except Exception as exc:
+            _log(
+                active_owner,
+                "create_account SDK-first prepare failed, use legacy: %s",
+                str(exc)[:240],
+            )
+            return prepared_kwargs, None
+
+        sdk_req_headers = dict(req_headers)
+        _set_header(sdk_req_headers, "openai-sentinel-token", sdk_headers.token)
+        if sdk_headers.so_token:
+            _set_header(
+                sdk_req_headers,
+                "openai-sentinel-so-token",
+                sdk_headers.so_token,
+            )
+        device_id = _resolve_device_id(active_owner, sdk_req_headers, session)
+        if device_id:
+            _set_header(sdk_req_headers, "oai-device-id", device_id)
+        prepared_kwargs["headers"] = sdk_req_headers
+        _log(
+            active_owner,
+            "create_account SDK-first attempt: token_len=%s so_present=%s so_len=%s",
+            sdk_headers.token_len,
+            sdk_headers.so_present,
+            sdk_headers.so_len,
+        )
+        return prepared_kwargs, sdk_headers
+
+    def _handle(
+        url: Any,
+        resp: Any,
+        req_headers: dict[str, Any],
+        retry_send: Callable[..., Any],
+        create_kwargs: dict[str, Any],
+        *,
+        allow_sdk_retry: bool = True,
+    ) -> Any:
         if not _is_create_account_url(url):
             return resp
 
@@ -283,7 +354,11 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
 
         code = _error_code(resp)
         _record(active_root, active_owner, legacy_headers, success=False, error_code=code)
-        if code != "registration_disallowed" or legacy_headers.so_present:
+        if (
+            not allow_sdk_retry
+            or code != "registration_disallowed"
+            or legacy_headers.so_present
+        ):
             return resp
 
         try:
@@ -331,39 +406,8 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
         # If already carries SO token, leave as-is. On non-200 after SDK attempt, fall back once
         # to original headers (legacy path) so A/B remains measurable via route_stats.
         req_headers = dict(kwargs.get("headers") or {})
-        create_kwargs = dict(kwargs)
-        attempted_sdk_first = False
-        if _is_create_account_url(url) and not _get_header(req_headers, "openai-sentinel-so-token"):
-            active_owner = getattr(session, "_openai_create_account_fallback_owner", owner)
-            active_root = Path(getattr(session, "_openai_create_account_fallback_root", root)).resolve()
-            try:
-                sdk_headers = _sdk_headers_for_retry(
-                    original_post,
-                    project_root=active_root,
-                    owner=active_owner,
-                    session=session,
-                    base_headers=req_headers,
-                    create_kwargs=create_kwargs,
-                )
-                sdk_req_headers = dict(req_headers)
-                _set_header(sdk_req_headers, "openai-sentinel-token", sdk_headers.token)
-                if sdk_headers.so_token:
-                    _set_header(sdk_req_headers, "openai-sentinel-so-token", sdk_headers.so_token)
-                device_id = _resolve_device_id(active_owner, sdk_req_headers, session)
-                if device_id:
-                    _set_header(sdk_req_headers, "oai-device-id", device_id)
-                create_kwargs["headers"] = sdk_req_headers
-                attempted_sdk_first = True
-                _log(
-                    active_owner,
-                    "create_account SDK-first attempt: token_len=%s so_present=%s so_len=%s",
-                    sdk_headers.token_len,
-                    sdk_headers.so_present,
-                    sdk_headers.so_len,
-                )
-            except Exception as exc:
-                _log(active_owner, "create_account SDK-first prepare failed, use legacy: %s", str(exc)[:240])
-                create_kwargs = dict(kwargs)
+        create_kwargs, sdk_headers = _prepare_sdk_first(url, req_headers, kwargs)
+        attempted_sdk_first = sdk_headers is not None
 
         if args:
             # positional url
@@ -374,22 +418,54 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
         else:
             resp = original_post(**create_kwargs)
 
-        # If SDK-first failed hard, try original legacy headers once.
-        if attempted_sdk_first and int(getattr(resp, "status_code", 0) or 0) != 200:
+        # Keep one measurable legacy A/B attempt for protocol rejection only. Retrying
+        # 429/5xx here amplifies the same create_account failure and worsens rate limits.
+        if attempted_sdk_first and _should_try_legacy_after_sdk(resp):
+            active_owner = getattr(
+                session,
+                "_openai_create_account_fallback_owner",
+                owner,
+            )
+            active_root = Path(
+                getattr(session, "_openai_create_account_fallback_root", root)
+            ).resolve()
+            _record(
+                active_root,
+                active_owner,
+                sdk_headers,
+                success=False,
+                error_code=_error_code(resp),
+            )
             try:
                 if args:
                     legacy_resp = original_post(*args, **kwargs)
                 else:
                     legacy_resp = original_post(**kwargs)
-                # Prefer success; otherwise keep original SDK-first response for fallback handler.
-                if int(getattr(legacy_resp, "status_code", 0) or 0) == 200:
-                    resp = legacy_resp
-                    req_headers = dict(kwargs.get("headers") or {})
-                else:
-                    # still let _handle record/maybe retry again if needed
-                    pass
-            except Exception:
-                pass
+            except Exception as exc:
+                _log(active_owner, "create_account legacy A/B attempt failed: %s", str(exc)[:240])
+                return resp
+
+            legacy_headers = dict(kwargs.get("headers") or {})
+
+            def legacy_retry_send(**retry_kwargs: Any) -> Any:
+                if args:
+                    return original_post(
+                        args[0],
+                        **{k: v for k, v in retry_kwargs.items() if k != "url"},
+                    )
+                return original_post(**retry_kwargs)
+
+            handled_legacy = _handle(
+                url,
+                legacy_resp,
+                legacy_headers,
+                legacy_retry_send,
+                kwargs,
+                allow_sdk_retry=False,
+            )
+            if int(getattr(handled_legacy, "status_code", 0) or 0) == 200:
+                return handled_legacy
+            return resp
 
         final_headers = dict(create_kwargs.get("headers") or kwargs.get("headers") or {})
 
@@ -407,13 +483,66 @@ def install_create_account_fallback(session: Any, *, owner: Any = None, project_
             if str(method or "").upper() == "POST":
                 return wrapped_post(url, **kwargs)
             raise AttributeError("session.request is unavailable")
-        resp = original_request(method, url, **kwargs)
         req_headers = dict(kwargs.get("headers") or {})
+        request_kwargs = dict(kwargs)
+        sdk_headers = None
+        if str(method or "").upper() == "POST":
+            request_kwargs, sdk_headers = _prepare_sdk_first(
+                url,
+                req_headers,
+                kwargs,
+            )
+        attempted_sdk_first = sdk_headers is not None
+        resp = original_request(method, url, **request_kwargs)
+        final_headers = dict(request_kwargs.get("headers") or req_headers)
+
+        if attempted_sdk_first and _should_try_legacy_after_sdk(resp):
+            active_owner = getattr(
+                session,
+                "_openai_create_account_fallback_owner",
+                owner,
+            )
+            active_root = Path(
+                getattr(session, "_openai_create_account_fallback_root", root)
+            ).resolve()
+            _record(
+                active_root,
+                active_owner,
+                sdk_headers,
+                success=False,
+                error_code=_error_code(resp),
+            )
+            try:
+                legacy_resp = original_request(method, url, **kwargs)
+            except Exception as exc:
+                _log(active_owner, "create_account legacy A/B attempt failed: %s", str(exc)[:240])
+                return resp
+
+            def legacy_retry_send(**retry_kwargs: Any) -> Any:
+                return original_request(method, url, **retry_kwargs)
+
+            handled_legacy = _handle(
+                url,
+                legacy_resp,
+                req_headers,
+                legacy_retry_send,
+                kwargs,
+                allow_sdk_retry=False,
+            )
+            if int(getattr(handled_legacy, "status_code", 0) or 0) == 200:
+                return handled_legacy
+            return resp
 
         def retry_send(**retry_kwargs: Any) -> Any:
             return original_request(method, url, **retry_kwargs)
 
-        return _handle(url, resp, req_headers, retry_send, kwargs)
+        return _handle(
+            url,
+            resp,
+            final_headers,
+            retry_send,
+            request_kwargs if attempted_sdk_first else kwargs,
+        )
 
     setattr(session, "_openai_create_account_fallback_original_post", original_post)
     if original_request is not None:

@@ -9,9 +9,9 @@ from typing import Any, Sequence
 
 import pybase64
 
-DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 from utils.helper import new_uuid
 
+DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 
 CORES = [8, 16, 24, 32]
 DOCUMENT_KEYS = ["__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"]

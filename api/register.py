@@ -5,7 +5,7 @@ import json
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.support import require_admin
 from services.feature_flags import require_feature
@@ -17,6 +17,7 @@ class RegisterConfigRequest(BaseModel):
     proxy: str | None = None
     total: int | None = None
     threads: int | None = None
+    max_attempts: int | None = Field(default=None, ge=1, le=20)
     mode: str | None = None
     target_quota: int | None = None
     target_available: int | None = None
