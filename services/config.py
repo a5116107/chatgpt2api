@@ -390,6 +390,9 @@ def _normalize_video_settings(value: object) -> dict[str, object]:
 
 def _normalize_account_watcher_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
+    proxy_status_url = source.get("proxy_status_url")
+    if proxy_status_url is None:
+        proxy_status_url = DEFAULT_ACCOUNT_WATCHER_SETTINGS["proxy_status_url"]
     return {
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["enabled"])),
         "check_limited": _normalize_bool(source.get("check_limited"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["check_limited"])),
@@ -400,7 +403,7 @@ def _normalize_account_watcher_settings(value: object) -> dict[str, object]:
         "initial_delay_seconds": _normalize_positive_int(source.get("initial_delay_seconds"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["initial_delay_seconds"]), 0),
         "require_proxy_ready": _normalize_bool(source.get("require_proxy_ready"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["require_proxy_ready"])),
         "proxy_ready_timeout_secs": _normalize_positive_int(source.get("proxy_ready_timeout_secs"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["proxy_ready_timeout_secs"]), 1),
-        "proxy_status_url": str(source.get("proxy_status_url") or DEFAULT_ACCOUNT_WATCHER_SETTINGS["proxy_status_url"]),
+        "proxy_status_url": str(proxy_status_url).strip(),
         "min_proxy_available": _normalize_positive_int(source.get("min_proxy_available"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["min_proxy_available"]), 1),
         "dynamic_batch_by_proxy": _normalize_bool(source.get("dynamic_batch_by_proxy"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["dynamic_batch_by_proxy"])),
     }

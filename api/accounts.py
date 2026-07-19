@@ -23,15 +23,9 @@ from api.support import (
     sanitize_sub2api_server,
     sanitize_sub2api_servers,
 )
+from services import cpa_service, sub2api_service
 from services.account_service import account_service
-from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
-from services.sub2api_service import (
-    list_remote_accounts as sub2api_list_remote_accounts,
-    list_remote_groups as sub2api_list_remote_groups,
-    sub2api_config,
-    sub2api_import_service,
-)
 
 
 
@@ -260,6 +254,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_refresh_progress(progress_id, len(access_tokens))
 
         async def _do_refresh():
             try:
@@ -413,7 +408,7 @@ def create_router() -> APIRouter:
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        return {"pools": sanitize_cpa_pools(cpa_service.cpa_config.list_pools())}
 
     @router.post("/api/cpa/pools")
     async def create_cpa_pool(body: CPAPoolCreateRequest, authorization: str | None = Header(default=None)):
@@ -422,40 +417,53 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "base_url is required"})
         if not body.secret_key.strip():
             raise HTTPException(status_code=400, detail={"error": "secret_key is required"})
-        pool = cpa_config.add_pool(name=body.name, base_url=body.base_url, secret_key=body.secret_key)
-        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        pool = cpa_service.cpa_config.add_pool(
+            name=body.name,
+            base_url=body.base_url,
+            secret_key=body.secret_key,
+        )
+        return {
+            "pool": sanitize_cpa_pool(pool),
+            "pools": sanitize_cpa_pools(cpa_service.cpa_config.list_pools()),
+        }
 
     @router.post("/api/cpa/pools/{pool_id}")
     async def update_cpa_pool(pool_id: str, body: CPAPoolUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        pool = cpa_config.update_pool(pool_id, body.model_dump(exclude_none=True))
+        pool = cpa_service.cpa_config.update_pool(pool_id, body.model_dump(exclude_none=True))
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        return {
+            "pool": sanitize_cpa_pool(pool),
+            "pools": sanitize_cpa_pools(cpa_service.cpa_config.list_pools()),
+        }
 
     @router.delete("/api/cpa/pools/{pool_id}")
     async def delete_cpa_pool(pool_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        if not cpa_config.delete_pool(pool_id):
+        if not cpa_service.cpa_config.delete_pool(pool_id):
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        return {"pools": sanitize_cpa_pools(cpa_service.cpa_config.list_pools())}
 
     @router.get("/api/cpa/pools/{pool_id}/files")
     async def cpa_pool_files(pool_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        pool = cpa_service.cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pool_id": pool_id, "files": await run_in_threadpool(list_remote_files, pool)}
+        return {
+            "pool_id": pool_id,
+            "files": await run_in_threadpool(cpa_service.list_remote_files, pool),
+        }
 
     @router.post("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import(pool_id: str, body: CPAImportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        pool = cpa_service.cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
         try:
-            job = cpa_import_service.start_import(pool, body.names)
+            job = cpa_service.cpa_import_service.start_import(pool, body.names)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"import_job": job}
@@ -463,7 +471,7 @@ def create_router() -> APIRouter:
     @router.get("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import_progress(pool_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        pool = cpa_service.cpa_config.get_pool(pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
         return {"import_job": pool.get("import_job")}
@@ -471,7 +479,11 @@ def create_router() -> APIRouter:
     @router.get("/api/sub2api/servers")
     async def list_sub2api_servers(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        return {
+            "servers": sanitize_sub2api_servers(
+                sub2api_service.sub2api_config.list_servers()
+            )
+        }
 
     @router.post("/api/sub2api/servers")
     async def create_sub2api_server(body: Sub2APIServerCreateRequest, authorization: str | None = Header(default=None)):
@@ -482,7 +494,7 @@ def create_router() -> APIRouter:
         has_api_key = bool(body.api_key.strip())
         if not has_login and not has_api_key:
             raise HTTPException(status_code=400, detail={"error": "email+password or api_key is required"})
-        server = sub2api_config.add_server(
+        server = sub2api_service.sub2api_config.add_server(
             name=body.name,
             base_url=body.base_url,
             email=body.email,
@@ -490,31 +502,51 @@ def create_router() -> APIRouter:
             api_key=body.api_key,
             group_id=body.group_id,
         )
-        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        return {
+            "server": sanitize_sub2api_server(server),
+            "servers": sanitize_sub2api_servers(
+                sub2api_service.sub2api_config.list_servers()
+            ),
+        }
 
     @router.post("/api/sub2api/servers/{server_id}")
     async def update_sub2api_server(server_id: str, body: Sub2APIServerUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
+        server = sub2api_service.sub2api_config.update_server(
+            server_id,
+            body.model_dump(exclude_none=True),
+        )
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        return {
+            "server": sanitize_sub2api_server(server),
+            "servers": sanitize_sub2api_servers(
+                sub2api_service.sub2api_config.list_servers()
+            ),
+        }
 
     @router.delete("/api/sub2api/servers/{server_id}")
     async def delete_sub2api_server(server_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        if not sub2api_config.delete_server(server_id):
+        if not sub2api_service.sub2api_config.delete_server(server_id):
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        return {
+            "servers": sanitize_sub2api_servers(
+                sub2api_service.sub2api_config.list_servers()
+            )
+        }
 
     @router.get("/api/sub2api/servers/{server_id}/groups")
     async def sub2api_server_groups(server_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        server = sub2api_service.sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            groups = await run_in_threadpool(sub2api_list_remote_groups, server)
+            groups = await run_in_threadpool(
+                sub2api_service.list_remote_groups,
+                server,
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
         return {"server_id": server_id, "groups": groups}
@@ -522,11 +554,14 @@ def create_router() -> APIRouter:
     @router.get("/api/sub2api/servers/{server_id}/accounts")
     async def sub2api_server_accounts(server_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        server = sub2api_service.sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            accounts = await run_in_threadpool(sub2api_list_remote_accounts, server)
+            accounts = await run_in_threadpool(
+                sub2api_service.list_remote_accounts,
+                server,
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
         return {"server_id": server_id, "accounts": accounts}
@@ -534,11 +569,14 @@ def create_router() -> APIRouter:
     @router.post("/api/sub2api/servers/{server_id}/import")
     async def sub2api_server_import(server_id: str, body: Sub2APIImportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        server = sub2api_service.sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            job = sub2api_import_service.start_import(server, body.account_ids)
+            job = sub2api_service.sub2api_import_service.start_import(
+                server,
+                body.account_ids,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"import_job": job}
@@ -546,7 +584,7 @@ def create_router() -> APIRouter:
     @router.get("/api/sub2api/servers/{server_id}/import")
     async def sub2api_server_import_progress(server_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        server = sub2api_service.sub2api_config.get_server(server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         return {"import_job": server.get("import_job")}

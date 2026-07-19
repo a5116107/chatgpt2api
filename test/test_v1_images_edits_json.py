@@ -12,8 +12,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from test.utils import current_auth_headers
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(b"fake-png").decode("ascii")
 JPEG_DATA_URL = "data:image/jpeg;base64," + base64.b64encode(b"fake-jpeg").decode("ascii")
 
@@ -38,14 +38,14 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_json_model_omitted_uses_existing_default_logic(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "未传 model", "image": PNG_DATA_URL})
+        response = self.client.post("/v1/images/edits", headers=current_auth_headers(), json={"prompt": "未传 model", "image": PNG_DATA_URL})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.calls[0]["model"], "gpt-image-2")
 
     def test_json_model_is_not_overwritten_when_provided(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             json={"model": "codex-gpt-image-2", "prompt": "保留 model", "image": PNG_DATA_URL},
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -54,7 +54,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_accepts_json_image_url(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             json={
                 "model": "gpt-image-2",
                 "prompt": "把图片改成夜景风格",
@@ -72,7 +72,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_accepts_json_multiple_images_and_b64_json(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             json={
                 "prompt": "把两张图合成海报",
                 "images": [
@@ -92,7 +92,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_keeps_original_multipart_multiple_image_logic(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             data={"prompt": "multipart 多图仍然可用", "model": "gpt-image-2", "n": "1"},
             files=[
                 ("image", ("one.png", b"one", "image/png")),
@@ -108,7 +108,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         ])
 
     def test_image_edit_rejects_json_without_image(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "缺少图片"})
+        response = self.client.post("/v1/images/edits", headers=current_auth_headers(), json={"prompt": "缺少图片"})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("image file or image_url is required", response.text)
 
@@ -121,7 +121,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         with mock.patch("api.image_inputs.requests.get", return_value=response_mock):
             response = self.client.post(
                 "/v1/images/edits",
-                headers=AUTH_HEADERS,
+                headers=current_auth_headers(),
                 json={"prompt": "读取远程图片", "images": [{"image_url": "https://example.com/a.png"}]},
             )
         self.assertEqual(response.status_code, 200, response.text)
@@ -131,7 +131,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         )
 
     def test_image_edit_rejects_json_n_out_of_range(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "n 越界", "n": 5, "image": PNG_DATA_URL})
+        response = self.client.post("/v1/images/edits", headers=current_auth_headers(), json={"prompt": "n 越界", "n": 5, "image": PNG_DATA_URL})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertFalse(self.calls)
 

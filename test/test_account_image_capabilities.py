@@ -135,9 +135,18 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"last_refresh_error": "text_stream:token_revoked"}
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             AccountService._access_token_hard_dead(
                 {"last_refresh_error": "refresh_token_invalidated"}
+            )
+        )
+        self.assertTrue(
+            AccountService._access_token_hard_dead(
+                {
+                    "last_refresh_error": "confirmed_refresh_token_invalidated",
+                    "refresh_token_state": "invalidated",
+                    "refresh_token_permanent_failures": 2,
+                }
             )
         )
 

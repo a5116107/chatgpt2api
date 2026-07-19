@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest import mock
 
@@ -50,6 +51,51 @@ class ImageAccountProbeApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_refresh_progress_exists_before_background_task_is_scheduled(self) -> None:
+        def capture_task(coroutine):
+            coroutine.close()
+            return mock.Mock()
+
+        router = accounts_module.create_router()
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if route.path == "/api/accounts/refresh"
+        )
+
+        async def invoke() -> dict:
+            with (
+                mock.patch.object(
+                    accounts_module,
+                    "require_admin",
+                    return_value={"role": "admin"},
+                ),
+                mock.patch.object(
+                    account_service,
+                    "list_tokens",
+                    return_value=["token-1"],
+                ),
+                mock.patch.object(
+                    accounts_module.asyncio,
+                    "create_task",
+                    side_effect=capture_task,
+                ),
+            ):
+                return await endpoint(
+                    accounts_module.AccountRefreshRequest(access_tokens=[]),
+                    authorization=None,
+                )
+
+        started = asyncio.run(invoke())
+        progress_id = started["progress_id"]
+        progress = account_service.get_refresh_progress(progress_id)
+
+        self.addCleanup(account_service.clean_refresh_progress, progress_id)
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress["total"], 1)
+        self.assertEqual(progress["processed"], 0)
+        self.assertFalse(progress["done"])
 
 
 if __name__ == "__main__":

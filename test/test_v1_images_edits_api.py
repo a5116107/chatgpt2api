@@ -9,9 +9,9 @@ from fastapi.testclient import TestClient
 
 import api.ai as ai_module
 import api.image_inputs as image_inputs_module
+from test.utils import current_auth_headers
 
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 PNG_BYTES = b"\x89PNG\r\n\x1a\n"
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
@@ -35,7 +35,7 @@ class ImagesEditsApiTests(unittest.TestCase):
         """测试图片编辑接口支持官方 JSON image_url 引用。"""
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             json={
                 "model": "gpt-image-2",
                 "prompt": "edit",
@@ -56,7 +56,7 @@ class ImagesEditsApiTests(unittest.TestCase):
         """测试图片编辑接口对暂不支持的 file_id 返回明确错误。"""
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=current_auth_headers(),
             json={
                 "model": "gpt-image-2",
                 "prompt": "edit",

@@ -12,28 +12,28 @@ from threading import Condition, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode
 
+from services import image_account_pool
 from services.config import config
 from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
-from services.image_account_pool import (
-    ImagePoolOutcome,
-    ImagePoolState,
-    apply_image_outcome,
-    apply_probe_result,
-    classify_image_outcome,
-    image_pool_score,
-    is_image_pool_schedulable,
-    is_terminal_image_token,
-    normalize_image_pool_fields,
-    probe_is_due,
-    quota_refresh_is_due,
-)
-from services.log_service import (
-    LOG_TYPE_ACCOUNT,
-    log_service,
-)
+from services import log_service as log_service_module
 from services.storage.base import StorageBackend
 from services.runtime_profile_service import runtime_profile_service
 from utils.helper import anonymize_token
+
+
+ImagePoolOutcome = image_account_pool.ImagePoolOutcome
+ImagePoolState = image_account_pool.ImagePoolState
+apply_image_outcome = image_account_pool.apply_image_outcome
+apply_probe_result = image_account_pool.apply_probe_result
+classify_image_outcome = image_account_pool.classify_image_outcome
+image_pool_score = image_account_pool.image_pool_score
+is_image_pool_schedulable = image_account_pool.is_image_pool_schedulable
+is_terminal_image_token = image_account_pool.is_terminal_image_token
+normalize_image_pool_fields = image_account_pool.normalize_image_pool_fields
+probe_is_due = image_account_pool.probe_is_due
+quota_refresh_is_due = image_account_pool.quota_refresh_is_due
+LOG_TYPE_ACCOUNT = log_service_module.LOG_TYPE_ACCOUNT
+log_service = log_service_module.log_service
 
 
 class AccountService:
@@ -46,6 +46,8 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _AUTH_RECOVERY_MAX_SECONDS = 30 * 60
+    _REFRESH_TOKEN_PERMANENT_CONFIRMATIONS = 2
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -169,6 +171,44 @@ class AccountService:
         return any(m in text for m in soft_markers)
 
     @staticmethod
+    def _is_permanent_refresh_token_error(value: object) -> bool:
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "invalid_grant",
+                "refresh_token_invalidated",
+                "refresh token invalidated",
+                "refresh token has been revoked",
+                "refresh token expired",
+                "invalid refresh token",
+                "token_invalid",
+                "could not validate your token",
+                "session has ended",
+                "app_session_terminated",
+            )
+        )
+
+    @classmethod
+    def _auth_recovery_seconds(cls, failure_count: int) -> int:
+        exponent = min(max(0, int(failure_count) - 1), 4)
+        return min(
+            cls._AUTH_RECOVERY_MAX_SECONDS,
+            cls._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS * (2 ** exponent),
+        )
+
+    @classmethod
+    def _auth_recovery_active(cls, account: dict | None, now: datetime | None = None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        if str(account.get("auth_state") or "").strip().lower() not in {"cooldown", "suspect"}:
+            return False
+        recovery_at = cls._parse_time(account.get("auth_recovery_at"))
+        return recovery_at is not None and recovery_at > (now or datetime.now(timezone.utc))
+
+    @staticmethod
     def _access_token_hard_dead(account: dict | None) -> bool:
         """Return whether an access token reached a terminal upstream state."""
         if not isinstance(account, dict):
@@ -178,6 +218,8 @@ class AccountService:
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
+            return False
+        if AccountService._auth_recovery_active(account):
             return False
         if not is_image_pool_schedulable(account, now_epoch=time.time()):
             return False
@@ -194,6 +236,37 @@ class AccountService:
         # Fresh register may keep status=正常 while remote userinfo timed out (quota=0).
         # Exhausted accounts are marked 限流; allow normal tokens to pass acquire and rehydrate.
         return status == "正常"
+
+    @classmethod
+    def _is_recoverable_image_auth_error(cls, account: dict | None, error: object) -> bool:
+        """Keep transient access-token failures in recovery instead of quarantine."""
+        if not isinstance(account, dict) or cls._access_token_hard_dead(account):
+            return False
+        auth_state = str(account.get("auth_state") or "").strip().lower()
+        refresh_state = str(account.get("refresh_token_state") or "active").strip().lower()
+        permanent_failures = max(
+            0,
+            int(account.get("refresh_token_permanent_failures") or 0),
+        )
+        if (
+            auth_state not in {"cooldown", "suspect"}
+            or refresh_state == "invalidated"
+            or permanent_failures >= cls._REFRESH_TOKEN_PERMANENT_CONFIRMATIONS
+        ):
+            return False
+        text = str(error or "").strip().lower()
+        if "token_revoked" in text and "text_stream:token_revoked" not in text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "status=401",
+                "http 401",
+                "token invalid",
+                "token_invalidated",
+                "invalidated oauth",
+            )
+        )
 
     @staticmethod
     def _should_skip_remote_image_preflight(account: dict) -> bool:
@@ -365,6 +438,17 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        auth_state = str(normalized.get("auth_state") or "active").strip().lower()
+        normalized["auth_state"] = auth_state if auth_state in {"active", "cooldown", "suspect", "invalidated"} else "active"
+        normalized["auth_recovery_at"] = normalized.get("auth_recovery_at") or None
+        refresh_state = str(normalized.get("refresh_token_state") or "active").strip().lower()
+        normalized["refresh_token_state"] = refresh_state if refresh_state in {"active", "suspect", "invalidated"} else "active"
+        normalized["refresh_token_permanent_failures"] = max(
+            0,
+            int(normalized.get("refresh_token_permanent_failures") or 0),
+        )
+        normalized["refresh_token_permanent_first_at"] = normalized.get("refresh_token_permanent_first_at") or None
+        normalized["refresh_token_permanent_last_at"] = normalized.get("refresh_token_permanent_last_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         normalized = normalize_image_pool_fields(normalized, now_epoch=time.time())
         normalized, _profile = runtime_profile_service.ensure_account_profile(normalized)
@@ -488,16 +572,139 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
-    def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+    @classmethod
+    def _apply_auth_recovery_state(
+        cls,
+        account: dict,
+        *,
+        now: datetime,
+        event: str,
+        error: str,
+        state: str,
+    ) -> int:
+        failures = max(0, int(account.get("invalid_count") or 0)) + 1
+        account["invalid_count"] = failures
+        account["last_invalid_at"] = now.isoformat()
+        account["auth_state"] = state
+        account["auth_recovery_at"] = (
+            None
+            if state == "invalidated"
+            else (
+                now + timedelta(seconds=cls._auth_recovery_seconds(failures))
+            ).isoformat()
+        )
+        account["auth_last_failure"] = str(
+            error or event or "authentication failure"
+        )[:240]
+        account["auth_last_failure_at"] = now.isoformat()
+        return failures
+
+    @staticmethod
+    def _clear_auth_recovery_state(account: dict) -> None:
+        account["auth_state"] = "active"
+        account["auth_recovery_at"] = None
+        account["auth_last_failure"] = None
+        account["auth_last_failure_at"] = None
+        account["refresh_token_state"] = "active"
+        account["refresh_token_permanent_failures"] = 0
+        account["refresh_token_permanent_first_at"] = None
+        account["refresh_token_permanent_last_at"] = None
+        account["invalid_count"] = 0
+        account["last_invalid_at"] = None
+        if str(account.get("status") or "").strip() == "异常":
+            account["status"] = "正常"
+
+    @staticmethod
+    def _clear_terminal_image_auth_state(
+        account: dict,
+        *,
+        was_revoked: bool,
+        reason: str,
+    ) -> None:
+        probe_error = str(account.get("image_last_probe_error") or "").lower()
+        if any(
+            marker in probe_error
+            for marker in (
+                "token_revoked",
+                "token_invalidated",
+                "invalidated oauth",
+                "invalid access token",
+            )
+        ):
+            account["image_last_probe_error"] = None
+        if was_revoked and str(account.get("status") or "").strip() == "禁用":
+            account["status"] = "正常"
+        if (
+            was_revoked
+            and str(account.get("image_pool_state") or "").strip().lower()
+            == ImagePoolState.QUARANTINED
+        ):
+            account["image_pool_state"] = ImagePoolState.PROBATION
+            account["image_pool_reason"] = reason
+
+    def _record_token_refresh_error(
+        self,
+        access_token: str,
+        event: str,
+        error: str,
+        *,
+        permanent: bool = False,
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        error_text = str(error or "refresh token failed")
+        permanent_failures = 0
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
-                return
+                return 0
             next_item = dict(current)
-            next_item["last_token_refresh_error"] = str(error or "refresh token failed")
-            next_item["last_token_refresh_error_at"] = now
+            next_item["last_token_refresh_error"] = error_text
+            next_item["last_token_refresh_error_at"] = now.isoformat()
+            refresh_state = str(
+                next_item.get("refresh_token_state") or "active"
+            ).strip().lower()
+            if permanent:
+                previous_failures = max(
+                    0,
+                    int(next_item.get("refresh_token_permanent_failures") or 0),
+                )
+                permanent_failures = (
+                    max(self._REFRESH_TOKEN_PERMANENT_CONFIRMATIONS, previous_failures)
+                    if refresh_state == "invalidated"
+                    else previous_failures + 1
+                )
+                invalidated = (
+                    permanent_failures >= self._REFRESH_TOKEN_PERMANENT_CONFIRMATIONS
+                )
+                next_item["refresh_token_state"] = (
+                    "invalidated" if invalidated else "suspect"
+                )
+                next_item["refresh_token_permanent_failures"] = permanent_failures
+                next_item["refresh_token_permanent_first_at"] = (
+                    next_item.get("refresh_token_permanent_first_at")
+                    or now.isoformat()
+                )
+                next_item["refresh_token_permanent_last_at"] = now.isoformat()
+                self._apply_auth_recovery_state(
+                    next_item,
+                    now=now,
+                    event=event,
+                    error=error_text,
+                    state="invalidated" if invalidated else "suspect",
+                )
+            elif refresh_state != "invalidated":
+                next_item["refresh_token_state"] = "active"
+                next_item["refresh_token_permanent_failures"] = 0
+                next_item["refresh_token_permanent_first_at"] = None
+                next_item["refresh_token_permanent_last_at"] = None
+                self._apply_auth_recovery_state(
+                    next_item,
+                    now=now,
+                    event=event,
+                    error=error_text,
+                    state="cooldown",
+                )
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[resolved] = account
@@ -505,8 +712,15 @@ class AccountService:
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
-            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            {
+                "source": event,
+                "token": anonymize_token(access_token),
+                "error": str(error or ""),
+                "permanent": permanent,
+                "permanent_failures": permanent_failures,
+            },
         )
+        return permanent_failures
 
     def _recent_token_refresh_error(self, account: dict) -> bool:
         last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
@@ -544,10 +758,16 @@ class AccountService:
         from curl_cffi import requests
 
         normalized_account, _profile = runtime_profile_service.ensure_account_profile(dict(account or {}))
+        oauth_token_url = str(
+            normalized_account.get("oauth_token_url") or self._OAUTH_TOKEN_URL
+        ).strip()
+        oauth_client_id = str(
+            normalized_account.get("oauth_client_id") or self._OAUTH_CLIENT_ID
+        ).strip()
         session = requests.Session(**self._profile_session_kwargs(normalized_account))
         try:
             response = session.post(
-                self._OAUTH_TOKEN_URL,
+                oauth_token_url,
                 headers=self._profile_headers(
                     normalized_account,
                     content_type="application/x-www-form-urlencoded",
@@ -556,7 +776,7 @@ class AccountService:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
+                    "client_id": oauth_client_id,
                 },
                 timeout=60,
             )
@@ -595,17 +815,19 @@ class AccountService:
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
             was_revoked = self._access_token_hard_dead(current)
+            self._clear_auth_recovery_state(next_item)
             next_item["token_status"] = "active"
             next_item["token_revoked"] = False
             next_item.pop("token_revoked_at", None)
             next_item.pop("token_revoked_source", None)
-            if was_revoked and str(next_item.get("status") or "").strip() == "禁用":
-                next_item["status"] = "正常"
+            self._clear_terminal_image_auth_state(
+                next_item,
+                was_revoked=was_revoked,
+                reason="token_refresh_recovered",
+            )
 
             account = self._normalize_account(next_item)
             if account is None:
@@ -652,27 +874,20 @@ class AccountService:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
                 error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
-                low = error_str.lower()
-                # 会话/刷新令牌永久失效时，优先用邮箱密码抢救，避免号池被 watcher 直接清空
-                permanent = any(
-                    marker in low
-                    for marker in (
-                        "app_session_terminated",
-                        "refresh_token_invalidated",
-                        "session has ended",
-                        "invalid_grant",
-                        "token has been revoked",
-                        "token_revoked",
-                    )
+                permanent = self._is_permanent_refresh_token_error(error_str)
+                permanent_failures = self._record_token_refresh_error(
+                    active_token,
+                    event,
+                    error_str,
+                    permanent=permanent,
                 )
-                if permanent:
+                if (
+                    permanent
+                    and permanent_failures
+                    >= self._REFRESH_TOKEN_PERMANENT_CONFIRMATIONS
+                ):
                     email = str(account.get("email") or "").strip()
                     password = str(account.get("password") or "").strip()
-                    # PATCH_MARKER hard_dead_refresh_disable_r24
-                    # Permanent refresh death (session ended / invalid_grant / etc.) must not re-stack
-                    # as soft「异常」with fake quota. Route free/automation through remove_invalid_token
-                    # so hard_dead_free_disable_r23 marks 禁用; paid may still attempt password rescue.
                     try:
                         self.remove_invalid_token(
                             active_token,
@@ -689,16 +904,18 @@ class AccountService:
                                     "quota": 0 if self._is_free_account(account) else int(account.get("quota") or 0),
                                     "last_token_refresh_error": error_str[:500],
                                     "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
-                                    "last_refresh_error": "refresh_token_invalidated",
+                                    "last_refresh_error": "confirmed_refresh_token_invalidated",
                                     "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                                    "auth_state": "invalidated",
+                                    "auth_recovery_at": None,
+                                    "refresh_token_state": "invalidated",
+                                    "refresh_token_permanent_failures": permanent_failures,
                                 },
                                 quiet=True,
                                 sync_capabilities=False,
                             )
                         except Exception:
                             pass
-                    # Password rescue is best-effort and can itself trip OpenAI OTP / deactivation.
-                    # Skip free-plan auto rescue; register refill remains the recovery path.
                     if (
                         email
                         and password
@@ -713,6 +930,68 @@ class AccountService:
                         t.start()
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def accept_registered_account(self, access_token: str) -> dict[str, Any]:
+        """Force-refresh a newly registered account before exposing it to the pool.
+
+        The authorization-code exchange can return a short-lived refresh session. A
+        successful immediate refresh rotates it into the durable session used by the
+        account watcher and image workers. Registration is only accepted after that
+        rotation has been persisted.
+        """
+        candidate = str(access_token or "").strip()
+        if not candidate:
+            raise ValueError("register_token_acceptance_failed: access_token is empty")
+
+        initial = self.get_account(candidate)
+        if not initial:
+            raise RuntimeError("register_token_acceptance_failed: account not found")
+        initial_refresh = str(initial.get("refresh_token") or "").strip()
+        if not initial_refresh:
+            self.delete_accounts([candidate], sync_capabilities=False)
+            raise RuntimeError("register_token_acceptance_failed: refresh_token is empty")
+
+        refreshed_token = self.refresh_access_token(
+            candidate,
+            force=True,
+            event="register_token_acceptance",
+        )
+        accepted = self.get_account(refreshed_token) if refreshed_token else None
+        refresh_error = str((accepted or {}).get("last_token_refresh_error") or "").strip()
+        refreshed_at = str((accepted or {}).get("last_token_refresh_at") or "").strip()
+        accepted_refresh = str((accepted or {}).get("refresh_token") or "").strip()
+        if not accepted or refresh_error or not refreshed_at or not accepted_refresh:
+            if accepted:
+                self.delete_accounts([str(accepted.get("access_token") or refreshed_token)], sync_capabilities=False)
+            raise RuntimeError(
+                "register_token_acceptance_failed: "
+                f"{refresh_error or 'refresh did not persist a usable token'}"
+            )
+
+        validation_time = datetime.now(timezone.utc).isoformat()
+        rotated = accepted_refresh != initial_refresh
+        self.update_account(
+            str(accepted.get("access_token") or refreshed_token),
+            {
+                "registration_token_validated_at": validation_time,
+                "registration_token_rotated": rotated,
+            },
+            quiet=True,
+            sync_capabilities=False,
+        )
+        final_account = self.get_account(str(accepted.get("access_token") or refreshed_token)) or accepted
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "注册账号令牌验收完成",
+            {
+                "source": "register_token_acceptance",
+                "token": anonymize_token(str(final_account.get("access_token") or refreshed_token)),
+                "access_token_len": len(str(final_account.get("access_token") or "")),
+                "refresh_token_len": len(str(final_account.get("refresh_token") or "")),
+                "rotated": rotated,
+            },
+        )
+        return final_account
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1247,6 +1526,30 @@ class AccountService:
                 and self._token_needs_refresh(token)
             ]
 
+    def list_auth_recovery_tokens(self) -> list[str]:
+        """Return accounts whose authentication cooldown is ready for another attempt."""
+        now = datetime.now(timezone.utc)
+        ready: list[str] = []
+        with self._lock:
+            for account in self._accounts.values():
+                auth_state = str(account.get("auth_state") or "").strip().lower()
+                refresh_state = str(
+                    account.get("refresh_token_state") or "active"
+                ).strip().lower()
+                if auth_state not in {"cooldown", "suspect"}:
+                    continue
+                if refresh_state == "invalidated":
+                    continue
+                if str(account.get("status") or "").strip() == "禁用":
+                    continue
+                recovery_at = self._parse_time(account.get("auth_recovery_at"))
+                if recovery_at is not None and recovery_at > now:
+                    continue
+                token = str(account.get("access_token") or "").strip()
+                if token and str(account.get("refresh_token") or "").strip():
+                    ready.append(token)
+        return ready
+
     def list_refresh_token_keepalive_tokens(self) -> list[str]:
         now = datetime.now(timezone.utc)
         due_items: list[tuple[datetime, str]] = []
@@ -1675,18 +1978,11 @@ class AccountService:
             account.get("last_token_refresh_error") or event or ""
         )[:500]
         hard_dead = self._access_token_hard_dead(probe) or any(
-            m in low_event
-            for m in (
-                "token invalidated",
-                "token_invalidated",
-                "invalidated oauth",
+            marker in low_event
+            for marker in (
                 "account_deactivated",
-                "refresh_token_invalidated",
-                "session has ended",
-                "invalid_grant",
-                "app_session_terminated",
-                "oauth_refresh_http_401",
-                "oauth_refresh_http_403",
+                "account has been deactivated",
+                "confirmed_refresh_token_invalidated",
             )
         )
         if hard_dead:
@@ -2135,13 +2431,25 @@ class AccountService:
             if current is None:
                 return
             next_item = dict(current)
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
+            was_revoked = self._access_token_hard_dead(current)
+            self._clear_auth_recovery_state(next_item)
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["last_token_refresh_error"] = None
+            next_item["last_token_refresh_error_at"] = None
+            next_item["token_status"] = "active"
+            next_item["token_revoked"] = False
+            next_item.pop("token_revoked_at", None)
+            next_item.pop("token_revoked_source", None)
+            self._clear_terminal_image_auth_state(
+                next_item,
+                was_revoked=was_revoked,
+                reason="account_probe_recovered",
+            )
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
+                self._save_accounts()
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
@@ -2172,8 +2480,13 @@ class AccountService:
                 return True
             should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
             next_item = dict(current)
-            next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
-            next_item["last_invalid_at"] = now.isoformat()
+            self._apply_auth_recovery_state(
+                next_item,
+                now=now,
+                event=event,
+                error=error,
+                state="cooldown",
+            )
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
             account = self._normalize_account(next_item)
@@ -2251,6 +2564,11 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            if (
+                outcome == ImagePoolOutcome.TOKEN_INVALID
+                and self._is_recoverable_image_auth_error(current, error)
+            ):
+                outcome = ImagePoolOutcome.UPSTREAM_ERROR
             next_item = apply_probe_result(
                 current,
                 success=success,
@@ -2518,8 +2836,21 @@ class AccountService:
             with OpenAIBackendAPI(active_token) as backend:
                 result = backend.get_user_info()
         except InvalidAccessTokenError as exc:
+            refresh_started_at = datetime.now(timezone.utc)
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
-            if refreshed_token and refreshed_token != active_token:
+            refreshed_account = self.get_account(refreshed_token) if refreshed_token else None
+            refreshed_at = self._parse_time(
+                (refreshed_account or {}).get("last_token_refresh_at")
+            )
+            refresh_succeeded = bool(
+                refreshed_token
+                and refreshed_account
+                and str(refreshed_account.get("refresh_token") or "").strip()
+                and not str(refreshed_account.get("last_token_refresh_error") or "").strip()
+                and refreshed_at is not None
+                and refreshed_at >= refresh_started_at - timedelta(seconds=1)
+            )
+            if refreshed_token and (refreshed_token != active_token or refresh_succeeded):
                 try:
                     with OpenAIBackendAPI(refreshed_token) as backend:
                         result = backend.get_user_info()

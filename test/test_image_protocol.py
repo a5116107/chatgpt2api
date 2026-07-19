@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -113,6 +114,43 @@ class ImageProtocolTests(unittest.TestCase):
 
         self.assertEqual(urls, ["https://example.test/attachment.png"])
         backend._get_attachment_download_url.assert_called_once_with("conversation-1", "file-1")
+
+    def test_cancelled_poll_race_loser_is_not_logged_as_timeout(self) -> None:
+        backend = backend_module.OpenAIBackendAPI.__new__(backend_module.OpenAIBackendAPI)
+        backend.image_deadline_monotonic = None
+        backend.image_request_id = "cancelled-poll-test"
+        backend._report_progress = lambda _step: None
+        cancel_event = threading.Event()
+
+        def get_conversation(*_args, **_kwargs):
+            cancel_event.set()
+            return {}
+
+        backend._get_conversation = get_conversation
+        with (
+            mock.patch.object(backend_module.logger, "info") as info_log,
+            mock.patch.object(backend_module.logger, "debug") as debug_log,
+        ):
+            with self.assertRaisesRegex(backend_module.ImagePollTimeoutError, "cancelled"):
+                backend._poll_image_results(
+                    "conversation-1",
+                    timeout_secs=1.0,
+                    cancel_event=cancel_event,
+                    initial_wait_secs=0.0,
+                )
+
+        info_events = [
+            call.args[0].get("event")
+            for call in info_log.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+        ]
+        debug_events = [
+            call.args[0].get("event")
+            for call in debug_log.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+        ]
+        self.assertNotIn("image_poll_timeout", info_events)
+        self.assertIn("image_poll_cancelled", debug_events)
 
 
 class ImageConfigTests(unittest.TestCase):

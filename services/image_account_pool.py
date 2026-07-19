@@ -106,31 +106,38 @@ def is_terminal_image_token(account: dict[str, Any]) -> bool:
         "invalidated",
     }:
         return True
-    blob = " ".join(
-        str(account.get(key) or "")
+    refresh_state = str(account.get("refresh_token_state") or "").strip().lower()
+    permanent_failures = _as_int(account.get("refresh_token_permanent_failures"))
+    if refresh_state == "invalidated" or permanent_failures >= 2:
+        return True
+
+    fields = {
+        key: str(account.get(key) or "").strip().lower()
         for key in (
             "token_revoked_source",
             "last_refresh_error",
             "last_token_refresh_error",
             "image_last_probe_error",
         )
-    ).lower()
-    hard_markers = (
-        "token invalidated",
-        "token_invalidated",
-        "invalidated oauth",
-        "encountered invalidated oauth token",
-        "account_deactivated",
-        "refresh_token_invalidated",
-        "session has ended",
-        "invalid_grant",
-        "app_session_terminated",
-        "oauth_refresh_http_401",
-    )
-    if any(marker in blob for marker in hard_markers):
+    }
+    blob = " ".join(fields.values())
+    if any(
+        marker in blob
+        for marker in (
+            "account_deactivated",
+            "account has been deactivated",
+            "confirmed_refresh_token_invalidated",
+        )
+    ):
         return True
-    without_chat_soft_revoke = blob.replace("text_stream:token_revoked", "")
-    return "token_revoked" in without_chat_soft_revoke
+
+    # Access-token 401s and bare OAuth refresh HTTP statuses are recoverable.
+    # Only an explicit image revocation or a confirmed refresh-token state is terminal.
+    for key in ("token_revoked_source", "image_last_probe_error", "last_refresh_error"):
+        evidence = fields[key]
+        if "token_revoked" in evidence and "text_stream:token_revoked" not in evidence:
+            return True
+    return False
 
 
 def quota_refresh_is_due(
@@ -198,6 +205,13 @@ def normalize_image_pool_fields(
         state = ImagePoolState.DISABLED
     elif status == "限流":
         state = ImagePoolState.EXHAUSTED
+    elif state == ImagePoolState.DISABLED:
+        if _has_current_generation_success(normalized):
+            state = ImagePoolState.READY
+            normalized["image_pool_reason"] = None
+        else:
+            state = ImagePoolState.PROBATION
+            probation_reason = "manual_enable_awaiting_generation"
     elif state == ImagePoolState.EXHAUSTED and (
         bool(normalized.get("image_quota_unknown"))
         or max(0, _as_int(normalized.get("quota"))) > 0

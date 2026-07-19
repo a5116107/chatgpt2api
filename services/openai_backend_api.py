@@ -2439,6 +2439,16 @@ class OpenAIBackendAPI:
             interval = fast_interval if elapsed < fast_window else slow_interval
             if not _wait(interval):
                 break
+        if _cancelled():
+            logger.debug({
+                "event": "image_poll_cancelled",
+                "request_id": self.image_request_id,
+                "conversation_id": conversation_id,
+                "attempts_made": attempt,
+            })
+            exc = ImagePollTimeoutError("image polling cancelled")
+            setattr(exc, "conversation_id", conversation_id or "")
+            raise exc
         logger.info({
             "event": "image_poll_timeout",
             "request_id": self.image_request_id,

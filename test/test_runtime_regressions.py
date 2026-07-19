@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from unittest import mock
 
+os.environ.setdefault("CHATGPT2API_AUTH_KEY", "chatgpt2api")
+
+from api import support as support_module
+from api.support import _select_keepalive_tokens
+from services.config import ConfigStore
 from services.openai_backend_api import OpenAIBackendAPI
 from services import risk_control_service as risk_module
+from services.proxy_service import _apply_dynamic_proxy_session
 
 
 class UserInfoSessionTests(unittest.TestCase):
@@ -39,6 +47,45 @@ class UserInfoSessionTests(unittest.TestCase):
         self.assertEqual([name for name, _ in calls], ["me", "init", "account"])
         self.assertEqual({thread_id for _, thread_id in calls}, {caller_thread})
         self.assertEqual(result["quota"], 2)
+
+
+class AccountWatcherSchedulingTests(unittest.TestCase):
+    def test_keepalive_excludes_every_token_already_selected_for_refresh(self) -> None:
+        selected = ["limited", "normal", "expiring", "recovery"]
+        candidates = ["normal", "expiring", "keepalive", "keepalive", "later"]
+
+        result = _select_keepalive_tokens(candidates, selected, max_batch=1)
+
+        self.assertEqual(result, ["keepalive"])
+
+    def test_explicit_empty_proxy_status_url_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                '{"auth-key":"test-auth-key","account_watcher":{"proxy_status_url":""}}',
+                encoding="utf-8",
+            )
+
+            watcher = ConfigStore(path).get_account_watcher_settings()
+
+        self.assertEqual(watcher["proxy_status_url"], "")
+
+    def test_single_proxy_mode_skips_dynamic_pool_status_lookup(self) -> None:
+        watcher = {
+            "require_proxy_ready": True,
+            "proxy_ready_timeout_secs": 8,
+            "proxy_status_url": "",
+            "max_batch": 4,
+        }
+        with (
+            mock.patch.object(support_module, "test_proxy", return_value={"ok": True}),
+            mock.patch.object(support_module, "_account_watcher_proxy_status") as pool_status,
+        ):
+            result = support_module._account_watcher_proxy_ready(watcher)
+
+        pool_status.assert_not_called()
+        self.assertEqual(result["mode"], "single_proxy")
+        self.assertEqual(result["available"], 4)
 
 
 class CapabilitySyncTests(unittest.TestCase):
@@ -96,6 +143,43 @@ class CapabilitySyncTests(unittest.TestCase):
         self.assertFalse(item["image"])
         self.assertFalse(item["image_edit"])
         self.assertFalse(item["image_variation"])
+
+
+class ProxySessionRoutingTests(unittest.TestCase):
+    def test_parameterized_proxy_replaces_only_the_session_id(self) -> None:
+        proxy = (
+            "http://ACCESS-country-US-sid-old-ttl-5-probe-slot-ttl-120:"
+            "SECRET%2BVALUE@socks.example.test:8080"
+        )
+
+        rotated = _apply_dynamic_proxy_session(proxy, "sess-profile-123")
+        parsed = urlparse(rotated)
+
+        self.assertEqual(
+            unquote(parsed.username or ""),
+            "ACCESS-country-US-sid-sess-profile-123-ttl-120",
+        )
+        self.assertEqual(parsed.password, "SECRET%2BVALUE")
+        self.assertEqual(parsed.hostname, "socks.example.test")
+        self.assertEqual(parsed.port, 8080)
+
+    def test_parameterized_proxy_session_is_stable_per_profile(self) -> None:
+        proxy = "socks5h://ACCESS-country-RAND-sid-old-ttl-5:SECRET@socks.example.test:1080"
+
+        first = _apply_dynamic_proxy_session(proxy, "sess-profile-a")
+        repeated = _apply_dynamic_proxy_session(proxy, "sess-profile-a")
+        second = _apply_dynamic_proxy_session(proxy, "sess-profile-b")
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, second)
+
+    def test_plain_authenticated_proxy_is_not_rewritten(self) -> None:
+        proxy = "http://ACCESS:SECRET@socks.example.test:8080"
+
+        self.assertEqual(
+            _apply_dynamic_proxy_session(proxy, "sess-profile-123"),
+            proxy,
+        )
 
 
 if __name__ == "__main__":

@@ -60,6 +60,19 @@ def raise_image_quota_error(exc: Exception) -> None:
     raise HTTPException(status_code=502, detail={"error": message}) from exc
 
 
+def _select_keepalive_tokens(
+    candidates: list[str],
+    selected_tokens: list[str],
+    max_batch: int,
+) -> list[str]:
+    selected = set(selected_tokens)
+    return [
+        token
+        for token in dict.fromkeys(candidates)
+        if token and token not in selected
+    ][:max_batch]
+
+
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:
     if not isinstance(pool, dict):
         return None
@@ -123,6 +136,15 @@ def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
             f"latency_ms={result.get('latency_ms')}"
         )
         return None
+    if not str(watcher.get("proxy_status_url") or "").strip():
+        available = max(1, int(watcher.get("max_batch") or 1))
+        return {
+            "available": available,
+            "total": available,
+            "banned": 0,
+            "below_score": 0,
+            "mode": "single_proxy",
+        }
     pool_status = _account_watcher_proxy_status(watcher)
     min_available = max(1, int(watcher.get("min_proxy_available") or 1))
     available = int((pool_status or {}).get("available") or 0)
@@ -173,24 +195,27 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 limited_tokens = account_service.list_limited_tokens() if watcher.get("check_limited") else []
                 normal_tokens = account_service.list_normal_tokens() if watcher.get("check_normal") else []
                 expiring_tokens = account_service.list_expiring_access_tokens() if watcher.get("check_expiring") else []
+                recovery_tokens = account_service.list_auth_recovery_tokens() if watcher.get("check_expiring") else []
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens() if watcher.get("keepalive_refresh_tokens") else []
-                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens, *recovery_tokens]))
                 max_batch = max(1, int(watcher.get("max_batch") or 64))
                 if watcher.get("dynamic_batch_by_proxy"):
                     available = max(1, int((proxy_status or {}).get("available") or 1))
                     max_batch = min(max_batch, available)
                 if len(tokens) > max_batch:
                     tokens = tokens[:max_batch]
-                expiring_token_set = set(expiring_tokens)
-                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
-                if len(keepalive_tokens) > max_batch:
-                    keepalive_tokens = keepalive_tokens[:max_batch]
+                keepalive_tokens = _select_keepalive_tokens(
+                    keepalive_tokens,
+                    tokens,
+                    max_batch,
+                )
                 if tokens:
                     print(
                         "[account-watcher] checking "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(normal_tokens)} normal accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens; "
+                        f"{len(expiring_tokens)} expiring access tokens, "
+                        f"{len(recovery_tokens)} auth recoveries; "
                         f"batch={len(tokens)}/{max_batch}"
                     )
                     account_service.refresh_accounts(tokens)

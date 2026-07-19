@@ -5,6 +5,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from services.config import config
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT_DIR / "data" / "output"
@@ -16,6 +18,10 @@ if str(ROOT_DIR) not in sys.path:
 
 def load_auth_key() -> str:
     return json.loads((ROOT_DIR / "config.json").read_text(encoding="utf-8"))["auth-key"]
+
+
+def current_auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {config.auth_key}"}
 
 
 def post_json(path: str, payload: dict) -> dict:

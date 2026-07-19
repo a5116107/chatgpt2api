@@ -62,6 +62,48 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
         self.assertEqual(probed_only["image_pool_state"], ImagePoolState.PROBATION)
         self.assertEqual(generation_verified["image_pool_state"], ImagePoolState.READY)
 
+    def test_manual_disable_only_blocks_pool_while_account_status_is_disabled(self) -> None:
+        disabled = normalize_image_pool_fields(
+            {
+                "status": "禁用",
+                "quota": 25,
+                "image_pool_state": ImagePoolState.DISABLED,
+                "image_pool_reason": "manual_disabled",
+            },
+            now_epoch=NOW,
+        )
+        restored_unverified = normalize_image_pool_fields(
+            {
+                **disabled,
+                "status": "正常",
+            },
+            now_epoch=NOW,
+        )
+        restored_verified = normalize_image_pool_fields(
+            {
+                **disabled,
+                "status": "正常",
+                "image_last_success_at": NOW - 10,
+            },
+            now_epoch=NOW,
+        )
+
+        self.assertEqual(disabled["image_pool_state"], ImagePoolState.DISABLED)
+        self.assertFalse(is_image_pool_schedulable(disabled, now_epoch=NOW))
+        self.assertEqual(
+            restored_unverified["image_pool_state"], ImagePoolState.PROBATION
+        )
+        self.assertEqual(
+            restored_unverified["image_pool_reason"],
+            "manual_enable_awaiting_generation",
+        )
+        self.assertTrue(
+            is_image_pool_schedulable(restored_unverified, now_epoch=NOW)
+        )
+        self.assertEqual(restored_verified["image_pool_state"], ImagePoolState.READY)
+        self.assertIsNone(restored_verified["image_pool_reason"])
+        self.assertTrue(is_image_pool_schedulable(restored_verified, now_epoch=NOW))
+
     def test_classifies_account_outcomes_without_conflating_policy_and_network_errors(self) -> None:
         self.assertEqual(
             classify_image_outcome("Encountered invalidated oauth token", status_code=401),
@@ -95,9 +137,27 @@ class ImageAccountPoolPolicyTests(unittest.TestCase):
                 {"last_refresh_error": "text_stream:token_revoked"}
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             is_terminal_image_token(
                 {"last_refresh_error": "oauth_refresh_http_401"}
+            )
+        )
+        self.assertFalse(
+            is_terminal_image_token(
+                {
+                    "last_token_refresh_error": "oauth_refresh_http_400: invalid_grant",
+                    "refresh_token_state": "suspect",
+                    "refresh_token_permanent_failures": 1,
+                }
+            )
+        )
+        self.assertTrue(
+            is_terminal_image_token(
+                {
+                    "last_token_refresh_error": "oauth_refresh_http_400: invalid_grant",
+                    "refresh_token_state": "invalidated",
+                    "refresh_token_permanent_failures": 2,
+                }
             )
         )
         self.assertTrue(is_terminal_image_token({"token_revoked": True}))
