@@ -2,16 +2,23 @@
 
 import { AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Textarea,
+} from "@/components/ui";
 
 import { useSettingsStore } from "../../settings/store";
-
-const mailfreeDefaultDomainIndices = [482, 1383, 1443, 1503, 1563, 1623, 1720, 1726, 1732];
+import { mailProviderDefaults, mailProviderOptions } from "./mail-provider-catalog";
+import { OutlookExternalProviderFields } from "./outlook-external-provider-fields";
+import { RandomDomainProviderFields } from "./random-domain-provider-fields";
 
 export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
@@ -20,6 +27,7 @@ export function RegisterCard() {
   const setProxy = useSettingsStore((state) => state.setRegisterProxy);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
+  const setMaxAttempts = useSettingsStore((state) => state.setRegisterMaxAttempts);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
@@ -59,17 +67,7 @@ export function RegisterCard() {
     updateProvider(index, {
       type,
       enable: true,
-      ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
-      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [] } : {}),
-      ...(type === "mailfree" ? { api_base: "https://mailfree.cavanal.workers.dev", admin_password: "", domain_index: 4, domain_indices: mailfreeDefaultDomainIndices } : {}),
-      ...(type === "tempmail_lol" ? { api_key: "", domain: [] } : {}),
-      ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
-      ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
-      ...(type === "duckmail" ? { api_key: "", default_domain: "duckmail.sbs" } : {}),
-      ...(type === "gptmail" ? { api_key: "", default_domain: "" } : {}),
-      ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
-      ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
-      ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...mailProviderDefaults(type),
     });
   };
 
@@ -117,6 +115,10 @@ export function RegisterCard() {
             <div className="space-y-2">
               <label className="text-sm text-stone-700">线程数</label>
               <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">单账号最大尝试次数</label>
+              <Input value={String(config.max_attempts || 6)} onChange={(event) => setMaxAttempts(event.target.value)} min={1} max={20} type="number" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册代理</label>
@@ -189,17 +191,9 @@ export function RegisterCard() {
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="cloudmail_gen">cloudmail_gen</SelectItem>
-                            <SelectItem value="cloudflare_temp_email">cloudflare_temp_email</SelectItem>
-                            <SelectItem value="mailfree">mailfree (自建邮箱)</SelectItem>
-                            <SelectItem value="tempmail_lol">tempmail_lol</SelectItem>
-                            <SelectItem value="moemail">moemail</SelectItem>
-                            <SelectItem value="inbucket">inbucket_mail</SelectItem>
-                            <SelectItem value="duckmail">duckmail</SelectItem>
-                            <SelectItem value="gptmail">gptmail(未测试)</SelectItem>
-                            <SelectItem value="yyds_mail">yyds_mail</SelectItem>
-                            <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
-                            <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            {mailProviderOptions.map((option) => (
+                              <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                            ))}
                           </SelectContent>
                         </Select>
                       </div>
@@ -273,6 +267,19 @@ export function RegisterCard() {
                           <label className="text-sm text-stone-700">API Key</label>
                           <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                         </div>
+                      ) : null}
+                      <RandomDomainProviderFields
+                        providerName={type}
+                        provider={provider}
+                        disabled={config.enabled}
+                        onChange={(patch) => updateProvider(index, patch)}
+                      />
+                      {type === "outlook_external" ? (
+                        <OutlookExternalProviderFields
+                          provider={provider}
+                          disabled={config.enabled}
+                          onChange={(patch) => updateProvider(index, patch)}
+                        />
                       ) : null}
                       {type === "duckmail" || type === "gptmail" ? (
                         <div className="space-y-2">

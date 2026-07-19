@@ -16,6 +16,7 @@ __pycache__/
 web/node_modules/
 web/.next/
 web/out/
+web/*.tsbuildinfo
 
 # Local diagnostics and release artifacts
 EVIDENCE*

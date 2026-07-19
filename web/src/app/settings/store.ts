@@ -35,6 +35,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
   type RegisterConfig,
+  type RegisterMailProvider,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
@@ -329,13 +330,14 @@ type SettingsStore = {
   setRegisterProxy: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
+  setRegisterMaxAttempts: (value: string) => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   addRegisterProvider: () => void;
-  updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
+  updateRegisterProvider: (index: number, updates: RegisterMailProvider) => void;
   deleteRegisterProvider: (index: number) => void;
   saveRegister: () => Promise<void>;
   toggleRegister: () => Promise<void>;
@@ -902,6 +904,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
   },
 
+  setRegisterMaxAttempts: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, max_attempts: Number(value) || 0 } } : {});
+  },
+
   setRegisterMode: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {});
   },
@@ -973,6 +979,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         proxy: registerConfig.proxy.trim(),
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
+        max_attempts: Math.min(20, Math.max(1, Number(registerConfig.max_attempts) || 6)),
         mode: registerConfig.mode,
         target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
@@ -998,6 +1005,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           proxy: registerConfig.proxy.trim(),
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),
+          max_attempts: Math.min(20, Math.max(1, Number(registerConfig.max_attempts) || 6)),
           mode: registerConfig.mode,
           target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),

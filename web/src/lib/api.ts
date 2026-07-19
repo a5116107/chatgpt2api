@@ -454,17 +454,31 @@ export type OutlookPoolStats = {
   failed: number;
 };
 
+export type RegisterMailProviderValue =
+  | string
+  | number
+  | boolean
+  | null
+  | RegisterMailProviderValue[]
+  | { [key: string]: RegisterMailProviderValue };
+
+export type RegisterMailProvider = Record<
+  string,
+  RegisterMailProviderValue | undefined
+>;
+
 export type RegisterConfig = {
   enabled: boolean;
   mail: {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
-    providers: Array<Record<string, unknown>>;
+    providers: RegisterMailProvider[];
   };
   proxy: string;
   total: number;
   threads: number;
+  max_attempts: number;
   mode: "total" | "quota" | "available";
   target_quota: number;
   target_available: number;
