@@ -31,6 +31,8 @@ _ddg_aliases_lock = Lock()
 
 OUTLOOK_TOKEN_USED_FILE = DATA_DIR / "outlook_token_used.json"
 _outlook_token_state_lock = Lock()
+OUTLOOK_EXTERNAL_DEFAULT_PREFLIGHT_ATTEMPTS = 20
+OUTLOOK_EXTERNAL_MAX_PREFLIGHT_ATTEMPTS = 100
 # in_use 超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {
@@ -1236,6 +1238,7 @@ class TempMailLolProvider(BaseMailProvider):
         attempts = self.random_domain_attempts if random_domain else 1
         skipped_domains: list[str] = []
         cooling_mailboxes: dict[str, dict[str, str]] = {}
+        permanently_rejected_families: set[str] = set()
         known_cooling_families = (
             random_mail_domain_health.random_mail_domain_cooling_families(
                 self.name, self.provider_ref
@@ -1274,6 +1277,13 @@ class TempMailLolProvider(BaseMailProvider):
                 self.name, self.provider_ref, domain_family
             ):
                 skipped_domains.append(address_domain)
+                if random_mail_domain_health.random_mail_domain_is_permanently_rejected(
+                    self.name,
+                    self.provider_ref,
+                    domain_family,
+                ):
+                    permanently_rejected_families.add(domain_family)
+                    continue
                 cooling_mailboxes.setdefault(
                     domain_family,
                     {"address": address, "token": token},
@@ -1317,6 +1327,11 @@ class TempMailLolProvider(BaseMailProvider):
                     skipped_domains,
                     half_open=True,
                 )
+        if random_domain and permanently_rejected_families and not cooling_mailboxes:
+            raise RuntimeError(
+                "TempMail.lol 随机域名池已被上游永久拒绝: "
+                + ",".join(sorted(permanently_rejected_families))
+            )
         families = sorted(
             {
                 random_mail_domain_health.random_mail_domain_family(
@@ -2021,7 +2036,16 @@ class OutlookExternalApiProvider(BaseMailProvider):
         self.use_plus_alias = bool(entry.get("use_plus_alias", True))
         self.prefer_alias = bool(entry.get("prefer_alias", True))
         self.realtime_preflight = bool(entry.get("realtime_preflight", True))
-        self.preflight_attempts = max(1, min(20, int(entry.get("preflight_attempts") or 8)))
+        self.preflight_attempts = max(
+            1,
+            min(
+                OUTLOOK_EXTERNAL_MAX_PREFLIGHT_ATTEMPTS,
+                int(
+                    entry.get("preflight_attempts")
+                    or OUTLOOK_EXTERNAL_DEFAULT_PREFLIGHT_ATTEMPTS
+                ),
+            ),
+        )
         if not self.api_key:
             raise RuntimeError("outlook_external 缺少 api_key（mail.acica.top 对外 API Key）")
         self.session = _create_session(conf)
@@ -2116,7 +2140,7 @@ class OutlookExternalApiProvider(BaseMailProvider):
                 self._request(
                     "GET",
                     "/api/external/emails",
-                    params={"email": candidate_email, "folder": "inbox", "top": 1},
+                    params={"email": candidate_email, "folder": self.folder, "top": 1},
                 )
 
             readable_account, preflight_errors = (

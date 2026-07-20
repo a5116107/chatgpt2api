@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -15,7 +16,10 @@ from api.support import _select_keepalive_tokens
 from services.config import ConfigStore
 from services.openai_backend_api import OpenAIBackendAPI
 from services import risk_control_service as risk_module
-from services.proxy_service import _apply_dynamic_proxy_session
+from services.proxy_service import (
+    FlareSolverrClearanceProvider,
+    _apply_dynamic_proxy_session,
+)
 
 
 class UserInfoSessionTests(unittest.TestCase):
@@ -146,6 +150,80 @@ class CapabilitySyncTests(unittest.TestCase):
 
 
 class ProxySessionRoutingTests(unittest.TestCase):
+    def test_flaresolverr_rejects_non_clearance_cookies_without_direct_fallback(self) -> None:
+        requests = []
+
+        def fake_request(endpoint, body, headers, timeout):
+            requests.append(json.loads(body.decode("utf-8")))
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "solution": {
+                        "status": 403,
+                        "cookies": [
+                            {
+                                "name": "__cf_bm",
+                                "value": "ordinary-cookie",
+                                "domain": ".auth.openai.com",
+                            }
+                        ],
+                        "userAgent": "ua",
+                    },
+                }
+            ).encode("utf-8")
+
+        provider = FlareSolverrClearanceProvider(
+            "http://flaresolverr:8191",
+            request_method=fake_request,
+        )
+
+        bundle = provider.get_clearance(
+            "https://auth.openai.com",
+            proxy_url="socks5h://ACCESS:SECRET@socks.example.test:1080",
+        )
+
+        self.assertIsNone(bundle)
+        self.assertEqual(len(requests), 1)
+        self.assertIn("proxy", requests[0])
+
+    def test_flaresolverr_accepts_cf_clearance_from_the_requested_proxy(self) -> None:
+        requests = []
+
+        def fake_request(endpoint, body, headers, timeout):
+            requests.append(json.loads(body.decode("utf-8")))
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "solution": {
+                        "status": 200,
+                        "cookies": [
+                            {
+                                "name": "cf_clearance",
+                                "value": "clearance-cookie",
+                                "domain": ".auth.openai.com",
+                            }
+                        ],
+                        "userAgent": "ua",
+                    },
+                }
+            ).encode("utf-8")
+
+        proxy = "socks5h://ACCESS:SECRET@socks.example.test:1080"
+        provider = FlareSolverrClearanceProvider(
+            "http://flaresolverr:8191",
+            request_method=fake_request,
+        )
+
+        bundle = provider.get_clearance(
+            "https://auth.openai.com",
+            proxy_url=proxy,
+        )
+
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle.proxy_url, proxy)
+        self.assertEqual(bundle.cookies, {"cf_clearance": "clearance-cookie"})
+        self.assertEqual(len(requests), 1)
+
     def test_parameterized_proxy_replaces_only_the_session_id(self) -> None:
         proxy = (
             "http://ACCESS-country-US-sid-old-ttl-5-probe-slot-ttl-120:"

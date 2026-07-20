@@ -191,6 +191,98 @@ class ImageConfigTests(unittest.TestCase):
 
 
 class ImageAccountFailoverTests(unittest.TestCase):
+    def test_alternative_account_probe_error_preserves_original_failure(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            started_monotonic=started,
+            deadline_monotonic=started + 120.0,
+        )
+
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-1",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"access_token": "token-1", "email": "one@example.test"},
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "has_alternative_image_account",
+                side_effect=RuntimeError("pool probe failed"),
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+        ):
+            with self.assertRaisesRegex(
+                conversation_module.ImageGenerationError,
+                "pool probe failed",
+            ):
+                conversation_module._generate_single_image(request, 1, 1)
+
+    def test_empty_conversation_403_rotates_to_another_account(self) -> None:
+        started = time.monotonic()
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw a test image",
+            started_monotonic=started,
+            deadline_monotonic=started + 120.0,
+        )
+        selected: list[str] = []
+
+        def select_token(**kwargs) -> str:
+            excluded = set(kwargs.get("excluded_tokens") or set())
+            token = "token-2" if "token-1" in excluded else "token-1"
+            selected.append(token)
+            return token
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def set_image_request_context(self, *_args) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def stream(backend, _attempt_request, _index, _total):
+            if backend.access_token == "token-1":
+                raise RuntimeError("/backend-api/f/conversation failed: status=403, body=")
+            yield conversation_module.ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                data=[{"url": "https://example.test/image.png"}],
+            )
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", side_effect=select_token),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                side_effect=lambda token: {"access_token": token, "email": f"{token}@example.test"},
+            ),
+            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(conversation_module.account_service, "mark_image_result") as mark_result,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=stream),
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+        ):
+            outputs = conversation_module._generate_single_image(request, 1, 1)
+
+        self.assertEqual(selected, ["token-1", "token-2"])
+        self.assertEqual(outputs[-1].kind, "result")
+        self.assertEqual(mark_result.call_count, 1)
+        self.assertTrue(mark_result.call_args.args[1])
+
     def test_poll_timeout_excludes_account_and_uses_per_attempt_deadline(self) -> None:
         started = time.monotonic()
         request = conversation_module.ConversationRequest(

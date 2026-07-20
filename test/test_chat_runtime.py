@@ -59,6 +59,49 @@ class ChatStreamDeadlineTests(unittest.TestCase):
 
 
 class ChatTimeoutRotationTests(unittest.TestCase):
+    def test_empty_conversation_403_before_first_delta_rotates_to_next_account(self) -> None:
+        class InitialBackend:
+            access_token = "token-1"
+
+            def close(self) -> None:
+                return None
+
+        class FakeBackend:
+            def __init__(self, access_token: str):
+                self.access_token = access_token
+                self.proxy_url = ""
+
+            def close(self) -> None:
+                return None
+
+        def fake_events(backend, **_kwargs):
+            if backend.access_token == "token-1":
+                raise RuntimeError("/backend-api/f/conversation failed: status=403, body=")
+            yield {"type": "conversation.delta", "delta": "ok"}
+
+        request = conversation_module.ConversationRequest(prompt="hello")
+        with (
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "conversation_events", side_effect=fake_events),
+            mock.patch.object(
+                conversation_module.config,
+                "get_chat_runtime_settings",
+                return_value={"max_account_rotates": 2, "rotate_on_timeout": True},
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_text_access_token",
+                return_value="token-2",
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_text_used"),
+            mock.patch.object(conversation_module, "_record_runtime_success"),
+            mock.patch.object(conversation_module, "_record_runtime_risk") as risk,
+        ):
+            result = list(conversation_module.stream_text_deltas(InitialBackend(), request))
+
+        self.assertEqual(result, ["ok"])
+        risk.assert_not_called()
+
     def test_timeout_before_first_delta_rotates_to_next_account(self) -> None:
         class InitialBackend:
             access_token = "token-1"

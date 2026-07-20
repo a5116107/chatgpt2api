@@ -430,7 +430,33 @@ class RandomMailDomainTests(unittest.TestCase):
 
         self.assertEqual(mailbox["provider"], "duckmail")
         self.assertTrue(mailbox["provider_failover"])
-        self.assertIn("随机域名均处于冷却", mailbox["provider_failover_from"][0])
+        self.assertIn("随机域名池已被上游永久拒绝", mailbox["provider_failover_from"][0])
+
+    def test_tempmail_does_not_half_open_a_permanently_rejected_only_pool(self):
+        rejected = {
+            "provider": "tempmail_lol",
+            "provider_ref": "tempmail_lol#1",
+            "address": "old@blocked.test",
+            "domain_family": "blocked.test",
+            "random_domain": True,
+        }
+        for _ in range(3):
+            mail_provider.mark_mailbox_result(
+                rejected,
+                success=False,
+                error="account_creation_failed",
+            )
+
+        provider = self._tempmail(random_domain_attempts=2)
+        provider._request = lambda *args, **kwargs: {
+            "address": "new@blocked.test",
+            "token": "blocked-token",
+        }
+        try:
+            with self.assertRaisesRegex(RuntimeError, "随机域名池已被上游永久拒绝"):
+                provider.create_mailbox()
+        finally:
+            provider.close()
 
 if __name__ == "__main__":
     unittest.main()

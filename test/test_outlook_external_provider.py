@@ -162,6 +162,47 @@ class OutlookExternalProviderTests(unittest.TestCase):
         self.assertTrue(mailbox["preflight_checked"])
         self.assertEqual(mailbox["preflight_skipped"], 1)
 
+    def test_outlook_default_preflight_reaches_a_readable_account_after_ten_stale_accounts(self):
+        provider = self._outlook_external(realtime_preflight=True)
+        provider._list_accounts = lambda: [
+            {
+                "email": f"stale-{index:02d}@outlook.com",
+                "status": "active",
+                "last_refresh_status": "success",
+                "last_refresh_at": f"2026-07-20 12:{59 - index:02d}:00",
+            }
+            for index in range(10)
+        ] + [
+            {
+                "email": "readable@outlook.com",
+                "status": "active",
+                "last_refresh_status": "success",
+                "last_refresh_at": "2026-07-20 11:00:00",
+            }
+        ]
+        checked = []
+
+        def fake_request(method, path, **kwargs):
+            email = kwargs["params"]["email"]
+            checked.append(email)
+            if email.startswith("stale-"):
+                raise RuntimeError("all mailbox methods failed")
+            return {"success": True, "emails": []}
+
+        provider._request = fake_request
+        try:
+            with (
+                patch.object(mail_provider, "provider_index", 0),
+                patch.object(mail_provider, "_load_outlook_external_used", return_value=set()),
+            ):
+                mailbox = provider.create_mailbox()
+        finally:
+            provider.close()
+
+        self.assertEqual(len(checked), 11)
+        self.assertEqual(mailbox["address"], "readable@outlook.com")
+        self.assertEqual(mailbox["preflight_skipped"], 10)
+
     def test_outlook_realtime_preflight_falls_back_from_stale_healthy_to_unknown(self):
         provider = self._outlook_external(realtime_preflight=True, preflight_attempts=2)
         provider._list_accounts = lambda: [

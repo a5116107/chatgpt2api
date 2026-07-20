@@ -975,5 +975,56 @@ class RiskControlService:
 
 risk_control_service = RiskControlService()
 
+
+def record_runtime_risk(
+    backend: Any,
+    message: str,
+    *,
+    status_code: int | None = None,
+    code: str | None = None,
+    scope: str | None = None,
+    raw: dict[str, Any] | None = None,
+) -> None:
+    if backend is None:
+        return
+    proxy = str(getattr(backend, "proxy_url", "") or "")
+    account = getattr(backend, "account", {}) or {}
+    try:
+        risk_control_service.record_event(
+            code=code,
+            message=message,
+            scope=scope,
+            account=account,
+            proxy=proxy,
+            profile_id=str(account.get("runtime_profile_id") or ""),
+            status_code=status_code,
+            raw=raw or {},
+        )
+    except Exception:
+        pass
+    try:
+        from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+
+        report_dynamic_proxy_denial(
+            proxy,
+            target="chatgpt.com:443",
+            status_code=int(status_code or 0),
+            reason=code or "runtime_upstream_denial",
+            detail={"message": str(message or "")[:500], "raw": raw or {}},
+        )
+    except Exception:
+        pass
+
+
+def record_runtime_success(backend: Any) -> None:
+    if backend is None:
+        return
+    try:
+        proxy = str(getattr(backend, "proxy_url", "") or "")
+        if proxy:
+            risk_control_service.report_proxy_event(proxy, "success")
+    except Exception:
+        pass
+
 # PATCH_MARKER free_soft_revoked_capability_r8
 # PATCH_MARKER soft_image_capability_heal_r10

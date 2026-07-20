@@ -120,17 +120,12 @@ class FlareSolverrClearanceProvider:
 
         timeout = _coerce_timeout(timeout_sec)
         requested_proxy = normalize_proxy_url(proxy_url)
-        # Prefer same-egress proxy first (cf_clearance often IP-bound). If that fails
-        # (docker/glider path breaks FlareSolverr), fall back to direct browser path
-        # but still bind the returned bundle to the requested proxy for cache matching.
-        proxy_candidates: list[str] = []
-        if requested_proxy:
-            proxy_candidates.append(requested_proxy)
-        proxy_candidates.append("")
+        # cf_clearance is bound to the browser egress. A direct fallback cannot be
+        # reused by traffic that still exits through requested_proxy.
+        proxy_candidates = [requested_proxy] if requested_proxy else [""]
 
         endpoint = f"{self.flaresolverr_url}/v1"
         target_host = _host_from_url(target_url)
-        best: ClearanceBundle | None = None
         for candidate in proxy_candidates:
             payload: dict[str, object] = {
                 "cmd": "request.get",
@@ -157,7 +152,7 @@ class FlareSolverrClearanceProvider:
                 continue
             cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
             user_agent = str(solution.get("userAgent") or "").strip()
-            if not cookies:
+            if "cf_clearance" not in cookies:
                 continue
             bundle = ClearanceBundle(
                 target_host=target_host,
@@ -166,11 +161,8 @@ class FlareSolverrClearanceProvider:
                 cookies=cookies,
                 user_agent=user_agent,
             )
-            if "cf_clearance" in cookies:
-                return bundle
-            if best is None:
-                best = bundle
-        return best
+            return bundle
+        return None
 
     @staticmethod
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
