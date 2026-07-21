@@ -10,7 +10,12 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
-from services.register import mail_provider, openai_register, openai_signup_primitives
+from services.register import (
+    mail_provider,
+    openai_register,
+    openai_registration_policy,
+    openai_signup_primitives,
+)
 try:
     from services.register.openai_signup_compat.route_stats import summarize_route_stats, suggest_route_retirement
 except Exception:  # pragma: no cover
@@ -25,6 +30,8 @@ OUTLOOK_POOL_PREVIEW_LIMIT = 20
 OPENAI_REGISTER_CONFIG_FIELDS = (
     "mail",
     "proxy",
+    "proxy_session_ttl_seconds",
+    "proxy_region",
     "total",
     "threads",
     "max_attempts",
@@ -68,6 +75,12 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    cfg["proxy_session_ttl_seconds"], cfg["proxy_region"] = (
+        openai_registration_policy.normalize_proxy_settings(
+            cfg.get("proxy_session_ttl_seconds"),
+            cfg.get("proxy_region"),
+        )
+    )
     # Keep optional mail.proxy for mailbox/OTP isolation.
     # OpenAI register traffic still uses cfg["proxy"] / sticky egress.
     if isinstance(cfg.get("mail"), dict) and "proxy" in cfg["mail"]:

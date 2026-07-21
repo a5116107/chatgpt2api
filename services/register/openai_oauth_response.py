@@ -2,6 +2,36 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+
+_SENSITIVE_QUERY_KEYS = {
+    "code",
+    "state",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+}
+
+
+def redact_url_secrets(value: str) -> str:
+    """Redact one-time OAuth values before a URL enters logs or diagnostics."""
+    raw = str(value or "")
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw[:300]
+    if not parsed.query:
+        return raw[:300]
+    query = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() in _SENSITIVE_QUERY_KEYS:
+            item = f"[REDACTED:{len(item)}]"
+        query.append((key, item))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))[:300]
 
 
 def response_json(response: Any) -> dict[str, Any]:
@@ -17,7 +47,7 @@ def response_debug_detail(response: Any, limit: int = 800) -> str:
         return ""
     payload = response_json(response)
     parts = [
-        f"url={str(getattr(response, 'url', '') or '')[:300]}",
+        f"url={redact_url_secrets(str(getattr(response, 'url', '') or ''))}",
         f"content_type={str(getattr(response, 'headers', {}).get('content-type') or '')}",
     ]
     for key in ("cf-ray", "x-request-id", "openai-processing-ms"):
@@ -30,6 +60,16 @@ def response_debug_detail(response: Any, limit: int = 800) -> str:
         else f"body={str(getattr(response, 'text', '') or '')[:limit]}"
     )
     return ", ".join(parts)
+
+
+def cloudflare_block_message(
+    response: Any,
+    prefix: str = "被 Cloudflare 拦截",
+    reason: str = "",
+) -> str:
+    status = getattr(response, "status_code", "unknown")
+    detail = reason or "clearance 刷新失败或重试后仍失败，请更换 IP/代理重试"
+    return f"{prefix}，{detail}: status={status}, {response_debug_detail(response)}"
 
 
 def is_cloudflare_challenge(response: Any) -> bool:

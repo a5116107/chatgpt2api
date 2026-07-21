@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import re
+from typing import Any
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
 
 _RETRYABLE_REGISTRATION_MARKERS = (
     "invalid_state",
@@ -38,6 +43,81 @@ _DOMAIN_REJECTION_MARKERS = (
     "not supported",
 )
 _TLS_MARKERS = ("curl: (28)", "curl: (35)", "curl: (55)", "curl: (56)", "tls connect")
+_PROXY_TTL_RE = re.compile(r"-ttl-(?P<seconds>\d+)$", flags=re.IGNORECASE)
+_PROXY_REGION_RE = re.compile(
+    r"-(?P<kind>country|region)-RAND(?=-sid-|$)",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_proxy_settings(lease_seconds: Any, region: Any) -> tuple[int, str]:
+    try:
+        normalized_lease = min(3600, max(60, int(lease_seconds or 900)))
+    except (TypeError, ValueError, OverflowError):
+        normalized_lease = 900
+    return normalized_lease, str(region or "").strip().upper()
+
+
+def normalize_registration_proxy(
+    proxy: str,
+    *,
+    region: str = "",
+    lease_seconds: int = 900,
+) -> str:
+    """Return a proxy URL with a stable region and sufficient session lease."""
+    candidate = str(proxy or "").strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate if "://" in candidate else f"http://{candidate}")
+    except ValueError:
+        return candidate
+    if not parsed.username:
+        return candidate
+
+    username = unquote(parsed.username)
+    normalized_region = str(region or "").strip()
+    if normalized_region:
+        username = _PROXY_REGION_RE.sub(
+            lambda match: f"-{match.group('kind')}-{normalized_region}",
+            username,
+            count=1,
+        )
+    bounded_lease = max(60, min(3600, int(lease_seconds)))
+    username = _PROXY_TTL_RE.sub(
+        lambda match: f"-ttl-{max(bounded_lease, int(match.group('seconds')))}",
+        username,
+    )
+    if username == unquote(parsed.username):
+        return candidate
+
+    userinfo, separator, host_port = parsed.netloc.rpartition("@")
+    if not separator:
+        return candidate
+    _, password_separator, encoded_password = userinfo.partition(":")
+    encoded_userinfo = quote(username, safe="")
+    if password_separator:
+        encoded_userinfo = f"{encoded_userinfo}:{encoded_password}"
+    rebuilt = urlunsplit(
+        (parsed.scheme, f"{encoded_userinfo}@{host_port}", parsed.path, parsed.query, parsed.fragment)
+    )
+    return rebuilt if "://" in candidate else rebuilt.removeprefix("http://")
+
+
+def clearance_target_url(value: str) -> str:
+    """Keep the challenged origin and path while dropping one-time query values."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+
+
+def short_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
 
 
 def is_retryable_registration_error(error: Exception | str) -> bool:

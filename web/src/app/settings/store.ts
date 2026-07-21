@@ -328,6 +328,8 @@ type SettingsStore = {
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
   setRegisterProxy: (value: string) => void;
+  setRegisterProxySessionTtl: (value: string) => void;
+  setRegisterProxyRegion: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterMaxAttempts: (value: string) => void;
@@ -896,6 +898,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
   },
 
+  setRegisterProxySessionTtl: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_session_ttl_seconds: Number(value) || 0 } } : {});
+  },
+
+  setRegisterProxyRegion: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_region: value.toUpperCase() } } : {});
+  },
+
   setRegisterTotal: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
   },
@@ -977,6 +987,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const data = await updateRegisterConfig({
         mail: registerConfig.mail,
         proxy: registerConfig.proxy.trim(),
+        proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+        proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
         max_attempts: Math.min(20, Math.max(1, Number(registerConfig.max_attempts) || 6)),
@@ -1003,6 +1015,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         await updateRegisterConfig({
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
+          proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+          proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),
           max_attempts: Math.min(20, Math.max(1, Number(registerConfig.max_attempts) || 6)),

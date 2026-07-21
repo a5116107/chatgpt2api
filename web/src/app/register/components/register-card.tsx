@@ -20,11 +20,35 @@ import { mailProviderDefaults, mailProviderOptions } from "./mail-provider-catal
 import { OutlookExternalProviderFields } from "./outlook-external-provider-fields";
 import { RandomDomainProviderFields } from "./random-domain-provider-fields";
 
+function RegisterProxyFields({ disabled }: { disabled: boolean }) {
+  const config = useSettingsStore((state) => state.registerConfig);
+  const setProxy = useSettingsStore((state) => state.setRegisterProxy);
+  const setSessionTtl = useSettingsStore((state) => state.setRegisterProxySessionTtl);
+  const setRegion = useSettingsStore((state) => state.setRegisterProxyRegion);
+
+  if (!config) return null;
+  return (
+    <>
+      <div className="space-y-2">
+        <label className="text-sm text-stone-700">注册代理</label>
+        <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={disabled} />
+      </div>
+      <div className="space-y-2">
+        <label className="text-sm text-stone-700">代理会话租期（秒）</label>
+        <Input value={String(config.proxy_session_ttl_seconds || 900)} onChange={(event) => setSessionTtl(event.target.value)} min={60} max={3600} type="number" className="h-10 rounded-xl border-stone-200 bg-white" disabled={disabled} />
+      </div>
+      <div className="space-y-2">
+        <label className="text-sm text-stone-700">代理区域</label>
+        <Input value={config.proxy_region || ""} onChange={(event) => setRegion(event.target.value)} placeholder="SG；留空沿用代理配置" className="h-10 rounded-xl border-stone-200 bg-white" disabled={disabled} />
+      </div>
+    </>
+  );
+}
+
 export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
-  const setProxy = useSettingsStore((state) => state.setRegisterProxy);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
   const setMaxAttempts = useSettingsStore((state) => state.setRegisterMaxAttempts);
@@ -120,10 +144,7 @@ export function RegisterCard() {
               <label className="text-sm text-stone-700">单账号最大尝试次数</label>
               <Input value={String(config.max_attempts || 6)} onChange={(event) => setMaxAttempts(event.target.value)} min={1} max={20} type="number" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
             </div>
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-            </div>
+            <RegisterProxyFields disabled={config.enabled} />
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>
               <Input value={String(config.target_quota || "")} onChange={(event) => setTargetQuota(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode !== "quota"} />

@@ -476,6 +476,8 @@ export type RegisterConfig = {
     providers: RegisterMailProvider[];
   };
   proxy: string;
+  proxy_session_ttl_seconds: number;
+  proxy_region: string;
   total: number;
   threads: number;
   max_attempts: number;

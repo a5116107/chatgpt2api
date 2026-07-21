@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from urllib.parse import unquote, urlparse
 from unittest.mock import Mock, patch
 
 from curl_cffi.const import CurlHttpVersion
@@ -117,6 +118,18 @@ class OpenAiSignupPrimitiveTests(unittest.TestCase):
                 response,
                 expected_state="expected",
             )
+
+    def test_debug_url_redacts_oauth_query_values(self):
+        response = FakeResponse(
+            url="https://platform.openai.com/auth/callback?code=secret-code&state=secret-state&scope=openid"
+        )
+
+        detail = openai_signup_primitives.response_debug_detail(response)
+
+        self.assertNotIn("secret-code", detail)
+        self.assertNotIn("secret-state", detail)
+        self.assertIn("code=%5BREDACTED%3A11%5D", detail)
+        self.assertIn("state=%5BREDACTED%3A12%5D", detail)
 
 
 class SentinelTransportRecoveryTests(unittest.TestCase):
@@ -333,11 +346,68 @@ class PlatformRegistrationStateMachineTests(unittest.TestCase):
             )
 
         registrar._refresh_cloudflare_clearance.assert_called_once_with(
-            "https://platform.openai.com/",
+            callback_url,
             1,
+            stage="oauth_continue",
         )
         self.assertEqual(callback["code"], "durable-code")
         self.assertEqual(session.request.call_count, 2)
+
+    def test_registration_proxy_uses_fixed_region_and_long_lease(self):
+        proxy = "http://ACCESS-country-RAND-sid-old-ttl-60:SECRET@socks.example.test:8080"
+        with patch.dict(
+            openai_register.config,
+            {"proxy_region": "SG", "proxy_session_ttl_seconds": 900},
+            clear=False,
+        ):
+            normalized = openai_register._normalize_registration_proxy(proxy)
+
+        parsed = urlparse(normalized)
+        self.assertEqual(
+            unquote(parsed.username or ""),
+            "ACCESS-country-SG-sid-old-ttl-900",
+        )
+        self.assertEqual(parsed.password, "SECRET")
+
+        preserved = openai_register._normalize_registration_proxy(
+            "http://ACCESS-country-US-sid-old-ttl-1800:SECRET@socks.example.test:8080"
+        )
+        self.assertEqual(unquote(urlparse(preserved).username or ""), "ACCESS-country-US-sid-old-ttl-1800")
+
+    def test_clearance_target_drops_oauth_query(self):
+        target = openai_register._clearance_target_url(
+            "https://platform.openai.com/auth/callback?code=secret&state=state"
+        )
+
+        self.assertEqual(target, "https://platform.openai.com/auth/callback")
+
+    def test_refresh_clearance_uses_effective_proxy_and_path_only(self):
+        session = Mock()
+        session.headers = {}
+        registrar = self.registrar(session)
+        registrar.proxy = "http://ACCESS:SECRET@socks.example.test:8080"
+        registrar.egress_proxy = registrar.proxy
+        registrar.runtime_profile = {"id": "profile-id"}
+        bundle = openai_register.ClearanceBundle(
+            target_host="platform.openai.com",
+            proxy_url=registrar.proxy,
+            cookies={"cf_clearance": "cookie"},
+            user_agent="ua",
+        )
+        profile = Mock(clearance_enabled=True)
+
+        with (
+            patch.object(openai_register.proxy_settings, "get_profile", return_value=profile),
+            patch.object(openai_register.proxy_settings, "refresh_clearance", return_value=bundle) as refresh,
+        ):
+            registrar._refresh_cloudflare_clearance(
+                "https://platform.openai.com/auth/callback?code=secret&state=state",
+                1,
+                stage="oauth_continue",
+            )
+
+        self.assertEqual(refresh.call_args.kwargs["target_url"], "https://platform.openai.com/auth/callback")
+        self.assertEqual(refresh.call_args.kwargs["proxy"], registrar.proxy)
 
     def test_register_executes_complete_oauth_state_machine_and_persists_metadata(self):
         registrar = self.registrar(Mock())
