@@ -477,6 +477,7 @@ export type RegisterConfig = {
   };
   proxy: string;
   proxy_session_ttl_seconds: number;
+  proxy_ttl_unit: "seconds" | "minutes";
   proxy_region: string;
   total: number;
   threads: number;

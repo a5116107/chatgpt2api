@@ -24,6 +24,7 @@ function RegisterProxyFields({ disabled }: { disabled: boolean }) {
   const config = useSettingsStore((state) => state.registerConfig);
   const setProxy = useSettingsStore((state) => state.setRegisterProxy);
   const setSessionTtl = useSettingsStore((state) => state.setRegisterProxySessionTtl);
+  const setTtlUnit = useSettingsStore((state) => state.setRegisterProxyTtlUnit);
   const setRegion = useSettingsStore((state) => state.setRegisterProxyRegion);
 
   if (!config) return null;
@@ -36,6 +37,16 @@ function RegisterProxyFields({ disabled }: { disabled: boolean }) {
       <div className="space-y-2">
         <label className="text-sm text-stone-700">代理会话租期（秒）</label>
         <Input value={String(config.proxy_session_ttl_seconds || 900)} onChange={(event) => setSessionTtl(event.target.value)} min={60} max={3600} type="number" className="h-10 rounded-xl border-stone-200 bg-white" disabled={disabled} />
+      </div>
+      <div className="space-y-2">
+        <label className="text-sm text-stone-700">代理 TTL 单位</label>
+        <Select value={config.proxy_ttl_unit || "seconds"} onValueChange={(value) => setTtlUnit(value as "seconds" | "minutes")} disabled={disabled}>
+          <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="seconds">秒（旧动态代理）</SelectItem>
+            <SelectItem value="minutes">分钟（socks.acom.work）</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
       <div className="space-y-2">
         <label className="text-sm text-stone-700">代理区域</label>

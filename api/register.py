@@ -16,6 +16,7 @@ class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
     proxy_session_ttl_seconds: int | None = Field(default=None, ge=60, le=3600)
+    proxy_ttl_unit: str | None = None
     proxy_region: str | None = None
     total: int | None = None
     threads: int | None = None

@@ -50,12 +50,20 @@ _PROXY_REGION_RE = re.compile(
 )
 
 
-def normalize_proxy_settings(lease_seconds: Any, region: Any) -> tuple[int, str]:
+def normalize_proxy_settings(
+    lease_seconds: Any,
+    region: Any,
+    ttl_unit: Any = "seconds",
+) -> tuple[int, str, str]:
+    """Normalize proxy lease settings while retaining legacy second-based config."""
     try:
         normalized_lease = min(3600, max(60, int(lease_seconds or 900)))
     except (TypeError, ValueError, OverflowError):
         normalized_lease = 900
-    return normalized_lease, str(region or "").strip().upper()
+    normalized_unit = str(ttl_unit or "seconds").strip().lower()
+    if normalized_unit not in {"seconds", "minutes"}:
+        normalized_unit = "seconds"
+    return normalized_lease, str(region or "").strip().upper(), normalized_unit
 
 
 def normalize_registration_proxy(
@@ -63,6 +71,7 @@ def normalize_registration_proxy(
     *,
     region: str = "",
     lease_seconds: int = 900,
+    ttl_unit: str = "seconds",
 ) -> str:
     """Return a proxy URL with a stable region and sufficient session lease."""
     candidate = str(proxy or "").strip()
@@ -84,10 +93,17 @@ def normalize_registration_proxy(
             count=1,
         )
     bounded_lease = max(60, min(3600, int(lease_seconds)))
-    username = _PROXY_TTL_RE.sub(
-        lambda match: f"-ttl-{max(bounded_lease, int(match.group('seconds')))}",
-        username,
-    )
+    normalized_unit = str(ttl_unit or "seconds").strip().lower()
+    if normalized_unit == "minutes":
+        # Gateway v2 accepts ttl in whole minutes. Replace an existing legacy
+        # seconds value instead of preserving it as an accidental 900-minute lease.
+        ttl_value = max(1, min(120, (bounded_lease + 59) // 60))
+        username = _PROXY_TTL_RE.sub(lambda _match: f"-ttl-{ttl_value}", username)
+    else:
+        username = _PROXY_TTL_RE.sub(
+            lambda match: f"-ttl-{max(bounded_lease, int(match.group('seconds')))}",
+            username,
+        )
     if username == unquote(parsed.username):
         return candidate
 

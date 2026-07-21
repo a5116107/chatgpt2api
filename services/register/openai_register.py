@@ -35,6 +35,7 @@ config = {
     },
     "proxy": "",
     "proxy_session_ttl_seconds": 900,
+    "proxy_ttl_unit": "seconds",
     "proxy_region": "SG",
     "total": 10,
     "threads": 3,
@@ -50,6 +51,7 @@ try:
                 "mail",
                 "proxy",
                 "proxy_session_ttl_seconds",
+                "proxy_ttl_unit",
                 "proxy_region",
                 "total",
                 "threads",
@@ -236,6 +238,7 @@ def _normalize_registration_proxy(proxy: str) -> str:
         proxy,
         region=str(config.get("proxy_region") or ""),
         lease_seconds=lease_seconds,
+        ttl_unit=str(config.get("proxy_ttl_unit") or "seconds"),
     )
 
 

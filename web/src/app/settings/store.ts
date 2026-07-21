@@ -329,6 +329,7 @@ type SettingsStore = {
   setRegisterConfig: (config: RegisterConfig) => void;
   setRegisterProxy: (value: string) => void;
   setRegisterProxySessionTtl: (value: string) => void;
+  setRegisterProxyTtlUnit: (value: "seconds" | "minutes") => void;
   setRegisterProxyRegion: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
@@ -902,6 +903,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_session_ttl_seconds: Number(value) || 0 } } : {});
   },
 
+  setRegisterProxyTtlUnit: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_ttl_unit: value } } : {});
+  },
+
   setRegisterProxyRegion: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_region: value.toUpperCase() } } : {});
   },
@@ -988,6 +993,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         mail: registerConfig.mail,
         proxy: registerConfig.proxy.trim(),
         proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+        proxy_ttl_unit: registerConfig.proxy_ttl_unit === "minutes" ? "minutes" : "seconds",
         proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
@@ -1016,6 +1022,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
           proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+          proxy_ttl_unit: registerConfig.proxy_ttl_unit === "minutes" ? "minutes" : "seconds",
           proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),

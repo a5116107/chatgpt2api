@@ -31,6 +31,7 @@ OPENAI_REGISTER_CONFIG_FIELDS = (
     "mail",
     "proxy",
     "proxy_session_ttl_seconds",
+    "proxy_ttl_unit",
     "proxy_region",
     "total",
     "threads",
@@ -75,10 +76,15 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    cfg["proxy_session_ttl_seconds"], cfg["proxy_region"] = (
+    (
+        cfg["proxy_session_ttl_seconds"],
+        cfg["proxy_region"],
+        cfg["proxy_ttl_unit"],
+    ) = (
         openai_registration_policy.normalize_proxy_settings(
             cfg.get("proxy_session_ttl_seconds"),
             cfg.get("proxy_region"),
+            cfg.get("proxy_ttl_unit"),
         )
     )
     # Keep optional mail.proxy for mailbox/OTP isolation.

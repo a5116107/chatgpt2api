@@ -374,6 +374,34 @@ class PlatformRegistrationStateMachineTests(unittest.TestCase):
         )
         self.assertEqual(unquote(urlparse(preserved).username or ""), "ACCESS-country-US-sid-old-ttl-1800")
 
+    def test_registration_proxy_converts_second_lease_for_minute_gateway(self):
+        proxy = "http://ACCESS-country-RAND-sid-old-ttl-900:SECRET@socks.example.test:1080"
+        with patch.dict(
+            openai_register.config,
+            {
+                "proxy_region": "RAND",
+                "proxy_session_ttl_seconds": 900,
+                "proxy_ttl_unit": "minutes",
+            },
+            clear=False,
+        ):
+            normalized = openai_register._normalize_registration_proxy(proxy)
+
+        self.assertEqual(
+            unquote(urlparse(normalized).username or ""),
+            "ACCESS-country-RAND-sid-old-ttl-15",
+        )
+
+    def test_proxy_ttl_unit_defaults_to_legacy_seconds_for_invalid_values(self):
+        self.assertEqual(
+            openai_register.openai_registration_policy.normalize_proxy_settings(900, "sg", "invalid"),
+            (900, "SG", "seconds"),
+        )
+        self.assertEqual(
+            openai_register.openai_registration_policy.normalize_proxy_settings(900, "rand", "minutes"),
+            (900, "RAND", "minutes"),
+        )
+
     def test_clearance_target_drops_oauth_query(self):
         target = openai_register._clearance_target_url(
             "https://platform.openai.com/auth/callback?code=secret&state=state"
