@@ -2524,18 +2524,46 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
 def mailbox_retry_excluded_domains(
     mailbox: dict | None,
     error: Exception | str | None,
+    *,
+    job_domain_failure_counts: dict[str, int] | None = None,
 ) -> set[str]:
-    """Return random-domain scopes to avoid for the rest of one registration job."""
+    """Return random-domain scopes to avoid for the rest of one registration job.
+
+    A domain with prior success gets one fresh-mailbox retry for a generic account
+    creation failure. Strong domain rejection signals are excluded immediately.
+    """
     if not isinstance(mailbox, dict) or not mailbox.get("random_domain"):
         return set()
-    if not random_mail_domain_health.registration_domain_penalty_reason(error):
+    penalty_reason = random_mail_domain_health.registration_domain_penalty_reason(error)
+    if not penalty_reason:
         return set()
     domains = {
         str(mailbox.get("domain") or "").strip().lower().lstrip("@"),
         str(mailbox.get("domain_family") or "").strip().lower().lstrip("@"),
         _email_domain(str(mailbox.get("address") or "")),
     }
-    return {domain for domain in domains if domain}
+    domains = {domain for domain in domains if domain}
+    if penalty_reason != "account_creation_failed" or job_domain_failure_counts is None:
+        return domains
+
+    provider = str(mailbox.get("provider") or "").strip().lower()
+    provider_ref = str(mailbox.get("provider_ref") or "").strip()
+    domain_family = str(mailbox.get("domain_family") or "").strip().lower().lstrip("@")
+    if not domain_family:
+        domain_family = _email_domain(str(mailbox.get("address") or ""))
+    failure_key = "|".join((provider, provider_ref.lower(), domain_family))
+    failure_count = int(job_domain_failure_counts.get(failure_key) or 0) + 1
+    job_domain_failure_counts[failure_key] = failure_count
+    if (
+        failure_count < random_mail_domain_health.GENERIC_DOMAIN_FAILURE_THRESHOLD
+        and random_mail_domain_health.random_mail_domain_has_success(
+            provider,
+            provider_ref,
+            domain_family,
+        )
+    ):
+        return set()
+    return domains
 
 
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:

@@ -1101,6 +1101,7 @@ def worker(index: int) -> dict:
     start = time.time()
     last_error: Exception | None = None
     excluded_mail_domains: set[str] = set()
+    job_mail_domain_failure_counts: dict[str, int] = {}
     max_attempts = openai_signup_primitives.registration_max_attempts(
         config.get("max_attempts")
     )
@@ -1206,6 +1207,7 @@ def worker(index: int) -> dict:
                 retry_exclusions = mail_provider.mailbox_retry_excluded_domains(
                     getattr(registrar, "mailbox", None),
                     e,
+                    job_domain_failure_counts=job_mail_domain_failure_counts,
                 )
                 new_exclusions = retry_exclusions - excluded_mail_domains
                 if new_exclusions:
@@ -1214,6 +1216,23 @@ def worker(index: int) -> dict:
                         index,
                         "本任务后续尝试将避让邮箱域名："
                         + ",".join(sorted(new_exclusions)),
+                        "yellow",
+                    )
+                elif (
+                    mail_provider.random_mail_domain_health.registration_domain_penalty_reason(e)
+                    == "account_creation_failed"
+                    and isinstance(getattr(registrar, "mailbox", None), dict)
+                    and registrar.mailbox.get("random_domain")
+                ):
+                    domain = str(
+                        registrar.mailbox.get("domain_family")
+                        or registrar.mailbox.get("domain")
+                        or ""
+                    ).strip()
+                    step(
+                        index,
+                        "邮箱域名有成功历史，普通创建失败先换邮箱/会话复试一次"
+                        + (f"：{domain}" if domain else ""),
                         "yellow",
                     )
                 retry_delay = openai_signup_primitives.registration_retry_delay_seconds(

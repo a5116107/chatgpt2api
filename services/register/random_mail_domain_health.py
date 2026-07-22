@@ -100,6 +100,26 @@ def random_mail_domain_is_cooling(provider: str, provider_ref: str, domain_famil
     return True
 
 
+def random_mail_domain_has_success(
+    provider: str,
+    provider_ref: str,
+    domain_family: str,
+) -> bool:
+    """Return whether a domain family has ever completed registration."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_family = str(domain_family or "").strip().lower()
+    if not normalized_provider or not normalized_family:
+        return False
+    with _health_file_lock:
+        matching_entries = _matching_health_entries(
+            RANDOM_MAIL_DOMAIN_HEALTH_FILE,
+            provider=normalized_provider,
+            provider_ref=provider_ref,
+            domain_family=normalized_family,
+        )
+    return _has_success(matching_entries)
+
+
 def random_mail_domain_is_permanently_rejected(
     provider: str,
     provider_ref: str,

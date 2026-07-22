@@ -107,6 +107,50 @@ class RandomMailDomainTests(unittest.TestCase):
         self.assertEqual(mailbox["address"], "second@c.healthy.test")
         self.assertEqual(mailbox["domain_health_skipped"], ["b.blocked.test"])
 
+    def test_successful_domain_gets_one_generic_failure_retry_before_job_exclusion(self):
+        mailbox = {
+            "provider": "dropmail",
+            "provider_ref": "dropmail#3",
+            "address": "first@preferred.test",
+            "domain": "preferred.test",
+            "domain_family": "preferred.test",
+            "random_domain": True,
+        }
+        mail_provider.mark_mailbox_result(mailbox, success=True)
+        failures: dict[str, int] = {}
+
+        first = mail_provider.mailbox_retry_excluded_domains(
+            mailbox,
+            "user_register_http_400: account_creation_failed",
+            job_domain_failure_counts=failures,
+        )
+        second = mail_provider.mailbox_retry_excluded_domains(
+            {**mailbox, "address": "second@preferred.test"},
+            "user_register_http_400: account_creation_failed",
+            job_domain_failure_counts=failures,
+        )
+
+        self.assertEqual(first, set())
+        self.assertEqual(second, {"preferred.test"})
+
+    def test_strong_domain_rejection_is_excluded_on_first_job_failure(self):
+        mailbox = {
+            "provider": "dropmail",
+            "provider_ref": "dropmail#3",
+            "address": "first@blocked.test",
+            "domain": "blocked.test",
+            "domain_family": "blocked.test",
+            "random_domain": True,
+        }
+
+        excluded = mail_provider.mailbox_retry_excluded_domains(
+            mailbox,
+            "create_account_http_400: unsupported_email",
+            job_domain_failure_counts={},
+        )
+
+        self.assertEqual(excluded, {"blocked.test"})
+
     def test_tempmail_half_opens_best_domain_when_every_family_is_cooling(self):
         preferred = {
             "provider": "tempmail_lol",
