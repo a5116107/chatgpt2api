@@ -14,6 +14,7 @@ RANDOM_MAIL_DOMAIN_HALF_OPEN_MIN_FAMILIES = 2
 GENERIC_DOMAIN_FAILURE_THRESHOLD = 2
 RANDOM_MAIL_DOMAIN_PERMANENT_FAILURE_THRESHOLD = 3
 RANDOM_MAIL_DOMAIN_PERMANENT_STRONG_FAILURE_THRESHOLD = 2
+RANDOM_MAIL_PROVIDER_UNPROVEN_FAILURE_THRESHOLD = 3
 
 _STRONG_DOMAIN_FAILURE_REASONS = {
     "domain_abuse_suspected",
@@ -118,6 +119,39 @@ def random_mail_domain_has_success(
             domain_family=normalized_family,
         )
     return _has_success(matching_entries)
+
+
+def random_mail_provider_health_state(
+    provider: str,
+    provider_ref: str,
+    *,
+    unproven_failure_threshold: int = RANDOM_MAIL_PROVIDER_UNPROVEN_FAILURE_THRESHOLD,
+) -> str:
+    """Classify a random-domain provider without exposing individual domains.
+
+    This is intentionally provider-scoped: domain circuit breakers still decide
+    whether a specific family may be used, while routing can prefer providers
+    that have demonstrated at least one successful registration.
+    """
+    normalized_provider = str(provider or "").strip().lower()
+    if not normalized_provider:
+        return "unknown"
+    threshold = bounded_provider_integer(unproven_failure_threshold, 3, 1, 100)
+    with _health_file_lock:
+        entries = _matching_health_entries(
+            RANDOM_MAIL_DOMAIN_HEALTH_FILE,
+            provider=normalized_provider,
+            provider_ref=provider_ref,
+        )
+    success_count = sum(int(entry.get("success_count") or 0) for entry in entries)
+    failure_count = sum(int(entry.get("failure_count") or 0) for entry in entries)
+    if success_count:
+        return "proven"
+    if failure_count >= threshold:
+        return "unproven_failed"
+    if failure_count:
+        return "unproven"
+    return "unknown"
 
 
 def random_mail_domain_is_permanently_rejected(

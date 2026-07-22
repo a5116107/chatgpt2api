@@ -2313,6 +2313,58 @@ def _enabled_entries(mail_config: dict) -> list[dict]:
     return items
 
 
+def _provider_routing_config(mail_config: dict) -> tuple[bool, int]:
+    raw = mail_config.get("provider_routing")
+    routing = raw if isinstance(raw, dict) else {}
+    enabled = str(routing.get("strategy") or "").strip().lower() == "success_preferred"
+    threshold = random_mail_domain_health.bounded_provider_integer(
+        routing.get("unproven_failure_threshold"),
+        random_mail_domain_health.RANDOM_MAIL_PROVIDER_UNPROVEN_FAILURE_THRESHOLD,
+        1,
+        100,
+    )
+    return enabled, threshold
+
+
+def _provider_routing_rank(entry: dict, *, unproven_failure_threshold: int) -> int:
+    provider_type = str(entry.get("type") or "").strip().lower()
+    if provider_type not in {"tempmail_lol", "dropmail"}:
+        return 0
+    state = random_mail_domain_health.random_mail_provider_health_state(
+        provider_type,
+        str(entry.get("provider_ref") or ""),
+        unproven_failure_threshold=unproven_failure_threshold,
+    )
+    entry["provider_health_state"] = state
+    return {
+        "proven": 1,
+        "unknown": 2,
+        "unproven": 3,
+        "unproven_failed": 4,
+    }.get(state, 2)
+
+
+def _provider_attempt_order(mail_config: dict, items: list[dict]) -> list[dict]:
+    success_preferred, threshold = _provider_routing_config(mail_config)
+    if not success_preferred:
+        global provider_index
+        with provider_lock:
+            start_idx = provider_index % len(items)
+            provider_index = (provider_index + 1) % len(items)
+        return items[start_idx:] + items[:start_idx]
+    ranked: list[tuple[int, int, dict]] = []
+    for position, item in enumerate(items):
+        entry = dict(item)
+        ranked.append(
+            (
+                _provider_routing_rank(entry, unproven_failure_threshold=threshold),
+                position,
+                entry,
+            )
+        )
+    return [item for _, _, item in sorted(ranked, key=lambda value: value[:2])]
+
+
 # PATCH_MARKER denied_domains_filter_r32
 def _email_domain(address: str) -> str:
     value = str(address or "").strip().lower()
@@ -2449,11 +2501,7 @@ def create_mailbox(
         if str(domain or "").strip()
     }
     denied = configured_denied | retry_excluded
-    global provider_index
-    with provider_lock:
-        start_idx = provider_index % len(enabled)
-        provider_index = (provider_index + 1) % len(enabled)
-    order = enabled[start_idx:] + enabled[:start_idx]
+    order = _provider_attempt_order(mail_config, enabled)
 
     tried: set[str] = set()
     errors: list[str] = []

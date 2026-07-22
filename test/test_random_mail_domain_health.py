@@ -51,6 +51,63 @@ class RandomMailDomainTests(unittest.TestCase):
         self.assertEqual(mailbox["domain_family"], "example.com")
         self.assertEqual(mailbox["label"], "tempmail_lol:r1.example.com")
 
+    def test_success_preferred_provider_routing_keeps_unproven_provider_as_last_fallback(self):
+        tempmail = {
+            "provider": "tempmail_lol",
+            "provider_ref": "tempmail_lol#2",
+            "address": "old@failed.test",
+            "domain_family": "failed.test",
+            "random_domain": True,
+        }
+        for _ in range(3):
+            mail_provider.mark_mailbox_result(
+                tempmail,
+                success=False,
+                error="account_creation_failed",
+            )
+        mail_provider.mark_mailbox_result(
+            {
+                "provider": "dropmail",
+                "provider_ref": "dropmail#3",
+                "address": "known@good.test",
+                "domain_family": "good.test",
+                "random_domain": True,
+            },
+            success=True,
+        )
+
+        config = {
+            "provider_routing": {
+                "strategy": "success_preferred",
+                "unproven_failure_threshold": 3,
+            },
+            "providers": [
+                {"type": "outlook_external", "enable": True},
+                {"type": "tempmail_lol", "enable": True},
+                {"type": "dropmail", "enable": True},
+            ],
+        }
+
+        order = mail_provider._provider_attempt_order(config, mail_provider._enabled_entries(config))
+
+        self.assertEqual(
+            [entry["type"] for entry in order],
+            ["outlook_external", "dropmail", "tempmail_lol"],
+        )
+        self.assertEqual(order[-1]["provider_health_state"], "unproven_failed")
+
+    def test_provider_routing_without_strategy_preserves_round_robin(self):
+        config = {
+            "providers": [
+                {"type": "tempmail_lol", "enable": True},
+                {"type": "dropmail", "enable": True},
+            ]
+        }
+        with patch.object(mail_provider, "provider_index", 1):
+            order = mail_provider._provider_attempt_order(config, mail_provider._enabled_entries(config))
+
+        self.assertEqual([entry["type"] for entry in order], ["dropmail", "tempmail_lol"])
+
     def test_tempmail_retries_a_transport_failure(self):
         provider = self._tempmail()
         calls = 0
