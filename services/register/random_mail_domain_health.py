@@ -333,11 +333,11 @@ def registration_domain_penalty_reason(error: Exception | str | None) -> str:
         return ""
     markers = (
         ("unsupported_email", "unsupported_email"),
+        ("email you provided is not supported", "unsupported_email"),
         ("account_creation_failed", "account_creation_failed"),
         ("failed to create account", "account_creation_failed"),
         ("registration_disallowed", "registration_disallowed"),
         ("邮箱域名很可能因滥用被封禁", "domain_abuse_suspected"),
-        ("not supported", "unsupported_email"),
     )
     for marker, reason in markers:
         if marker in error_text:

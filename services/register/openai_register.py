@@ -246,8 +246,17 @@ _clearance_target_url = openai_registration_policy.clearance_target_url
 _short_hash = openai_registration_policy.short_hash
 
 
-def create_mailbox(username: str | None = None, proxy: str | None = None) -> dict:
-    return mail_provider.create_mailbox(_mail_config(proxy), username)
+def create_mailbox(
+    username: str | None = None,
+    proxy: str | None = None,
+    *,
+    excluded_domains: set[str] | None = None,
+) -> dict:
+    return mail_provider.create_mailbox(
+        _mail_config(proxy),
+        username,
+        excluded_domains=excluded_domains,
+    )
 
 
 def wait_for_code(mailbox: dict, proxy: str | None = None) -> str | None:
@@ -381,7 +390,17 @@ def request_platform_oauth_token(
 
 
 class PlatformRegistrar:
-    def __init__(self, proxy: str = "") -> None:
+    def __init__(
+        self,
+        proxy: str = "",
+        *,
+        excluded_mail_domains: set[str] | None = None,
+    ) -> None:
+        self.excluded_mail_domains = {
+            str(domain or "").strip().lower().lstrip("@")
+            for domain in (excluded_mail_domains or set())
+            if str(domain or "").strip()
+        }
         self.proxy = _normalize_registration_proxy(proxy)
         self.runtime_profile = runtime_profile_service.create_profile(
             {"proxy": self.proxy},
@@ -963,7 +982,10 @@ class PlatformRegistrar:
     def register(self, index: int) -> dict:
         mail_proxy = self._resolve_mail_proxy()
         step(index, f"开始创建邮箱（mail_proxy={'direct' if not mail_proxy else mail_proxy.split('@')[-1]}）")
-        mailbox = create_mailbox(proxy=mail_proxy)
+        mailbox = create_mailbox(
+            proxy=mail_proxy,
+            excluded_domains=getattr(self, "excluded_mail_domains", set()),
+        )
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -990,6 +1012,13 @@ class PlatformRegistrar:
         # PATCH_MARKER denied_domains_log_r32
         if isinstance(mailbox, dict) and mailbox.get("denied_domains_checked"):
             step(index, f"denied_domains 已生效: {','.join(mailbox.get('denied_domains_checked') or [])}", "yellow")
+        if isinstance(mailbox, dict) and mailbox.get("retry_excluded_domains_checked"):
+            step(
+                index,
+                "本任务邮箱域名避让已生效: "
+                + ",".join(mailbox.get("retry_excluded_domains_checked") or []),
+                "yellow",
+            )
         try:
             password = openai_signup_primitives.random_password()
             first_name, last_name = openai_signup_primitives.random_name()
@@ -1071,11 +1100,15 @@ class PlatformRegistrar:
 def worker(index: int) -> dict:
     start = time.time()
     last_error: Exception | None = None
+    excluded_mail_domains: set[str] = set()
     max_attempts = openai_signup_primitives.registration_max_attempts(
         config.get("max_attempts")
     )
     for attempt in range(1, max_attempts + 1):
-        registrar = PlatformRegistrar(config["proxy"])
+        registrar = PlatformRegistrar(
+            config["proxy"],
+            excluded_mail_domains=set(excluded_mail_domains),
+        )
         try:
             step(index, "任务启动" if attempt == 1 else f"任务重试启动（第 {attempt}/{max_attempts} 次）", "yellow" if attempt > 1 else "")
             result = registrar.register(index)
@@ -1170,6 +1203,19 @@ def worker(index: int) -> dict:
             except Exception:
                 pass
             if attempt < max_attempts and _is_retryable_registration_error(e):
+                retry_exclusions = mail_provider.mailbox_retry_excluded_domains(
+                    getattr(registrar, "mailbox", None),
+                    e,
+                )
+                new_exclusions = retry_exclusions - excluded_mail_domains
+                if new_exclusions:
+                    excluded_mail_domains.update(new_exclusions)
+                    step(
+                        index,
+                        "本任务后续尝试将避让邮箱域名："
+                        + ",".join(sorted(new_exclusions)),
+                        "yellow",
+                    )
                 retry_delay = openai_signup_primitives.registration_retry_delay_seconds(
                     e, attempt
                 )

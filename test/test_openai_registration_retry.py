@@ -570,6 +570,13 @@ class RegistrationRetryTests(unittest.TestCase):
     def test_registration_disallowed_creates_a_fresh_registrar_and_retries(self):
         rejected_registrar = Mock()
         rejected_registrar.runtime_profile = None
+        rejected_registrar.mailbox = {
+            "provider": "dropmail",
+            "address": "rejected@blocked.test",
+            "domain": "blocked.test",
+            "domain_family": "blocked.test",
+            "random_domain": True,
+        }
         rejected_registrar.register.side_effect = RuntimeError(
             "create_account: registration_disallowed"
         )
@@ -624,6 +631,14 @@ class RegistrationRetryTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["result"]["email"], "fresh@example.test")
         self.assertEqual(registrar_factory.call_count, 2)
+        self.assertEqual(
+            registrar_factory.call_args_list[0].kwargs["excluded_mail_domains"],
+            set(),
+        )
+        self.assertEqual(
+            registrar_factory.call_args_list[1].kwargs["excluded_mail_domains"],
+            {"blocked.test"},
+        )
         rejected_registrar.register.assert_called_once_with(1)
         successful_registrar.register.assert_called_once_with(1)
         accept_registered_account.assert_called_once_with("access-token")
@@ -634,7 +649,7 @@ class RegistrationRetryTests(unittest.TestCase):
     def test_worker_uses_configured_max_attempts_for_transient_failures(self):
         registrars = []
 
-        def registrar_factory(_proxy):
+        def registrar_factory(_proxy, **_kwargs):
             registrar = Mock()
             registrar.runtime_profile = None
             registrar.register.side_effect = RuntimeError(
@@ -670,6 +685,8 @@ class RegistrationRetryTests(unittest.TestCase):
         for registrar in registrars:
             registrar.register.assert_called_once_with(1)
             registrar.close.assert_called()
+        for call in factory.call_args_list:
+            self.assertEqual(call.kwargs["excluded_mail_domains"], set())
 
 
 if __name__ == "__main__":

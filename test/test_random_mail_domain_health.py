@@ -327,6 +327,23 @@ class RandomMailDomainTests(unittest.TestCase):
             )
         )
 
+    def test_country_not_supported_does_not_penalize_mail_domain(self):
+        mailbox = {
+            "provider": "dropmail",
+            "provider_ref": "dropmail#1",
+            "address": "user@healthy.test",
+            "domain_family": "healthy.test",
+            "random_domain": True,
+        }
+
+        mail_provider.mark_mailbox_result(
+            mailbox,
+            success=False,
+            error="unsupported_country_region_territory - Country, region, or territory not supported",
+        )
+
+        self.assertFalse(self.health_file.exists())
+
     def test_tempmail_cooling_domains_fail_over_before_half_open_when_another_provider_exists(self):
         for domain in ("first.test", "second.test"):
             mail_provider.mark_mailbox_result(

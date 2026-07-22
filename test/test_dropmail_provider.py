@@ -82,6 +82,58 @@ class DropMailProviderTests(unittest.TestCase):
         self.assertEqual(mailbox["domain_health_skipped"], ["blocked.test"])
         self.assertNotEqual(mailbox["domain"], "fixed.example")
 
+    def test_job_exclusion_skips_a_previously_successful_domain(self):
+        mail_provider.mark_mailbox_result(
+            {
+                "provider": "dropmail",
+                "provider_ref": "dropmail#1",
+                "address": "old@preferred.test",
+                "domain_family": "preferred.test",
+                "random_domain": True,
+            },
+            success=True,
+        )
+        config = {"providers": [{"type": "dropmail", "enable": True}]}
+
+        def fake_graphql(_provider, _token, query, variables=None, **_kwargs):
+            if "domains" in query:
+                return {
+                    "domains": [
+                        {"id": "preferred", "name": "preferred.test"},
+                        {"id": "backup", "name": "backup.test"},
+                    ]
+                }
+            self.assertEqual(variables["input"]["domainId"], "backup")
+            return {
+                "introduceSession": {
+                    "id": "session-backup",
+                    "addresses": [{"id": "address-backup", "address": "new@backup.test"}],
+                }
+            }
+
+        with (
+            patch.object(mail_provider, "provider_index", 0),
+            patch.object(
+                dropmail_provider.DropMailProvider,
+                "_generate_token",
+                return_value="dynamic-token",
+            ),
+            patch.object(
+                dropmail_provider.DropMailProvider,
+                "_graphql",
+                autospec=True,
+                side_effect=fake_graphql,
+            ),
+            patch.object(dropmail_provider.random, "shuffle", lambda values: None),
+        ):
+            mailbox = mail_provider.create_mailbox(
+                config,
+                excluded_domains={"preferred.test"},
+            )
+
+        self.assertEqual(mailbox["address"], "new@backup.test")
+        self.assertIn("preferred.test", mailbox["retry_excluded_domains_checked"])
+
     def test_dropmail_fetches_latest_message_for_the_created_address(self):
         provider = self._dropmail()
         provider._graphql = lambda *args, **kwargs: {

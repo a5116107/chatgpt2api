@@ -2423,7 +2423,12 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     return _instantiate_provider(entry, _config(mail_config))
 
 
-def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
+def create_mailbox(
+    mail_config: dict,
+    username: str | None = None,
+    *,
+    excluded_domains: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict:
     """Create a mailbox, rotating across enabled providers with failover.
 
     Strategy:
@@ -2437,7 +2442,13 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
     - if created address domain is denied, failover to next provider
     """
     enabled = _enabled_entries(mail_config)
-    denied = _denied_domains(mail_config)
+    configured_denied = _denied_domains(mail_config)
+    retry_excluded = {
+        str(domain or "").strip().lower().lstrip("@")
+        for domain in (excluded_domains or ())
+        if str(domain or "").strip()
+    }
+    denied = configured_denied | retry_excluded
     global provider_index
     with provider_lock:
         start_idx = provider_index % len(enabled)
@@ -2485,8 +2496,10 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
                     getattr(provider, "provider_ref", "") or mailbox.get("provider_ref") or str(entry.get("provider_ref") or ""),
                 )
                 mailbox.setdefault("label", str(entry.get("label") or mailbox.get("provider") or provider_type))
-                if denied:
-                    mailbox["denied_domains_checked"] = sorted(denied)
+                if configured_denied:
+                    mailbox["denied_domains_checked"] = sorted(configured_denied)
+                if retry_excluded:
+                    mailbox["retry_excluded_domains_checked"] = sorted(retry_excluded)
             return mailbox
         except Exception as error:  # noqa: BLE001
             last_error = str(error)
@@ -2506,6 +2519,23 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()
+
+
+def mailbox_retry_excluded_domains(
+    mailbox: dict | None,
+    error: Exception | str | None,
+) -> set[str]:
+    """Return random-domain scopes to avoid for the rest of one registration job."""
+    if not isinstance(mailbox, dict) or not mailbox.get("random_domain"):
+        return set()
+    if not random_mail_domain_health.registration_domain_penalty_reason(error):
+        return set()
+    domains = {
+        str(mailbox.get("domain") or "").strip().lower().lstrip("@"),
+        str(mailbox.get("domain_family") or "").strip().lower().lstrip("@"),
+        _email_domain(str(mailbox.get("address") or "")),
+    }
+    return {domain for domain in domains if domain}
 
 
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
