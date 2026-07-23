@@ -8,7 +8,7 @@ import random
 import re
 import string
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import (
     header as email_header,
     message_from_bytes,
@@ -33,6 +33,12 @@ OUTLOOK_TOKEN_USED_FILE = DATA_DIR / "outlook_token_used.json"
 _outlook_token_state_lock = Lock()
 OUTLOOK_EXTERNAL_DEFAULT_PREFLIGHT_ATTEMPTS = 20
 OUTLOOK_EXTERNAL_MAX_PREFLIGHT_ATTEMPTS = 100
+OUTLOOK_EXTERNAL_DEFAULT_OTP_WAIT_SECONDS = 120
+OUTLOOK_EXTERNAL_MIN_OTP_WAIT_SECONDS = 10
+OUTLOOK_EXTERNAL_MAX_OTP_WAIT_SECONDS = 120
+OUTLOOK_EXTERNAL_DEFAULT_OTP_POLL_INTERVAL = 3
+OUTLOOK_EXTERNAL_MIN_OTP_POLL_INTERVAL = 1
+OUTLOOK_EXTERNAL_MAX_OTP_POLL_INTERVAL = 15
 # in_use 超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {
@@ -2019,14 +2025,26 @@ class OutlookExternalApiProvider(BaseMailProvider):
       - 从 GET /api/external/accounts 取可用主邮箱
       - 优先使用已有 alias；否则生成 plus 别名 local+gptXXXX@domain
     wait_for_code:
-      - GET /api/external/emails?email=<requested>&folder=all&top=20
-      - 从 subject/body_preview 提取验证码
+      - 优先 GET /api/external/otp，由邮件服务端长轮询并提取验证码
+      - 不支持 OTP 路由或发生临时错误时，回退 /api/external/emails 列表轮询
     """
 
     name = "outlook_external"
 
     def __init__(self, entry: dict, conf: dict):
-        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        provider_conf = dict(conf)
+        # New Outlook entries can use a dedicated mail-service egress without
+        # changing the proxy used by TempMail, DropMail, or other providers.
+        provider_proxy = str(entry.get("proxy") or "").strip()
+        if provider_proxy:
+            provider_conf["proxy"] = provider_proxy
+        request_timeout = entry.get("request_timeout")
+        if request_timeout is not None:
+            try:
+                provider_conf["request_timeout"] = max(5.0, min(180.0, float(request_timeout)))
+            except (TypeError, ValueError):
+                pass
+        super().__init__(provider_conf, str(entry.get("provider_ref") or ""))
         self.label = str(entry.get("label") or self.provider_ref or self.name)
         self.api_base = str(entry.get("api_base") or entry.get("base_url") or "https://mail.acica.top").rstrip("/")
         self.api_key = str(entry.get("api_key") or entry.get("external_api_key") or "").strip()
@@ -2035,6 +2053,34 @@ class OutlookExternalApiProvider(BaseMailProvider):
         self.top = max(1, min(50, int(entry.get("top") or 20)))
         self.use_plus_alias = bool(entry.get("use_plus_alias", True))
         self.prefer_alias = bool(entry.get("prefer_alias", True))
+        self.server_otp_enabled = entry.get("server_otp_enabled", True) is not False
+        self.otp_path = str(entry.get("otp_path") or "/api/external/otp").strip()
+        if not self.otp_path.startswith("/"):
+            raise RuntimeError("outlook_external otp_path 必须以 / 开头")
+        self.otp_wait_seconds = self._bounded_int(
+            entry.get("otp_wait_seconds"),
+            default=OUTLOOK_EXTERNAL_DEFAULT_OTP_WAIT_SECONDS,
+            minimum=OUTLOOK_EXTERNAL_MIN_OTP_WAIT_SECONDS,
+            maximum=OUTLOOK_EXTERNAL_MAX_OTP_WAIT_SECONDS,
+        )
+        self.otp_poll_interval = self._bounded_int(
+            entry.get("otp_poll_interval"),
+            default=OUTLOOK_EXTERNAL_DEFAULT_OTP_POLL_INTERVAL,
+            minimum=OUTLOOK_EXTERNAL_MIN_OTP_POLL_INTERVAL,
+            maximum=OUTLOOK_EXTERNAL_MAX_OTP_POLL_INTERVAL,
+        )
+        self.otp_subject_contains = str(entry.get("otp_subject_contains") or "").strip()
+        self.otp_from_contains = str(entry.get("otp_from_contains", "openai") or "").strip()
+        self.otp_keyword = str(entry.get("otp_keyword") or "").strip()
+        self.otp_code_regex = str(
+            entry.get("otp_code_regex", r"(?<!\d)(\d{6})(?!\d)") or ""
+        ).strip()
+        # folder=all can spend additional time merging folders after the wait window.
+        long_poll_overhead = max(30.0, float(self.otp_wait_seconds) * 0.5)
+        self.otp_http_timeout = max(
+            float(self.conf["request_timeout"]),
+            float(self.otp_wait_seconds) + long_poll_overhead,
+        )
         self.realtime_preflight = bool(entry.get("realtime_preflight", True))
         self.preflight_attempts = max(
             1,
@@ -2048,37 +2094,56 @@ class OutlookExternalApiProvider(BaseMailProvider):
         )
         if not self.api_key:
             raise RuntimeError("outlook_external 缺少 api_key（mail.acica.top 对外 API Key）")
-        self.session = _create_session(conf)
+        self.session = _create_session(self.conf)
         self.session.headers.update(
             {
-                "User-Agent": conf["user_agent"],
+                "User-Agent": self.conf["user_agent"],
                 "Accept": "application/json",
                 "X-API-Key": self.api_key,
             }
         )
 
-    def _request(self, method: str, path: str, params: dict | None = None, expected: tuple[int, ...] = (200,)):
+    @staticmethod
+    def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(maximum, number))
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        expected: tuple[int, ...] = (200,),
+        *,
+        timeout: float | None = None,
+        retries: int = 3,
+    ):
         url = f"{self.api_base}{path}"
         last_error = ""
-        for attempt in range(1, 4):
+        attempts = max(1, min(3, int(retries)))
+        request_timeout = float(timeout) if timeout is not None else float(self.conf["request_timeout"])
+        for attempt in range(1, attempts + 1):
             resp = self.session.request(
                 method.upper(),
                 url,
                 params=params,
-                timeout=self.conf["request_timeout"],
+                timeout=request_timeout,
                 verify=False,
             )
             body = getattr(resp, "text", "") or ""
             if resp.status_code not in expected:
                 last_error = f"outlook_external {method} {path} HTTP {resp.status_code}: {body[:240]}"
                 # 403 is often intermittent WAF/rate on shared edge; retry a few times.
-                if attempt < 3 and resp.status_code in {403, 408, 425, 429, 500, 502, 503, 504}:
+                if attempt < attempts and resp.status_code in {403, 408, 425, 429, 500, 502, 503, 504}:
                     time.sleep(min(1.5 * attempt, 4.0))
                     continue
                 raise RuntimeError(last_error)
             if not body.strip():
                 last_error = f"outlook_external {method} {path} empty body"
-                if attempt < 3:
+                if attempt < attempts:
                     time.sleep(min(1.0 * attempt, 3.0))
                     continue
                 raise RuntimeError(last_error)
@@ -2086,7 +2151,7 @@ class OutlookExternalApiProvider(BaseMailProvider):
                 data = resp.json()
             except Exception as exc:
                 last_error = f"outlook_external non-json: {exc}; body={body[:180]}"
-                if attempt < 3:
+                if attempt < attempts:
                     time.sleep(min(1.0 * attempt, 3.0))
                     continue
                 raise RuntimeError(last_error) from exc
@@ -2258,7 +2323,78 @@ class OutlookExternalApiProvider(BaseMailProvider):
         items = self.fetch_recent_messages(mailbox)
         return items[0] if items else None
 
-    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+    def _wait_for_server_otp(self, mailbox: dict[str, Any]) -> tuple[str | None, str]:
+        if not self.server_otp_enabled or mailbox.get("_server_otp_disabled"):
+            return None, "disabled"
+        address = str(mailbox.get("address") or mailbox.get("matched_alias") or mailbox.get("resolved_email") or "").strip()
+        if not address:
+            return None, "disabled"
+        params: dict[str, Any] = {
+            "email": address,
+            "folder": self.folder,
+            "wait_seconds": self.otp_wait_seconds,
+            "poll_interval": self.otp_poll_interval,
+            "top": self.top,
+        }
+        optional_filters = {
+            "subject_contains": self.otp_subject_contains,
+            "from_contains": self.otp_from_contains,
+            "keyword": self.otp_keyword,
+            "code_regex": self.otp_code_regex,
+        }
+        params.update({key: value for key, value in optional_filters.items() if value})
+        try:
+            data = self._request(
+                "GET",
+                self.otp_path,
+                params=params,
+                timeout=self.otp_http_timeout,
+                retries=1,
+            )
+        except Exception as exc:
+            error = str(exc)
+            if "HTTP 504" in error:
+                return None, "timed_out"
+            if "HTTP 404" in error:
+                mailbox["_server_otp_disabled"] = True
+                return None, "unavailable"
+            return None, "error"
+        code = str(data.get("code") or "").strip() if isinstance(data, dict) else ""
+        if not code:
+            return None, "error"
+        if not self._server_otp_code_is_current(mailbox, code):
+            return None, "unverified"
+        return code, "completed"
+
+    def _server_otp_code_is_current(self, mailbox: dict[str, Any], code: str) -> bool:
+        created_at = _parse_received_at(mailbox.get("created_at"))
+        reference = created_at or (datetime.now(timezone.utc) - timedelta(seconds=30))
+        minimum_timestamp = reference.timestamp() - 30
+        try:
+            messages = self.fetch_recent_messages(mailbox)
+        except Exception:
+            return False
+        for message in messages:
+            received_at = message.get("received_at")
+            if not isinstance(received_at, datetime) or received_at.timestamp() < minimum_timestamp:
+                continue
+            subject = str(message.get("subject") or "")
+            sender = str(message.get("sender") or "")
+            content = "\n".join(
+                str(message.get(key) or "")
+                for key in ("subject", "sender", "text_content", "html_content")
+            )
+            if self.otp_subject_contains and self.otp_subject_contains.lower() not in subject.lower():
+                continue
+            if self.otp_from_contains and self.otp_from_contains.lower() not in sender.lower():
+                continue
+            if self.otp_keyword and self.otp_keyword.lower() not in content.lower():
+                continue
+            if _extract_code(message) == code:
+                return True
+        return False
+
+    def _wait_for_code_from_list(self, mailbox: dict[str, Any]) -> str | None:
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
             seen_value = []
@@ -2267,7 +2403,7 @@ class OutlookExternalApiProvider(BaseMailProvider):
         created_at = _parse_received_at(mailbox.get("created_at"))
         # 允许少量时钟偏差
         min_ts = (created_at.timestamp() - 30) if created_at else 0.0
-        deadline = time.monotonic() + self.conf["wait_timeout"]
+        deadline = time.monotonic() + self.otp_wait_seconds
         while time.monotonic() < deadline:
             for message in self.fetch_recent_messages(mailbox):
                 ref = _message_tracking_ref(message)
@@ -2289,6 +2425,15 @@ class OutlookExternalApiProvider(BaseMailProvider):
                 seen_refs.add(ref)
             time.sleep(max(0.2, self.conf["wait_interval"]))
         return None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        code, status = self._wait_for_server_otp(mailbox)
+        if code:
+            return code
+        # A 504 means the server has already observed the complete configured wait window.
+        if status in {"completed", "timed_out"}:
+            return None
+        return self._wait_for_code_from_list(mailbox)
 
     def close(self) -> None:
         self.session.close()

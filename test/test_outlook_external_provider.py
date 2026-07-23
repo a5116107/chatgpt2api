@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -262,6 +263,186 @@ class OutlookExternalProviderTests(unittest.TestCase):
                     provider.create_mailbox()
         finally:
             provider.close()
+
+    def test_outlook_prefers_server_otp_long_poll(self):
+        provider = self._outlook_external(otp_wait_seconds=45, otp_poll_interval=5)
+        requests = []
+
+        def fake_request(method, path, params=None, **kwargs):
+            requests.append((method, path, params, kwargs))
+            return {"success": True, "code": "123456", "email": {"folder": "inbox"}}
+
+        provider._request = fake_request
+        provider.fetch_recent_messages = lambda mailbox: [
+            {
+                "subject": "Your OpenAI verification code",
+                "sender": "noreply@tm.openai.com",
+                "text_content": "Your verification code is 123456",
+                "html_content": "",
+                "received_at": datetime.now(timezone.utc),
+            }
+        ]
+        provider._wait_for_code_from_list = lambda mailbox: self.fail("list polling fallback should not run")
+        try:
+            code = provider.wait_for_code(
+                {
+                    "address": "alias@example.com",
+                    "resolved_email": "main@example.com",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        finally:
+            provider.close()
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(len(requests), 1)
+        method, path, params, kwargs = requests[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(path, "/api/external/otp")
+        self.assertEqual(params["email"], "alias@example.com")
+        self.assertEqual(params["folder"], "all")
+        self.assertEqual(params["wait_seconds"], 45)
+        self.assertEqual(params["poll_interval"], 5)
+        self.assertEqual(kwargs["retries"], 1)
+        self.assertGreaterEqual(kwargs["timeout"], 60)
+
+    def test_outlook_rejects_stale_server_otp_before_list_fallback(self):
+        provider = self._outlook_external()
+        provider._request = lambda *args, **kwargs: {"success": True, "code": "123456"}
+        provider.fetch_recent_messages = lambda mailbox: [
+            {
+                "subject": "Your OpenAI verification code",
+                "sender": "noreply@tm.openai.com",
+                "text_content": "Your verification code is 123456",
+                "html_content": "",
+                "received_at": datetime.now(timezone.utc) - timedelta(minutes=10),
+            }
+        ]
+        mailbox = {
+            "address": "alias@example.com",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            code, status = provider._wait_for_server_otp(mailbox)
+        finally:
+            provider.close()
+
+        self.assertIsNone(code)
+        self.assertEqual(status, "unverified")
+
+    def test_outlook_server_otp_defaults_to_openai_sender_filter(self):
+        provider = self._outlook_external()
+        try:
+            self.assertEqual(provider.otp_from_contains, "openai")
+            self.assertEqual(provider.otp_code_regex, r"(?<!\d)(\d{6})(?!\d)")
+        finally:
+            provider.close()
+
+    def test_outlook_server_otp_uses_provider_defaults_not_global_mail_wait_settings(self):
+        provider = mail_provider.OutlookExternalApiProvider(
+            {
+                "provider_ref": "outlook_external#1",
+                "api_key": "test-key",
+                "realtime_preflight": False,
+            },
+            mail_provider._config({"wait_timeout": 30, "wait_interval": 2}),
+        )
+        try:
+            self.assertEqual(provider.otp_wait_seconds, 120)
+            self.assertEqual(provider.otp_poll_interval, 3)
+            self.assertEqual(provider.otp_http_timeout, 180.0)
+        finally:
+            provider.close()
+
+    def test_outlook_provider_proxy_is_isolated_from_global_mail_proxy(self):
+        provider = self._outlook_external(
+            proxy="http://mail-proxy.example:8118",
+            request_timeout=45,
+        )
+        try:
+            self.assertEqual(provider.conf["proxy"], "http://mail-proxy.example:8118")
+            self.assertEqual(provider.conf["request_timeout"], 45.0)
+            self.assertGreaterEqual(provider.otp_http_timeout, 135.0)
+        finally:
+            provider.close()
+
+    def test_outlook_empty_provider_proxy_inherits_global_mail_proxy(self):
+        provider = mail_provider.OutlookExternalApiProvider(
+            {
+                "provider_ref": "outlook_external#1",
+                "api_key": "test-key",
+                "proxy": "",
+                "realtime_preflight": False,
+            },
+            mail_provider._config({"proxy": "http://global-mail-proxy.example:8118"}),
+        )
+        try:
+            self.assertEqual(provider.conf["proxy"], "http://global-mail-proxy.example:8118")
+        finally:
+            provider.close()
+
+    def test_outlook_server_otp_unavailable_falls_back_to_message_list(self):
+        provider = self._outlook_external()
+        mailbox = {"address": "alias@example.com", "resolved_email": "main@example.com"}
+        provider._request = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("outlook_external GET /api/external/otp HTTP 404")
+        )
+        provider.fetch_recent_messages = lambda item: [
+            {
+                "provider": "outlook_external",
+                "mailbox": item["address"],
+                "message_id": "message-1",
+                "subject": "OpenAI verification code",
+                "sender": "noreply@openai.com",
+                "text_content": "Your verification code is 654321",
+                "received_at": None,
+                "raw": {},
+            }
+        ]
+        try:
+            code = provider.wait_for_code(mailbox)
+        finally:
+            provider.close()
+
+        self.assertEqual(code, "654321")
+        self.assertTrue(mailbox["_server_otp_disabled"])
+
+    def test_outlook_server_otp_network_error_falls_back_to_message_list(self):
+        provider = self._outlook_external()
+        mailbox = {"address": "alias@example.com", "resolved_email": "main@example.com"}
+        provider._request = lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("mail api timeout"))
+        provider.fetch_recent_messages = lambda item: [
+            {
+                "provider": "outlook_external",
+                "mailbox": item["address"],
+                "message_id": "message-timeout",
+                "subject": "OpenAI verification code",
+                "sender": "noreply@openai.com",
+                "text_content": "Your verification code is 741852",
+                "received_at": None,
+                "raw": {},
+            }
+        ]
+        try:
+            code = provider.wait_for_code(mailbox)
+        finally:
+            provider.close()
+
+        self.assertEqual(code, "741852")
+        self.assertNotIn("_server_otp_disabled", mailbox)
+
+    def test_outlook_server_otp_timeout_does_not_repeat_list_wait(self):
+        provider = self._outlook_external()
+        provider._request = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("outlook_external GET /api/external/otp HTTP 504")
+        )
+        provider.fetch_recent_messages = lambda mailbox: self.fail("server wait already elapsed")
+        try:
+            code = provider.wait_for_code({"address": "alias@example.com"})
+        finally:
+            provider.close()
+
+        self.assertIsNone(code)
 
 if __name__ == "__main__":
     unittest.main()
