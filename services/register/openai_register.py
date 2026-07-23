@@ -748,6 +748,21 @@ class PlatformRegistrar:
         if not openai_signup_primitives.is_openai_oauth_continue_url(continue_url):
             raise RuntimeError("oauth_continue_untrusted_url")
 
+        try:
+            direct_callback = (
+                openai_signup_primitives.extract_oauth_callback_from_response(
+                    None,
+                    initial_url=continue_url,
+                    expected_state=self.oauth_state,
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if direct_callback:
+            self.platform_auth_code = str(direct_callback.get("code") or "").strip()
+            step(index, "OAuth callback 已携带 code，跳过页面访问")
+            return direct_callback
+
         headers = _headers_with_clearance(
             self._navigate_headers(referer),
             continue_url,

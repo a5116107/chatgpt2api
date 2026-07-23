@@ -320,6 +320,43 @@ class PlatformRegistrationStateMachineTests(unittest.TestCase):
         self.assertEqual(session.request.call_args.args[0], "GET")
         self.assertTrue(session.request.call_args.kwargs["allow_redirects"])
 
+    def test_follow_oauth_continue_skips_navigation_for_direct_callback(self):
+        callback_url = (
+            "https://platform.openai.com/auth/callback"
+            "?code=direct-code&state=expected-state&scope=openid"
+        )
+        session = Mock()
+        registrar = self.registrar(session)
+
+        callback = registrar._follow_oauth_continue(
+            callback_url,
+            1,
+            referer="https://auth.openai.com/about-you",
+            require_code=True,
+        )
+
+        self.assertEqual(callback["code"], "direct-code")
+        self.assertEqual(registrar.platform_auth_code, "direct-code")
+        session.request.assert_not_called()
+
+    def test_follow_oauth_continue_rejects_direct_callback_state_mismatch(self):
+        callback_url = (
+            "https://platform.openai.com/auth/callback"
+            "?code=direct-code&state=wrong-state&scope=openid"
+        )
+        session = Mock()
+        registrar = self.registrar(session)
+
+        with self.assertRaisesRegex(RuntimeError, "oauth_state_mismatch"):
+            registrar._follow_oauth_continue(
+                callback_url,
+                1,
+                referer="https://auth.openai.com/about-you",
+                require_code=True,
+            )
+
+        session.request.assert_not_called()
+
     def test_follow_oauth_continue_refreshes_clearance_for_challenged_host(self):
         callback_url = (
             "https://platform.openai.com/auth/callback"
