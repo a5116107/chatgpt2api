@@ -71,6 +71,8 @@ const providerDefaults: Record<string, MailProviderConfig> = {
     otp_from_contains: "openai",
     otp_keyword: "",
     otp_code_regex: "(?<!\\d)(\\d{6})(?!\\d)",
+    detail_session_enabled: false,
+    detail_password: "",
     prefer_alias: true,
     use_plus_alias: true,
     realtime_preflight: true,

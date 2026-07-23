@@ -431,18 +431,103 @@ class OutlookExternalProviderTests(unittest.TestCase):
         self.assertEqual(code, "741852")
         self.assertNotIn("_server_otp_disabled", mailbox)
 
-    def test_outlook_server_otp_timeout_does_not_repeat_list_wait(self):
+    def test_outlook_server_otp_timeout_performs_one_final_list_check(self):
         provider = self._outlook_external()
         provider._request = lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("outlook_external GET /api/external/otp HTTP 504")
         )
-        provider.fetch_recent_messages = lambda mailbox: self.fail("server wait already elapsed")
+        fetches = []
+        provider.fetch_recent_messages = lambda mailbox: fetches.append(mailbox) or [
+            {
+                "provider": "outlook_external",
+                "mailbox": "main@example.com",
+                "message_id": "message-after-timeout",
+                "subject": "OpenAI verification code",
+                "sender": "noreply@openai.com",
+                "text_content": "Your verification code is 159357",
+                "html_content": "",
+                "received_at": None,
+                "raw": {"folder": "inbox"},
+            }
+        ]
         try:
-            code = provider.wait_for_code({"address": "alias@example.com"})
+            code = provider.wait_for_code(
+                {"address": "alias@example.com", "resolved_email": "main@example.com"}
+            )
         finally:
             provider.close()
 
-        self.assertIsNone(code)
+        self.assertEqual(code, "159357")
+        self.assertEqual(len(fetches), 1)
+
+    def test_outlook_detail_session_hydrates_a_truncated_preview(self):
+        provider = self._outlook_external(
+            detail_session_enabled=True,
+            detail_password="detail-password",
+        )
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/login"):
+                return FakeResponse({"success": True})
+            return FakeResponse(
+                {
+                    "success": True,
+                    "email": {
+                        "body": "<p>OpenAI verification code: 852456</p>",
+                    },
+                }
+            )
+
+        provider.session.request = fake_request
+        message = {
+            "provider": "outlook_external",
+            "mailbox": "main@example.com",
+            "message_id": "message/1",
+            "subject": "OpenAI verification code",
+            "sender": "noreply@openai.com",
+            "text_content": "<html><head>preview only</head>",
+            "html_content": "",
+            "raw": {"folder": "inbox"},
+        }
+        try:
+            hydrated = provider._message_with_detail(message)
+            cached = provider._message_with_detail(message)
+        finally:
+            provider.close()
+
+        self.assertEqual(mail_provider._extract_code(hydrated), "852456")
+        self.assertEqual(mail_provider._extract_code(cached), "852456")
+        self.assertEqual([item[0] for item in calls], ["POST", "GET"])
+        self.assertNotIn("detail-password", calls[1][1])
+        self.assertIn("message%2F1", calls[1][1])
+
+    def test_outlook_detail_session_is_disabled_without_a_password(self):
+        provider = self._outlook_external(detail_session_enabled=True)
+        provider.session.request = lambda *args, **kwargs: self.fail(
+            "detail request must remain disabled without a password"
+        )
+        try:
+            body = provider._fetch_message_detail_body(
+                {
+                    "mailbox": "main@example.com",
+                    "message_id": "message-1",
+                    "raw": {"folder": "inbox"},
+                }
+            )
+        finally:
+            provider.close()
+
+        self.assertEqual(body, "")
 
 if __name__ == "__main__":
     unittest.main()

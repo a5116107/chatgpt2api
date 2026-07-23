@@ -19,6 +19,7 @@ from email import (
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, TypeVar
+from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -2075,6 +2076,13 @@ class OutlookExternalApiProvider(BaseMailProvider):
         self.otp_code_regex = str(
             entry.get("otp_code_regex", r"(?<!\d)(\d{6})(?!\d)") or ""
         ).strip()
+        self.detail_password = str(entry.get("detail_password") or "").strip()
+        self.detail_session_enabled = (
+            entry.get("detail_session_enabled", bool(self.detail_password)) is not False
+            and bool(self.detail_password)
+        )
+        self._detail_authenticated = False
+        self._detail_body_cache: dict[tuple[str, str, str], str] = {}
         # folder=all can spend additional time merging folders after the wait window.
         long_poll_overhead = max(30.0, float(self.otp_wait_seconds) * 0.5)
         self.otp_http_timeout = max(
@@ -2323,6 +2331,75 @@ class OutlookExternalApiProvider(BaseMailProvider):
         items = self.fetch_recent_messages(mailbox)
         return items[0] if items else None
 
+    def _authenticate_detail_session(self) -> bool:
+        if not self.detail_session_enabled:
+            return False
+        if self._detail_authenticated:
+            return True
+        try:
+            resp = self.session.request(
+                "POST",
+                f"{self.api_base}/login",
+                json={"password": self.detail_password},
+                timeout=float(self.conf["request_timeout"]),
+                verify=False,
+            )
+            data = resp.json() if resp.status_code == 200 else {}
+        except Exception:
+            return False
+        self._detail_authenticated = bool(
+            isinstance(data, dict) and data.get("success") is True
+        )
+        return self._detail_authenticated
+
+    def _fetch_message_detail_body(self, message: dict[str, Any]) -> str:
+        if not self.detail_session_enabled:
+            return ""
+        email = str(message.get("mailbox") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        raw = message.get("raw") if isinstance(message.get("raw"), dict) else {}
+        folder = str(raw.get("folder") or "inbox").strip() or "inbox"
+        if not email or not message_id:
+            return ""
+        cache_key = (email.lower(), message_id, folder)
+        if cache_key in self._detail_body_cache:
+            return self._detail_body_cache[cache_key]
+        if not self._authenticate_detail_session():
+            return ""
+        url = f"{self.api_base}/api/email/{quote(email, safe='')}/{quote(message_id, safe='')}"
+        body = ""
+        for attempt in range(2):
+            try:
+                resp = self.session.request(
+                    "GET",
+                    url,
+                    params={"folder": folder, "method": "graph"},
+                    timeout=float(self.conf["request_timeout"]),
+                    verify=False,
+                )
+                data = resp.json() if resp.status_code == 200 else {}
+            except Exception:
+                data = {}
+            detail = data.get("email") if isinstance(data, dict) else None
+            if isinstance(detail, dict) and data.get("success") is not False:
+                body = str(detail.get("body") or detail.get("html") or "")
+                break
+            if attempt == 0:
+                self._detail_authenticated = False
+                if not self._authenticate_detail_session():
+                    break
+        if body:
+            self._detail_body_cache[cache_key] = body
+        return body
+
+    def _message_with_detail(self, message: dict[str, Any]) -> dict[str, Any]:
+        if _extract_code(message):
+            return message
+        body = self._fetch_message_detail_body(message)
+        if not body:
+            return message
+        return {**message, "html_content": body}
+
     def _wait_for_server_otp(self, mailbox: dict[str, Any]) -> tuple[str | None, str]:
         if not self.server_otp_enabled or mailbox.get("_server_otp_disabled"):
             return None, "disabled"
@@ -2378,6 +2455,7 @@ class OutlookExternalApiProvider(BaseMailProvider):
             received_at = message.get("received_at")
             if not isinstance(received_at, datetime) or received_at.timestamp() < minimum_timestamp:
                 continue
+            message = self._message_with_detail(message)
             subject = str(message.get("subject") or "")
             sender = str(message.get("sender") or "")
             content = "\n".join(
@@ -2394,7 +2472,7 @@ class OutlookExternalApiProvider(BaseMailProvider):
                 return True
         return False
 
-    def _wait_for_code_from_list(self, mailbox: dict[str, Any]) -> str | None:
+    def _find_code_from_list_once(self, mailbox: dict[str, Any]) -> str | None:
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
             seen_value = []
@@ -2403,26 +2481,33 @@ class OutlookExternalApiProvider(BaseMailProvider):
         created_at = _parse_received_at(mailbox.get("created_at"))
         # 允许少量时钟偏差
         min_ts = (created_at.timestamp() - 30) if created_at else 0.0
+        for message in self.fetch_recent_messages(mailbox):
+            ref = _message_tracking_ref(message)
+            if ref in seen_refs:
+                continue
+            received = message.get("received_at")
+            if isinstance(received, datetime) and received.timestamp() < min_ts:
+                seen_refs.add(ref)
+                continue
+            # 优先 OpenAI 相关
+            blob = f"{message.get('subject') or ''}\n{message.get('sender') or ''}\n{message.get('text_content') or ''}".lower()
+            if not any(k in blob for k in ("openai", "chatgpt", "tm.openai", "verification", "code", "验证")):
+                seen_refs.add(ref)
+                continue
+            message = self._message_with_detail(message)
+            code = _extract_code(message)
+            if code:
+                seen_value.append(ref)
+                return code
+            seen_refs.add(ref)
+        return None
+
+    def _wait_for_code_from_list(self, mailbox: dict[str, Any]) -> str | None:
         deadline = time.monotonic() + self.otp_wait_seconds
         while time.monotonic() < deadline:
-            for message in self.fetch_recent_messages(mailbox):
-                ref = _message_tracking_ref(message)
-                if ref in seen_refs:
-                    continue
-                received = message.get("received_at")
-                if isinstance(received, datetime) and received.timestamp() < min_ts:
-                    seen_refs.add(ref)
-                    continue
-                # 优先 OpenAI 相关
-                blob = f"{message.get('subject') or ''}\n{message.get('sender') or ''}\n{message.get('text_content') or ''}".lower()
-                if not any(k in blob for k in ("openai", "chatgpt", "tm.openai", "verification", "code", "验证")):
-                    seen_refs.add(ref)
-                    continue
-                code = _extract_code(message)
-                if code:
-                    seen_value.append(ref)
-                    return code
-                seen_refs.add(ref)
+            code = self._find_code_from_list_once(mailbox)
+            if code:
+                return code
             time.sleep(max(0.2, self.conf["wait_interval"]))
         return None
 
@@ -2430,8 +2515,11 @@ class OutlookExternalApiProvider(BaseMailProvider):
         code, status = self._wait_for_server_otp(mailbox)
         if code:
             return code
-        # A 504 means the server has already observed the complete configured wait window.
-        if status in {"completed", "timed_out"}:
+        # A 504 means the server already waited. Perform one final list/detail
+        # check for services whose body_preview is shorter than the full email.
+        if status == "timed_out":
+            return self._find_code_from_list_once(mailbox)
+        if status == "completed":
             return None
         return self._wait_for_code_from_list(mailbox)
 

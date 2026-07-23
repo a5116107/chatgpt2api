@@ -59,6 +59,17 @@ function OutlookApiFields({
         />
       </div>
       <div className="space-y-2">
+        <label className="text-sm text-stone-700">邮件详情登录密码</label>
+        <Input
+          type="password"
+          autoComplete="new-password"
+          value={fieldText(provider.detail_password)}
+          onChange={(event) => onChange({ detail_password: event.target.value })}
+          className="h-10 rounded-xl border-stone-200 bg-white"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2">
         <label className="text-sm text-stone-700">API 请求超时（秒）</label>
         <Input
           type="number"
@@ -266,6 +277,12 @@ export function OutlookExternalProviderFields(props: OutlookExternalProviderFiel
         disabled={disabled}
         label="服务端验证码长轮询"
         onChange={(checked) => onChange({ server_otp_enabled: checked })}
+      />
+      <OutlookToggleField
+        checked={Boolean(provider.detail_session_enabled ?? false)}
+        disabled={disabled}
+        label="预览截断时读取完整正文"
+        onChange={(checked) => onChange({ detail_session_enabled: checked })}
       />
     </>
   );
