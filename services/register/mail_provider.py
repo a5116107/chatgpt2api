@@ -19,7 +19,6 @@ from email import (
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, TypeVar
-from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -2366,7 +2365,11 @@ class OutlookExternalApiProvider(BaseMailProvider):
             return self._detail_body_cache[cache_key]
         if not self._authenticate_detail_session():
             return ""
-        url = f"{self.api_base}/api/email/{quote(email, safe='')}/{quote(message_id, safe='')}"
+        url = (
+            f"{self.api_base}/api/email/"
+            f"{requests.utils.quote(email, safe='')}/"
+            f"{requests.utils.quote(message_id, safe='')}"
+        )
         body = ""
         for attempt in range(2):
             try:
