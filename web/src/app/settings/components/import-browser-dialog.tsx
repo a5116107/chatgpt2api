@@ -14,7 +14,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 import { PAGE_SIZE_OPTIONS, useSettingsStore } from "../store";
 
@@ -48,8 +54,12 @@ export function ImportBrowserDialog() {
   const currentPageSize = Number(pageSize);
   const filePageCount = Math.max(1, Math.ceil(filteredFiles.length / currentPageSize));
   const safeFilePage = Math.min(filePage, filePageCount);
-  const pagedFiles = filteredFiles.slice((safeFilePage - 1) * currentPageSize, safeFilePage * currentPageSize);
-  const allFilteredSelected = filteredFiles.length > 0 && filteredFiles.every((item) => selectedNames.includes(item.name));
+  const pagedFiles = filteredFiles.slice(
+    (safeFilePage - 1) * currentPageSize,
+    safeFilePage * currentPageSize,
+  );
+  const allFilteredSelected =
+    filteredFiles.length > 0 && filteredFiles.every((item) => selectedNames.includes(item.name));
 
   const toggleSelectAllFiltered = (checked: boolean) => {
     if (checked) {
@@ -66,23 +76,31 @@ export function ImportBrowserDialog() {
         <DialogHeader className="gap-2">
           <DialogTitle>选择要导入的账号</DialogTitle>
           <DialogDescription className="text-sm leading-6">
-            {browserPool ? `来自 ${browserPool.name || browserPool.base_url}` : "读取到的远程账号列表"}
+            {browserPool
+              ? `来自 ${browserPool.name || browserPool.base_url}`
+              : "读取到的远程账号列表"}
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="relative min-w-[260px]">
-            <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
+            <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={fileQuery}
               onChange={(event) => setFileQuery(event.target.value)}
               placeholder="搜索 email 或文件名"
-              className="h-10 rounded-xl border-stone-200 bg-white pl-10"
+              className="h-10 rounded-xl border-border bg-card pl-10"
             />
           </div>
           <div className="flex items-center gap-2">
-            <Select value={pageSize} onValueChange={(value) => setPageSize(value as (typeof PAGE_SIZE_OPTIONS)[number])}>
-              <SelectTrigger className="h-10 w-[120px] rounded-xl border-stone-200 bg-white">
+            <Select
+              value={pageSize}
+              onValueChange={(value) => setPageSize(value as (typeof PAGE_SIZE_OPTIONS)[number])}
+            >
+              <SelectTrigger
+                className="h-10 w-[120px] rounded-xl border-border bg-card"
+                aria-label="每页数量"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -95,7 +113,7 @@ export function ImportBrowserDialog() {
             </Select>
             <Button
               variant="outline"
-              className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+              className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80"
               onClick={() => toggleSelectAllFiltered(!allFilteredSelected)}
             >
               {allFilteredSelected ? "取消全选" : "全选筛选结果"}
@@ -103,28 +121,40 @@ export function ImportBrowserDialog() {
           </div>
         </div>
 
-        <div className="rounded-xl border border-stone-200">
-          <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+        <div className="rounded-xl border border-border">
+          <div className="flex items-center justify-between border-b border-border px-4 py-3 text-sm text-muted-foreground">
             <div className="flex items-center gap-3">
-              <Checkbox checked={allFilteredSelected} onCheckedChange={(checked) => toggleSelectAllFiltered(Boolean(checked))} />
+              <Checkbox
+                checked={allFilteredSelected}
+                onCheckedChange={(checked) => toggleSelectAllFiltered(Boolean(checked))}
+                aria-label="全选当前页"
+              />
               <span>筛选结果 {filteredFiles.length} 个</span>
             </div>
             <span>已选 {selectedNames.length} 个</span>
           </div>
           <div className="max-h-[420px] overflow-auto">
             {pagedFiles.length === 0 ? (
-              <div className="flex items-center justify-center py-12 text-sm text-stone-400">没有匹配的远程账号</div>
+              <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+                没有匹配的远程账号
+              </div>
             ) : (
-              <div className="divide-y divide-stone-100">
+              <div className="divide-y divide-border">
                 {pagedFiles.map((item) => (
-                  <label key={item.name} className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-stone-50">
+                  <label
+                    key={item.name}
+                    className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-muted"
+                  >
                     <Checkbox
                       checked={selectedNames.includes(item.name)}
                       onCheckedChange={(checked) => toggleFile(item.name, Boolean(checked))}
+                      aria-label="选择此项"
                     />
                     <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-stone-700">{item.email || item.name}</div>
-                      <div className="truncate text-xs text-stone-400">{item.name}</div>
+                      <div className="truncate text-sm font-medium text-foreground/80">
+                        {item.email || item.name}
+                      </div>
+                      <div className="truncate text-xs text-muted-foreground">{item.name}</div>
                     </div>
                   </label>
                 ))}
@@ -133,15 +163,16 @@ export function ImportBrowserDialog() {
           </div>
         </div>
 
-        <div className="flex items-center justify-between text-sm text-stone-500">
+        <div className="flex items-center justify-between text-sm text-muted-foreground">
           <span>
             第 {filteredFiles.length === 0 ? 0 : (safeFilePage - 1) * currentPageSize + 1} -{" "}
-            {Math.min(safeFilePage * currentPageSize, filteredFiles.length)} 条，共 {filteredFiles.length} 条
+            {Math.min(safeFilePage * currentPageSize, filteredFiles.length)} 条，共{" "}
+            {filteredFiles.length} 条
           </span>
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
-              className="h-9 rounded-xl border-stone-200 bg-white px-3"
+              className="h-9 rounded-xl border-border bg-card px-3"
               onClick={() => setFilePage(Math.max(1, safeFilePage - 1))}
               disabled={safeFilePage <= 1}
             >
@@ -152,7 +183,7 @@ export function ImportBrowserDialog() {
             </span>
             <Button
               variant="outline"
-              className="h-9 rounded-xl border-stone-200 bg-white px-3"
+              className="h-9 rounded-xl border-border bg-card px-3"
               onClick={() => setFilePage(Math.min(filePageCount, safeFilePage + 1))}
               disabled={safeFilePage >= filePageCount}
             >
@@ -164,18 +195,22 @@ export function ImportBrowserDialog() {
         <DialogFooter className="pt-2">
           <Button
             variant="secondary"
-            className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+            className="h-10 rounded-xl bg-muted px-5 text-foreground/80 hover:bg-secondary"
             onClick={() => setBrowserOpen(false)}
             disabled={isStartingImport}
           >
             取消
           </Button>
           <Button
-            className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+            className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
             onClick={() => void startImport()}
             disabled={isStartingImport || selectedNames.length === 0}
           >
-            {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
+            {isStartingImport ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <Import className="size-4" />
+            )}
             导入选中账号
           </Button>
         </DialogFooter>

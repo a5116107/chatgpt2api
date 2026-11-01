@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Link2, LoaderCircle, PlugZap, Save } from "lucide-react";
 import { toast } from "sonner";
 
@@ -13,6 +13,7 @@ import { testProxy, type ProxyTestResult } from "@/lib/api";
 import { useSettingsStore } from "../store";
 
 export function ProxySettingsCard() {
+  const fieldId = useId();
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<ProxyTestResult | null>(null);
   const config = useSettingsStore((state) => state.config);
@@ -47,31 +48,38 @@ export function ProxySettingsCard() {
   };
 
   return (
-    <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+    <Card className="rounded-2xl border-border bg-card shadow-sm">
       <CardContent className="space-y-6 p-6">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex items-center gap-3">
-            <div className="flex size-10 items-center justify-center rounded-xl bg-stone-100">
-              <Link2 className="size-5 text-stone-600" />
+            <div className="flex size-10 items-center justify-center rounded-xl bg-muted">
+              <Link2 className="size-5 text-foreground/80" />
             </div>
             <div>
               <h2 className="text-lg font-semibold tracking-tight">全局代理</h2>
-              <p className="text-sm text-stone-500">为系统中的出站请求配置统一代理，保存后会立即生效。</p>
+              <p className="text-sm text-muted-foreground">
+                为系统中的出站请求配置统一代理，保存后会立即生效。
+              </p>
             </div>
           </div>
-          <Badge variant={proxy.trim() ? "success" : "secondary"} className="w-fit rounded-md px-2.5 py-1">
+          <Badge
+            variant={proxy.trim() ? "success" : "secondary"}
+            className="w-fit rounded-md px-2.5 py-1"
+          >
             {proxy.trim() ? "已配置" : "未配置"}
           </Badge>
         </div>
 
         {isLoadingConfig ? (
           <div className="flex items-center justify-center py-10">
-            <LoaderCircle className="size-5 animate-spin text-stone-400" />
+            <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
           </div>
         ) : (
           <>
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">代理地址</label>
+              <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-1"}>
+                代理地址
+              </label>
               <Input
                 value={proxy}
                 onChange={(event) => {
@@ -79,10 +87,13 @@ export function ProxySettingsCard() {
                   setTestResult(null);
                 }}
                 placeholder="http://user:pass@127.0.0.1:7890"
-                className="h-11 rounded-xl border-stone-200 bg-white"
+                className="h-11 rounded-xl border-border bg-card"
+                id={fieldId + "-1"}
               />
-              <p className="text-sm text-stone-500">
-                留空表示不使用代理。请按完整地址填写，例如 `http://127.0.0.1:7890`、`http://用户名:密码@127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`。
+              <p className="text-sm text-muted-foreground">
+                留空表示不使用代理。请按完整地址填写，例如
+                `http://127.0.0.1:7890`、`http://用户名:密码@127.0.0.1:7890` 或
+                `socks5://127.0.0.1:7890`。
               </p>
             </div>
 
@@ -90,8 +101,8 @@ export function ProxySettingsCard() {
               <div
                 className={`rounded-xl border px-4 py-3 text-sm leading-6 ${
                   testResult.ok
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                    : "border-rose-200 bg-rose-50 text-rose-800"
+                    ? "border-success/25 bg-success/10 text-success"
+                    : "border-destructive/25 bg-destructive/10 text-destructive"
                 }`}
               >
                 {testResult.ok
@@ -103,19 +114,27 @@ export function ProxySettingsCard() {
             <div className="flex justify-end gap-2">
               <Button
                 variant="outline"
-                className="h-10 rounded-xl border-stone-200 bg-white px-5 text-stone-700"
+                className="h-10 rounded-xl border-border bg-card px-5 text-foreground/80"
                 onClick={() => void handleTest()}
                 disabled={isTesting || isLoadingConfig}
               >
-                {isTesting ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                {isTesting ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <PlugZap className="size-4" />
+                )}
                 测试代理
               </Button>
               <Button
-                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
                 onClick={() => void saveConfig()}
                 disabled={isSavingConfig}
               >
-                {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+                {isSavingConfig ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <Save className="size-4" />
+                )}
                 保存配置
               </Button>
             </div>

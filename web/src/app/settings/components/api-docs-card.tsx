@@ -1,7 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
+import {
+  ChevronDown,
+  FileArchive,
+  FileText,
+  KeyRound,
+  ListChecks,
+  type LucideIcon,
+} from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
 import webConfig from "@/constants/common-env";
@@ -25,12 +32,8 @@ const docs: ApiDoc[] = [
     method: "GET",
     path: "/v1/models",
     icon: ListChecks,
-    input: [
-      ["Authorization", "header", "Bearer <auth-key>。"],
-    ],
-    output: [
-      ["data", "array", "模型列表，包含 id、object、created、owned_by。"],
-    ],
+    input: [["Authorization", "header", "Bearer <auth-key>。"]],
+    output: [["data", "array", "模型列表，包含 id、object、created、owned_by。"]],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/models \\
   -H "Authorization: Bearer ${key}"`,
   },
@@ -81,9 +84,7 @@ const docs: ApiDoc[] = [
     method: "POST",
     path: "/v1/search",
     icon: ListChecks,
-    input: [
-      ["prompt", "string", "搜索问题或检索指令。"],
-    ],
+    input: [["prompt", "string", "搜索问题或检索指令。"]],
     output: [
       ["answer", "string", "搜索后的回答内容，具体字段以返回结果为准。"],
       ["sources", "array", "可选，搜索引用来源。"],
@@ -188,16 +189,17 @@ const docs: ApiDoc[] = [
     method: "GET",
     path: "/v1/editable-file-tasks?ids={taskId1,taskId2}",
     icon: ListChecks,
-    input: [
-      ["ids", "string", "可选，逗号分隔任务 ID；不传则返回当前用户全部可编辑文件任务。"],
-    ],
+    input: [["ids", "string", "可选，逗号分隔任务 ID；不传则返回当前用户全部可编辑文件任务。"]],
     output: [
       ["items", "array", "任务列表。成功任务的 result 内包含 primary_url 和 zip_url。"],
       ["missing_ids", "string[]", "查询指定 ids 时，返回未找到的任务 ID。"],
       ["result.primary_url", "string", "主文件下载地址。"],
       ["result.zip_url", "string", "素材 zip 下载地址。"],
     ],
-    example: (baseUrl: string, key: string) => `curl "${baseUrl}/editable-file-tasks?ids=<task_id>" \\
+    example: (
+      baseUrl: string,
+      key: string,
+    ) => `curl "${baseUrl}/editable-file-tasks?ids=<task_id>" \\
   -H "Authorization: Bearer ${key}"`,
   },
   {
@@ -206,34 +208,47 @@ const docs: ApiDoc[] = [
     path: "/files/{file_path}",
     icon: FileArchive,
     input: [
-      ["file_path", "string", "由任务 result.primary_url 或 result.zip_url 返回，通常不需要手动拼接。"],
+      [
+        "file_path",
+        "string",
+        "由任务 result.primary_url 或 result.zip_url 返回，通常不需要手动拼接。",
+      ],
     ],
-    output: [
-      ["binary", "file", "返回 pptx/psd/zip 文件流。"],
-    ],
-    example: (baseUrl: string, _key: string) => `curl ${baseUrl.replace(/\/v1$/, "")}/files/<file_path> -o result.zip`,
+    output: [["binary", "file", "返回 pptx/psd/zip 文件流。"]],
+    example: (baseUrl: string, _key: string) =>
+      `curl ${baseUrl.replace(/\/v1$/, "")}/files/<file_path> -o result.zip`,
   },
 ];
 
-const usableModels = ["gpt-image-2", "codex-gpt-image-2", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-3", "gpt-5-3-mini", "gpt-5-mini"];
+const usableModels = [
+  "gpt-image-2",
+  "codex-gpt-image-2",
+  "auto",
+  "gpt-5",
+  "gpt-5-1",
+  "gpt-5-2",
+  "gpt-5-3",
+  "gpt-5-3-mini",
+  "gpt-5-mini",
+];
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (
-    <div className="overflow-hidden rounded-lg border border-stone-200">
+    <div className="overflow-hidden rounded-lg border border-border">
       <table className="w-full text-left text-xs">
-        <thead className="bg-stone-50 text-stone-500">
+        <thead className="bg-muted text-muted-foreground">
           <tr>
             <th className="px-3 py-2 font-medium">参数</th>
             <th className="px-3 py-2 font-medium">类型</th>
             <th className="px-3 py-2 font-medium">说明</th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-stone-100 bg-white">
+        <tbody className="divide-y divide-border bg-card">
           {rows.map(([name, type, desc]) => (
             <tr key={name}>
-              <td className="px-3 py-2 font-mono text-stone-800">{name}</td>
-              <td className="px-3 py-2 font-mono text-stone-500">{type}</td>
-              <td className="px-3 py-2 text-stone-600">{desc}</td>
+              <td className="px-3 py-2 font-mono text-foreground">{name}</td>
+              <td className="px-3 py-2 font-mono text-muted-foreground">{type}</td>
+              <td className="px-3 py-2 text-foreground/80">{desc}</td>
             </tr>
           ))}
         </tbody>
@@ -244,7 +259,9 @@ function ParamTable({ rows }: { rows: ParamRow[] }) {
 
 export function ApiDocsCard() {
   const [authKey, setAuthKey] = useState("");
-  const serviceBaseUrl = webConfig.apiUrl.replace(/\/$/, "") || (typeof window !== "undefined" ? window.location.origin : "");
+  const serviceBaseUrl =
+    webConfig.apiUrl.replace(/\/$/, "") ||
+    (typeof window !== "undefined" ? window.location.origin : "");
   const openAIBaseUrl = `${serviceBaseUrl}/v1`;
   const displayKey = authKey || "<当前密钥>";
 
@@ -259,42 +276,51 @@ export function ApiDocsCard() {
   }, []);
 
   return (
-    <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+    <Card className="rounded-2xl border-border bg-card shadow-sm">
       <CardContent className="space-y-5 p-6">
         <div>
-          <div className="flex items-center gap-2 text-base font-semibold text-stone-900">
-            <KeyRound className="size-5 text-stone-500" />
+          <div className="flex items-center gap-2 text-base font-semibold text-foreground">
+            <KeyRound className="size-5 text-muted-foreground" />
             接口接入说明
           </div>
-          <p className="mt-1 text-xs leading-6 text-stone-500">
+          <p className="mt-1 text-xs leading-6 text-muted-foreground">
             第三方应用按 OpenAI 兼容接口接入；文件任务接口也使用同一套鉴权方式。
           </p>
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
-          <div className="space-y-1 rounded-xl border border-stone-200 bg-white px-3 py-2">
-            <div className="text-xs text-stone-500">服务地址</div>
-            <div className="break-all font-mono text-xs text-stone-800">{serviceBaseUrl}</div>
+          <div className="space-y-1 rounded-xl border border-border bg-card px-3 py-2">
+            <div className="text-xs text-muted-foreground">服务地址</div>
+            <div className="break-all font-mono text-xs text-foreground">{serviceBaseUrl}</div>
           </div>
-          <div className="space-y-1 rounded-xl border border-stone-200 bg-white px-3 py-2">
-            <div className="text-xs text-stone-500">Base URL（OpenAI）</div>
-            <div className="break-all font-mono text-xs text-stone-800">{openAIBaseUrl}</div>
+          <div className="space-y-1 rounded-xl border border-border bg-card px-3 py-2">
+            <div className="text-xs text-muted-foreground">Base URL（OpenAI）</div>
+            <div className="break-all font-mono text-xs text-foreground">{openAIBaseUrl}</div>
           </div>
-          <div className="space-y-1 rounded-xl border border-stone-200 bg-white px-3 py-2">
-            <div className="text-xs text-stone-500">API Key</div>
-            <div className="break-all font-mono text-xs text-stone-800">{displayKey}</div>
+          <div className="space-y-1 rounded-xl border border-border bg-card px-3 py-2">
+            <div className="text-xs text-muted-foreground">API Key</div>
+            <div className="break-all font-mono text-xs text-foreground">{displayKey}</div>
           </div>
-          <div className="space-y-1 rounded-xl border border-stone-200 bg-white px-3 py-2">
-            <div className="text-xs text-stone-500">请求头</div>
-            <div className="break-all font-mono text-xs text-stone-800">Authorization: Bearer {displayKey}</div>
+          <div className="space-y-1 rounded-xl border border-border bg-card px-3 py-2">
+            <div className="text-xs text-muted-foreground">请求头</div>
+            <div className="break-all font-mono text-xs text-foreground">
+              Authorization: Bearer {displayKey}
+            </div>
           </div>
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs font-medium text-stone-600">常用模型，也可请求 /v1/models 获取</div>
+          <div className="text-xs font-medium text-foreground/80">
+            常用模型，也可请求 /v1/models 获取
+          </div>
           <div className="flex flex-wrap gap-2">
             {usableModels.map((model) => (
-              <span key={model} className="rounded-md border border-stone-200 bg-white px-2 py-1 font-mono text-xs text-stone-700">{model}</span>
+              <span
+                key={model}
+                className="rounded-md border border-border bg-card px-2 py-1 font-mono text-xs text-foreground/80"
+              >
+                {model}
+              </span>
             ))}
           </div>
         </div>
@@ -303,32 +329,41 @@ export function ApiDocsCard() {
           {docs.map((item) => {
             const Icon = item.icon;
             return (
-              <details key={item.path} className="group rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <details
+                key={item.path}
+                className="group rounded-xl border border-border bg-card px-4 py-3"
+              >
                 <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
                   <span className="flex min-w-0 items-center gap-3">
-                    <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-stone-100 text-stone-600">
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground/80">
                       <Icon className="size-4" />
                     </span>
                     <span className="min-w-0">
-                      <span className="block text-sm font-semibold text-stone-900">{item.title}</span>
-                      <span className="mt-1 block truncate font-mono text-xs text-stone-500">{item.method} {item.path}</span>
+                      <span className="block text-sm font-semibold text-foreground">
+                        {item.title}
+                      </span>
+                      <span className="mt-1 block truncate font-mono text-xs text-muted-foreground">
+                        {item.method} {item.path}
+                      </span>
                     </span>
                   </span>
-                  <ChevronDown className="size-4 shrink-0 text-stone-400 transition group-open:rotate-180" />
+                  <ChevronDown className="size-4 shrink-0 text-muted-foreground transition group-open:rotate-180" />
                 </summary>
 
                 <div className="mt-4 grid gap-4 lg:grid-cols-2">
                   <div className="space-y-2">
-                    <h3 className="text-xs font-semibold text-stone-700">输入参数</h3>
+                    <h3 className="text-xs font-semibold text-foreground/80">输入参数</h3>
                     <ParamTable rows={item.input} />
                   </div>
                   <div className="space-y-2">
-                    <h3 className="text-xs font-semibold text-stone-700">输出参数</h3>
+                    <h3 className="text-xs font-semibold text-foreground/80">输出参数</h3>
                     <ParamTable rows={item.output} />
                   </div>
                   <div className="space-y-2 lg:col-span-2">
-                    <h3 className="text-xs font-semibold text-stone-700">调用示例</h3>
-                    <pre className="overflow-auto whitespace-pre-wrap break-all rounded-xl bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">{item.example(openAIBaseUrl, displayKey)}</pre>
+                    <h3 className="text-xs font-semibold text-foreground/80">调用示例</h3>
+                    <pre className="overflow-auto whitespace-pre-wrap break-all rounded-xl bg-primary px-3 py-3 text-xs leading-5 text-primary-foreground">
+                      {item.example(openAIBaseUrl, displayKey)}
+                    </pre>
                   </div>
                 </div>
               </details>

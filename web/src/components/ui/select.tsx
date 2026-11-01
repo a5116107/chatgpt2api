@@ -8,15 +8,11 @@ function Select(props: React.ComponentProps<typeof SelectPrimitive.Root>) {
   return <SelectPrimitive.Root data-slot="select" {...props} />;
 }
 
-function SelectGroup(
-  props: React.ComponentProps<typeof SelectPrimitive.Group>,
-) {
+function SelectGroup(props: React.ComponentProps<typeof SelectPrimitive.Group>) {
   return <SelectPrimitive.Group data-slot="select-group" {...props} />;
 }
 
-function SelectValue(
-  props: React.ComponentProps<typeof SelectPrimitive.Value>,
-) {
+function SelectValue(props: React.ComponentProps<typeof SelectPrimitive.Value>) {
   return <SelectPrimitive.Value data-slot="select-value" {...props} />;
 }
 
@@ -49,10 +45,7 @@ function SelectScrollUpButton({
   return (
     <SelectPrimitive.ScrollUpButton
       data-slot="select-scroll-up-button"
-      className={cn(
-        "flex cursor-default items-center justify-center py-1",
-        className,
-      )}
+      className={cn("flex cursor-default items-center justify-center py-1", className)}
       {...props}
     >
       <ChevronUp className="size-4" />
@@ -67,10 +60,7 @@ function SelectScrollDownButton({
   return (
     <SelectPrimitive.ScrollDownButton
       data-slot="select-scroll-down-button"
-      className={cn(
-        "flex cursor-default items-center justify-center py-1",
-        className,
-      )}
+      className={cn("flex cursor-default items-center justify-center py-1", className)}
       {...props}
     >
       <ChevronDown className="size-4" />
@@ -89,7 +79,7 @@ function SelectContent({
       <SelectPrimitive.Content
         data-slot="select-content"
         className={cn(
-          "bg-popover text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out relative z-50 max-h-96 min-w-[8rem] overflow-x-hidden overflow-y-auto rounded-2xl border border-white/80 shadow-[0_20px_60px_-30px_rgba(15,23,42,0.35)]",
+          "bg-popover text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out relative z-50 max-h-96 min-w-[8rem] overflow-x-hidden overflow-y-auto rounded-2xl border border-border shadow-sm",
           position === "popper" &&
             "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
           className,
@@ -113,10 +103,7 @@ function SelectContent({
   );
 }
 
-function SelectLabel({
-  className,
-  ...props
-}: React.ComponentProps<typeof SelectPrimitive.Label>) {
+function SelectLabel({ className, ...props }: React.ComponentProps<typeof SelectPrimitive.Label>) {
   return (
     <SelectPrimitive.Label
       data-slot="select-label"

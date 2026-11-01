@@ -1,12 +1,19 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { LoaderCircle, LockKeyhole } from "lucide-react";
-import { toast } from "sonner";
-
+import { useRef, useState, type FormEvent } from "react";
+import {
+  ArrowRight,
+  Eye,
+  EyeOff,
+  ImageIcon,
+  LoaderCircle,
+  MessagesSquare,
+  ShieldCheck,
+  Sparkles,
+  Workflow,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { HeaderActions } from "@/components/header-actions";
 import { login } from "@/lib/api";
@@ -16,86 +23,165 @@ import { getDefaultRouteForRole, setStoredAuthSession } from "@/store/auth";
 export default function LoginPage() {
   const router = useRouter();
   const [authKey, setAuthKey] = useState("");
+  const [visible, setVisible] = useState(false);
+  const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const submitting = useRef(false);
+  const input = useRef<HTMLInputElement>(null);
   const { isCheckingAuth } = useRedirectIfAuthenticated();
 
-  const handleLogin = async () => {
-    const normalizedAuthKey = authKey.trim();
-    if (!normalizedAuthKey) {
-      toast.error("请输入 密钥");
+  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (submitting.current) return;
+    const key = authKey.trim();
+    if (!key) {
+      setError("请输入访问密钥后再登录。");
+      input.current?.focus();
       return;
     }
-
+    submitting.current = true;
     setIsSubmitting(true);
+    setError("");
     try {
-      const data = await login(normalizedAuthKey);
+      const data = await login(key);
       await setStoredAuthSession({
-        key: normalizedAuthKey,
+        key,
         role: data.role,
         subjectId: data.subject_id,
         name: data.name,
       });
       router.replace(getDefaultRouteForRole(data.role));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "登录失败";
-      toast.error(message);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "登录未成功，请稍后重试。");
+      input.current?.focus();
     } finally {
+      submitting.current = false;
       setIsSubmitting(false);
     }
   };
 
-  if (isCheckingAuth) {
+  if (isCheckingAuth)
     return (
-      <div className="grid min-h-[calc(100vh-1rem)] w-full place-items-center px-4 py-6">
-        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+      <div className="workspace-auth-loading" role="status">
+        <LoaderCircle className="size-6 animate-spin text-primary" aria-hidden="true" />
+        正在检查登录状态…
       </div>
     );
-  }
 
   return (
-    <div className="grid min-h-[calc(100vh-1rem)] w-full place-items-center px-4 py-6">
-      <HeaderActions className="fixed top-4 right-4 z-10" />
-      <Card className="w-full max-w-[505px] rounded-[30px] border-white/80 bg-white/95 shadow-[0_28px_90px_rgba(28,25,23,0.10)]">
-        <CardContent className="space-y-7 p-6 sm:p-8">
-          <div className="space-y-4 text-center">
-            <div className="mx-auto inline-flex size-14 items-center justify-center rounded-[18px] bg-stone-950 text-white shadow-sm">
-              <LockKeyhole className="size-5" />
-            </div>
-            <div className="space-y-2">
-              <h1 className="text-3xl font-semibold tracking-tight text-stone-950">欢迎回来</h1>
-              <p className="text-sm leading-6 text-stone-500">输入密钥后继续使用账号管理和图片生成功能。</p>
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <label htmlFor="auth-key" className="block text-sm font-medium text-stone-700">
-              密钥
-            </label>
-            <Input
-              id="auth-key"
-              type="password"
-              value={authKey}
-              onChange={(event) => setAuthKey(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  void handleLogin();
-                }
-              }}
-              placeholder="请输入密钥"
-              className="h-13 rounded-2xl border-stone-200 bg-white px-4"
-            />
-          </div>
-
-          <Button
-            className="h-13 w-full rounded-2xl bg-stone-950 text-white hover:bg-stone-800"
-            onClick={() => void handleLogin()}
-            disabled={isSubmitting}
+    <div className="login-layout">
+      <section className="login-story" aria-labelledby="login-story-title">
+        <div className="workspace-brand">
+          <span className="brand-mark">
+            <Sparkles size={22} strokeWidth={1.7} />
+          </span>
+          <span>
+            <strong>
+              chatgpt2api<span className="brand-dot">.</span>
+            </strong>
+            <small>YOUR CREATIVE CONTROL ROOM</small>
+          </span>
+        </div>
+        <div className="login-story-content">
+          <span className="login-story-label">A LITTLE SPACE. ENDLESS POSSIBILITIES.</span>
+          <h2 id="login-story-title">
+            给灵感，
+            <br />
+            一个<em>生长的空间。</em>
+          </h2>
+          <p>
+            把对话、图像与日常管理放在一起。
+            <br />
+            少一点切换，多一点创造。
+          </p>
+        </div>
+        <div className="login-story-footer">
+          <span className="flex items-center gap-2">
+            <MessagesSquare size={15} />
+            对话探索
+          </span>
+          <span className="flex items-center gap-2">
+            <ImageIcon size={15} />
+            图像创作
+          </span>
+          <span className="flex items-center gap-2">
+            <Workflow size={15} />
+            一站管理
+          </span>
+        </div>
+        <div className="login-orbit" aria-hidden="true" />
+      </section>
+      <section className="login-form-side" aria-labelledby="login-title">
+        <HeaderActions className="absolute top-5 right-5 sm:top-8 sm:right-8" />
+        <div className="login-form-wrap">
+          <span className="login-eyebrow">WELCOME TO YOUR WORKSPACE</span>
+          <h1 id="login-title">欢迎回来。</h1>
+          <p className="login-form-note">
+            输入访问密钥，继续你的创作与管理。
+            <br />
+            系统会根据密钥自动识别你的访问权限。
+          </p>
+          <form
+            className="login-form"
+            noValidate
+            onSubmit={(event) => void handleLogin(event)}
+            aria-busy={isSubmitting}
           >
-            {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
-            登录
-          </Button>
-        </CardContent>
-      </Card>
+            <div className="login-field">
+              <label htmlFor="auth-key">访问密钥</label>
+              <div className="login-input-wrap">
+                <Input
+                  ref={input}
+                  id="auth-key"
+                  name="auth-key"
+                  type={visible ? "text" : "password"}
+                  autoComplete="current-password"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  value={authKey}
+                  onChange={(event) => {
+                    setAuthKey(event.target.value);
+                    setError("");
+                  }}
+                  placeholder="输入你的访问密钥"
+                  disabled={isSubmitting}
+                  aria-invalid={Boolean(error)}
+                  aria-describedby={error ? "login-error" : "login-security"}
+                />
+                <button
+                  type="button"
+                  aria-label={visible ? "隐藏密钥" : "显示密钥"}
+                  aria-pressed={visible}
+                  onClick={() => setVisible((value) => !value)}
+                >
+                  {visible ? <EyeOff size={17} /> : <Eye size={17} />}
+                </button>
+              </div>
+              {error && (
+                <p id="login-error" role="alert" className="text-xs leading-6 text-destructive">
+                  {error}
+                </p>
+              )}
+            </div>
+            <Button
+              type="submit"
+              className="h-12 w-full justify-between px-5"
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? "正在验证…" : "进入工作空间"}
+              {isSubmitting ? (
+                <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <ArrowRight className="size-4" aria-hidden="true" />
+              )}
+            </Button>
+          </form>
+          <p id="login-security" className="login-security-note">
+            <ShieldCheck size={15} className="shrink-0 text-primary" />
+            请妥善保管密钥，不要在共享设备上保持登录。
+          </p>
+        </div>
+      </section>
     </div>
   );
 }

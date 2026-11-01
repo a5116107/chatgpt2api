@@ -1,8 +1,14 @@
-import { httpRequest, request } from "@/lib/request";
+import { httpRequest, request, streamRequest } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
-export type ImagePoolState = "ready" | "probation" | "cooldown" | "exhausted" | "quarantined" | "disabled";
+export type ImagePoolState =
+  | "ready"
+  | "probation"
+  | "cooldown"
+  | "exhausted"
+  | "quarantined"
+  | "disabled";
 export type ImageQuotaConfidence = "verified" | "estimated" | "unknown";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
@@ -38,6 +44,8 @@ export type Account = {
   fail: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
+  text_schedulable?: boolean;
+  image_schedulable?: boolean;
   image_pool_state?: ImagePoolState;
   image_pool_reason?: string | null;
   image_quota_confidence?: ImageQuotaConfidence;
@@ -50,6 +58,7 @@ export type Account = {
   image_latency_ema_ms?: number;
   image_consecutive_failures?: number;
   image_probe_inflight?: boolean;
+  health_check?: AccountHealthCheck | null;
   last_used_at?: string | null;
   proxy?: string | null;
   runtime_profile_id?: string | null;
@@ -58,6 +67,45 @@ export type Account = {
   profile_snapshot?: RuntimeProfile | null;
   proxy_policy?: RuntimeProfile["proxy_policy"] | null;
 };
+
+export type AccountHealthCheck = {
+  state: string;
+  phase: "connection" | "login";
+  checked_at: number;
+  duration_ms: number;
+  http_status: number | null;
+  stale?: boolean;
+};
+
+export type AccountHealthProgress = {
+  progress_id: string;
+  started_at: number;
+  total: number;
+  processed: number;
+  done: boolean;
+  error: string | null;
+  counts: Record<string, number>;
+};
+
+export function checkAccountHealth(access_tokens: string[] = []) {
+  return httpRequest<AccountHealthProgress>("/api/accounts/health-check", {
+    method: "POST",
+    body: { access_tokens },
+  });
+}
+
+export function fetchAccountHealthProgress(id: string, signal?: AbortSignal) {
+  return httpRequest<AccountHealthProgress>(
+    `/api/accounts/health-check/${encodeURIComponent(id)}`,
+    {
+      signal,
+    },
+  );
+}
+
+export function fetchCurrentAccountHealth() {
+  return httpRequest<{ job: AccountHealthProgress | null }>("/api/accounts/health-check/current");
+}
 
 export type AccountImportPayload = {
   access_token: string;
@@ -151,6 +199,12 @@ export type RuntimeProfile = {
     register_proxy?: string;
     runtime_proxy?: string;
     allow_rotate?: boolean;
+    failover_enabled?: boolean;
+    country?: string;
+    failover_count?: number;
+    last_failover_at?: string;
+    last_failover_reason?: string;
+    previous_group?: string;
   };
   clearance?: {
     scope?: string;
@@ -215,6 +269,7 @@ export type ProxyRuntimeClearanceSettings = {
 };
 
 export type ProxyRuntimeSettings = {
+  platform_url: string;
   enabled: boolean;
   egress_mode: ProxyRuntimeEgressMode;
   proxy_url: string;
@@ -408,6 +463,7 @@ export type ImageResponse = {
 };
 
 export type ImageTask = {
+  account_hash?: string;
   id: string;
   status: "queued" | "running" | "success" | "error";
   mode: "generate" | "edit";
@@ -462,10 +518,7 @@ export type RegisterMailProviderValue =
   | RegisterMailProviderValue[]
   | { [key: string]: RegisterMailProviderValue };
 
-export type RegisterMailProvider = Record<
-  string,
-  RegisterMailProviderValue | undefined
->;
+export type RegisterMailProvider = Record<string, RegisterMailProviderValue | undefined>;
 
 export type RegisterConfig = {
   enabled: boolean;
@@ -501,6 +554,11 @@ export type RegisterConfig = {
     started_at?: string;
     updated_at?: string;
     finished_at?: string;
+    finish_reason?: string;
+    start_blocked_reason?: string;
+    last_error?: string;
+    consecutive_failures?: number;
+    proxy_capacity?: { enabled: boolean; strict?: boolean; remaining: number | null };
   };
   logs?: Array<{
     time: string;
@@ -588,8 +646,11 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
-export async function fetchRefreshProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
+export async function fetchRefreshProgress(progressId: string, signal?: AbortSignal) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`, {
+    signal,
+    timeout: 30000,
+  });
 }
 
 export async function reLoginAccounts(accessTokens: string[]) {
@@ -599,8 +660,11 @@ export async function reLoginAccounts(accessTokens: string[]) {
   });
 }
 
-export async function fetchReLoginProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`);
+export async function fetchReLoginProgress(progressId: string, signal?: AbortSignal) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`, {
+    signal,
+    timeout: 30000,
+  });
 }
 
 export async function updateAccount(
@@ -650,24 +714,32 @@ export async function rebindRuntimeProfile(accessToken: string, profileId = "") 
   });
 }
 
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageResponse>(
-    "/v1/images/generations",
-    {
-      method: "POST",
-      body: {
-        prompt,
-        ...(model ? { model } : {}),
-        ...(size ? { size } : {}),
-        quality,
-        n: 1,
-        response_format: "b64_json",
-      },
+export async function generateImage(
+  prompt: string,
+  model?: ImageModel,
+  size?: string,
+  quality = "auto",
+) {
+  return httpRequest<ImageResponse>("/v1/images/generations", {
+    method: "POST",
+    body: {
+      prompt,
+      ...(model ? { model } : {}),
+      ...(size ? { size } : {}),
+      quality,
+      n: 1,
+      response_format: "b64_json",
     },
-  );
+  });
 }
 
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function editImage(
+  files: File | File[],
+  prompt: string,
+  model?: ImageModel,
+  size?: string,
+  quality = "auto",
+) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
 
@@ -684,16 +756,19 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   formData.append("quality", quality);
   formData.append("n", "1");
 
-  return httpRequest<ImageResponse>(
-    "/v1/images/edits",
-    {
-      method: "POST",
-      body: formData,
-    },
-  );
+  return httpRequest<ImageResponse>("/v1/images/edits", {
+    method: "POST",
+    body: formData,
+  });
 }
 
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function createImageGenerationTask(
+  clientTaskId: string,
+  prompt: string,
+  model?: ImageModel,
+  size?: string,
+  quality = "auto",
+) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
     body: {
@@ -775,28 +850,39 @@ export async function testBackupConnection() {
 }
 
 export async function testImageStorageConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
-    method: "POST",
-    body: {},
-  });
+  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>(
+    "/api/image-storage/test",
+    {
+      method: "POST",
+      body: {},
+    },
+  );
 }
 
 export async function syncImageStorage() {
-  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
-    method: "POST",
-    body: {},
-  });
+  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>(
+    "/api/image-storage/sync",
+    {
+      method: "POST",
+      body: {},
+    },
+  );
 }
 
 export async function fetchBackups() {
-  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups");
+  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>(
+    "/api/backups",
+  );
 }
 
 export async function runBackupNow() {
-  return httpRequest<{ result: { key: string; size: number; encrypted: boolean } }>("/api/backups/run", {
-    method: "POST",
-    body: {},
-  });
+  return httpRequest<{ result: { key: string; size: number; encrypted: boolean } }>(
+    "/api/backups/run",
+    {
+      method: "POST",
+      body: {},
+    },
+  );
 }
 
 export async function deleteBackup(key: string) {
@@ -822,12 +908,18 @@ export async function fetchManagedImages(filters: { start_date?: string; end_dat
   const params = new URLSearchParams();
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
-    `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
-  );
+  return httpRequest<{
+    items: ManagedImage[];
+    groups: Array<{ date: string; items: ManagedImage[] }>;
+  }>(`/api/images${params.toString() ? `?${params.toString()}` : ""}`);
 }
 
-export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
+export async function deleteManagedImages(body: {
+  paths?: string[];
+  start_date?: string;
+  end_date?: string;
+  all_matching?: boolean;
+}) {
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
 }
 
@@ -869,14 +961,21 @@ export async function setImageTags(path: string, tags: string[]) {
 }
 
 export async function deleteImageTag(tag: string) {
-  return httpRequest<{ ok: boolean; removed_from: number }>(`/api/images/tags/${encodeURIComponent(tag)}`, {
-    method: "DELETE",
-  });
+  return httpRequest<{ ok: boolean; removed_from: number }>(
+    `/api/images/tags/${encodeURIComponent(tag)}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 export type ImageStorageStats = {
-  disk_total_mb: number; disk_used_mb: number; disk_free_mb: number;
-  image_count: number; image_size_mb: number; image_size_bytes: number;
+  disk_total_mb: number;
+  disk_used_mb: number;
+  disk_free_mb: number;
+  image_count: number;
+  image_size_mb: number;
+  image_size_bytes: number;
 };
 
 export async function fetchImageStorage() {
@@ -884,7 +983,10 @@ export async function fetchImageStorage() {
 }
 
 export async function compressAllImages() {
-  return httpRequest<{ compressed: number; saved_bytes: number; saved_mb: number }>("/api/images/storage/compress", { method: "POST" });
+  return httpRequest<{ compressed: number; saved_bytes: number; saved_mb: number }>(
+    "/api/images/storage/compress",
+    { method: "POST" },
+  );
 }
 
 export async function deleteToTarget(targetFreeMb: number) {
@@ -894,12 +996,18 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: {
+  type?: string;
+  start_date?: string;
+  end_date?: string;
+}) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  return httpRequest<{ items: SystemLog[] }>(
+    `/api/logs${params.toString() ? `?${params.toString()}` : ""}`,
+  );
 }
 
 export async function deleteSystemLogs(ids: string[]) {
@@ -920,7 +1028,10 @@ export async function createUserKey(name: string) {
   });
 }
 
-export async function updateUserKey(keyId: string, updates: { enabled?: boolean; name?: string; key?: string }) {
+export async function updateUserKey(
+  keyId: string,
+  updates: { enabled?: boolean; name?: string; key?: string },
+) {
   return httpRequest<{ item: UserKey; items: UserKey[] }>(`/api/auth/users/${keyId}`, {
     method: "POST",
     body: updates,
@@ -1097,10 +1208,13 @@ export async function updateSub2APIServer(
     group_id?: string;
   },
 ) {
-  return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(`/api/sub2api/servers/${serverId}`, {
-    method: "POST",
-    body: updates,
-  });
+  return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(
+    `/api/sub2api/servers/${serverId}`,
+    {
+      method: "POST",
+      body: updates,
+    },
+  );
 }
 
 export async function fetchSub2APIServerGroups(serverId: string) {
@@ -1122,14 +1236,19 @@ export async function fetchSub2APIServerAccounts(serverId: string) {
 }
 
 export async function startSub2APIImport(serverId: string, accountIds: string[]) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`, {
-    method: "POST",
-    body: { account_ids: accountIds },
-  });
+  return httpRequest<{ import_job: CPAImportJob | null }>(
+    `/api/sub2api/servers/${serverId}/import`,
+    {
+      method: "POST",
+      body: { account_ids: accountIds },
+    },
+  );
 }
 
 export async function fetchSub2APIImportJob(serverId: string) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`);
+  return httpRequest<{ import_job: CPAImportJob | null }>(
+    `/api/sub2api/servers/${serverId}/import`,
+  );
 }
 
 // ── Upstream proxy ────────────────────────────────────────────────
@@ -1248,10 +1367,27 @@ export type AccountCapability = {
 };
 
 export type ProxyNode = {
+  protected?: boolean;
+  assignment_ready?: boolean;
+  assignment_enabled?: boolean;
+  probe?: {
+    network_ok: boolean;
+    target_ok: boolean;
+    target_status: number;
+    exit_ip: string;
+    country: string;
+    latency_ms: number | null;
+    observed_at: string;
+    network_error?: string;
+    target_error?: string;
+  };
   id: string;
   proxy: string;
   status: "healthy" | "cooldown" | "dead" | string;
-  score: number;
+  score: number | null;
+  testable?: boolean;
+  observed_at?: string | null;
+  observation_scope?: string;
   success: number;
   fail: number;
   http_403: number;
@@ -1266,6 +1402,72 @@ export type ProxyNode = {
   updated_at?: string;
   cooldown_until?: number | null;
 };
+
+export type ProxyPlatformStatus = {
+  direct_pool?: {
+    total: number;
+    ready: number;
+    enabled: number;
+    assignable: number;
+    countries: string[];
+    valid_until: string;
+  };
+  status: string;
+  source: string;
+  project?: string;
+  revision?: number;
+  runtime_revision?: number;
+  observed_at?: string;
+  valid_until?: string;
+  error_code?: string;
+  bindings?: {
+    unit: string;
+    enabled: boolean;
+    strict: boolean;
+    limit: number;
+    used: number;
+    remaining: number;
+    groups: number;
+  };
+  capacity?: {
+    unit: string;
+    max_concurrency: number;
+    observed_active_connections: number;
+    observed_remaining_connections: number | null;
+    rate_limit_per_minute: number;
+    eligible_nodes: number;
+    runtime_routes: number;
+    observed_unique_exits: number;
+    live_gateways: number;
+  };
+  policy?: {
+    id: string;
+    selection_mode: string;
+    ttl_mode: string;
+    ttl_seconds: number;
+    countries: string[] | null;
+  };
+  nodes: Array<{
+    id: string;
+    country: string;
+    country_source: string;
+    exit_country?: string;
+    exit_asn?: number;
+    geo_observed_at?: string;
+    geo_valid_until?: string;
+    geo_verified: boolean;
+    health: string;
+    observed_at: string;
+    exit_ip: string;
+    latency_ms: number | null;
+    routes: number;
+    routable: boolean;
+  }>;
+};
+
+export async function fetchProxyPlatform(signal?: AbortSignal) {
+  return httpRequest<ProxyPlatformStatus>("/api/proxies/platform", { signal, timeout: 12000 });
+}
 
 export type UnifiedTask = {
   id: string;
@@ -1346,7 +1548,9 @@ export async function fetchRiskSummary() {
   return httpRequest<RiskSummary>("/api/risk/summary");
 }
 
-export async function fetchRiskEvents(filters: { limit?: number; code?: string; scope?: string } = {}) {
+export async function fetchRiskEvents(
+  filters: { limit?: number; code?: string; scope?: string } = {},
+) {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit ?? 200));
   if (filters.code) params.set("code", filters.code);
@@ -1359,53 +1563,107 @@ export async function fetchAccountCapabilities() {
 }
 
 export async function probeAccountCapabilities() {
-  return httpRequest<{ created: number; updated: number; removed: number; total: number }>("/api/accounts/capabilities/probe-batch", { method: "POST" });
+  return httpRequest<{ created: number; updated: number; removed: number; total: number }>(
+    "/api/accounts/capabilities/probe-batch",
+    { method: "POST" },
+  );
 }
 
-export async function updateAccountCapability(accountKey: string, updates: Partial<AccountCapability>) {
-  return httpRequest<{ item: AccountCapability }>(`/api/accounts/${encodeURIComponent(accountKey)}/capabilities`, {
-    method: "POST",
-    body: updates,
-  });
+export async function updateAccountCapability(
+  accountKey: string,
+  updates: Partial<AccountCapability>,
+) {
+  return httpRequest<{ item: AccountCapability }>(
+    `/api/accounts/${encodeURIComponent(accountKey)}/capabilities`,
+    {
+      method: "POST",
+      body: updates,
+    },
+  );
 }
 
 export async function fetchProxies() {
   return httpRequest<{ items: ProxyNode[] }>("/api/proxies");
 }
 
-export async function upsertProxy(body: { proxy: string; country?: string; provider?: string; asn?: string }) {
+export async function upsertProxy(body: {
+  proxy: string;
+  country?: string;
+  provider?: string;
+  asn?: string;
+}) {
   return httpRequest<{ item: ProxyNode }>("/api/proxies", { method: "POST", body });
 }
 
-export async function reportProxyEvent(proxy: string, code: string, statusCode?: number) {
+export async function reportProxyEvent(proxyId: string, code: string, statusCode?: number) {
   return httpRequest<{ item: ProxyNode | null }>("/api/proxies/events", {
     method: "POST",
-    body: { proxy, code, status_code: statusCode },
+    body: { proxy_id: proxyId, code, status_code: statusCode },
   });
 }
 
 export async function rebuildProxyScores() {
-  return httpRequest<{ rebuilt: number; total: number }>("/api/proxies/rebuild", { method: "POST" });
+  return httpRequest<{ rebuilt: number; total: number }>("/api/proxies/rebuild", {
+    method: "POST",
+  });
 }
 
 export async function deleteProxies(body: { ids?: string[]; statuses?: string[] } = {}) {
-  return httpRequest<{ removed: number; kept: number }>("/api/proxies/delete", { method: "POST", body });
+  return httpRequest<{ removed: number; kept: number }>("/api/proxies/delete", {
+    method: "POST",
+    body,
+  });
 }
 
-export async function pruneProxies(body: { min_score?: number; min_failures?: number; include_cooldown?: boolean } = {}) {
-  return httpRequest<{ removed: number; kept: number; removed_ids: string[] }>("/api/proxies/prune", { method: "POST", body });
+export async function pruneProxies(
+  body: { min_score?: number; min_failures?: number; include_cooldown?: boolean } = {},
+) {
+  return httpRequest<{ removed: number; kept: number; removed_ids: string[] }>(
+    "/api/proxies/prune",
+    { method: "POST", body },
+  );
 }
 
-export async function testProxyPool(body: { limit?: number; include_dead?: boolean } = {}) {
-  return httpRequest<{ tested: number; ok: number; failed: number; items: Array<Record<string, unknown>> }>("/api/proxies/test-pool", { method: "POST", body });
+export async function importProxies(text: string, provider: string) {
+  return httpRequest<{
+    imported: number;
+    duplicates: number;
+    invalid: Array<{ line: number; reason: string }>;
+    ids: string[];
+  }>("/api/proxies/import", { method: "POST", body: { text, provider } });
 }
 
-export async function fetchUnifiedTasks(filters: { limit?: number; type?: string; status?: string } = {}) {
+export async function activateProxies(ids: string[], enabled: boolean) {
+  return httpRequest<{ updated: number; enabled: boolean }>("/api/proxies/activate", {
+    method: "POST",
+    body: { ids, enabled },
+  });
+}
+
+export async function testProxyPool(
+  body: { limit?: number; include_dead?: boolean; ids?: string[] } = {},
+) {
+  return httpRequest<{
+    tested: number;
+    ok: number;
+    failed: number;
+    skipped: number;
+    items: Array<Record<string, unknown>>;
+  }>("/api/proxies/test-pool", { method: "POST", body, timeout: 180000 });
+}
+
+export async function fetchUnifiedTasks(
+  filters: { limit?: number; type?: string; status?: string } = {},
+  signal?: AbortSignal,
+) {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit ?? 300));
   if (filters.type) params.set("type", filters.type);
   if (filters.status) params.set("status", filters.status);
-  return httpRequest<{ items: UnifiedTask[] }>(`/api/tasks?${params.toString()}`);
+  return httpRequest<{ items: UnifiedTask[] }>(`/api/tasks?${params.toString()}`, {
+    signal,
+    timeout: 20000,
+  });
 }
 
 export async function syncUnifiedTasks() {
@@ -1419,57 +1677,160 @@ export async function bulkDeleteUnifiedTasks(ids: string[] = [], terminalOnly = 
   });
 }
 
-export async function fetchConversations(params: { limit?: number; include_messages?: boolean } = {}) {
+export async function fetchConversations(
+  params: { limit?: number; include_messages?: boolean } = {},
+) {
   const query = new URLSearchParams();
   query.set("limit", String(params.limit ?? 100));
   if (params.include_messages) query.set("include_messages", "true");
   return httpRequest<{ items: Conversation[] }>(`/api/conversations?${query.toString()}`);
 }
 
-export async function createConversation(body: { title?: string; model?: string; source?: string; metadata?: Record<string, unknown> } = {}) {
-  const response = await httpRequest<{ item: Conversation }>("/api/conversations", { method: "POST", body });
+export async function createConversation(
+  body: {
+    title?: string;
+    model?: string;
+    source?: string;
+    metadata?: Record<string, unknown>;
+  } = {},
+) {
+  const response = await httpRequest<{ item: Conversation }>("/api/conversations", {
+    method: "POST",
+    body,
+  });
   return response.item;
 }
 
 export async function fetchConversation(conversationId: string) {
-  const response = await httpRequest<{ item: Conversation }>(`/api/conversations/${encodeURIComponent(conversationId)}`);
+  const response = await httpRequest<{ item: Conversation }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}`,
+  );
   return response.item;
 }
 
-export async function updateConversation(conversationId: string, updates: Partial<Pick<Conversation, "title" | "model" | "status" | "source" | "metadata">>) {
-  const response = await httpRequest<{ item: Conversation }>(`/api/conversations/${encodeURIComponent(conversationId)}`, {
-    method: "POST",
-    body: updates,
-  });
+export async function updateConversation(
+  conversationId: string,
+  updates: Partial<Pick<Conversation, "title" | "model" | "status" | "source" | "metadata">>,
+) {
+  const response = await httpRequest<{ item: Conversation }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}`,
+    {
+      method: "POST",
+      body: updates,
+    },
+  );
   return response.item;
 }
 
 export async function deleteConversation(conversationId: string) {
-  return httpRequest<{ removed: number }>(`/api/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+  return httpRequest<{ removed: number }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE" },
+  );
 }
 
-export async function appendConversationMessage(conversationId: string, message: { role: string; content: string; metadata?: Record<string, unknown> }) {
-  const response = await httpRequest<{ item: Conversation }>(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
-    method: "POST",
-    body: message,
-  });
+export async function appendConversationMessage(
+  conversationId: string,
+  message: { role: string; content: string; metadata?: Record<string, unknown> },
+) {
+  const response = await httpRequest<{ item: Conversation }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+    {
+      method: "POST",
+      body: message,
+    },
+  );
   return response.item;
 }
 
-export function getConversationExportUrl(conversationId: string, format: "json" | "markdown" = "markdown") {
-  const params = new URLSearchParams();
-  params.set("format", format);
-  return `/api/conversations/${encodeURIComponent(conversationId)}/export?${params.toString()}`;
+export async function exportConversation(conversationId: string) {
+  return httpRequest<Blob>(
+    "/api/conversations/" + encodeURIComponent(conversationId) + "/export?format=markdown",
+    { responseType: "blob" },
+  );
 }
 
-export async function sendChatMessage(body: { conversation_id?: string; model?: string; messages: Array<{ role: string; content: string }>; stream?: boolean }) {
-  return httpRequest<ChatCompletionResponse>("/v1/chat/completions", {
-    method: "POST",
-    body,
-  });
+export async function sendChatMessage(
+  body: {
+    conversation_id: string;
+    model: string;
+    messages: Array<{ role: string; content: string }>;
+  },
+  options: { signal: AbortSignal; onDelta: (value: string) => void },
+) {
+  const response = await streamRequest(
+    "/v1/chat/completions",
+    { ...body, stream: true },
+    options.signal,
+  );
+  if (response.headers.get("content-type")?.includes("application/json")) {
+    const result = (await response.json()) as ChatCompletionResponse;
+    const content = result.choices?.[0]?.message?.content;
+    if (!content) throw new Error("服务未返回回复内容，请检查账号状态后重试。");
+    options.onDelta(String(content));
+    return;
+  }
+  if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream"))
+    throw new Error("服务返回了非预期格式，请稍后重试。");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finished = false;
+  let received = false;
+  const consume = (frame: string) => {
+    const data = frame
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data) return;
+    if (data.trim() === "[DONE]") {
+      finished = true;
+      return;
+    }
+    const chunk = JSON.parse(data);
+    if (chunk.error)
+      throw new Error(
+        typeof chunk.error === "string" ? chunk.error : chunk.error.message || "生成中断",
+      );
+    const choice = chunk.choices?.[0];
+    const delta = choice?.delta?.content;
+    if (typeof delta === "string" && delta) {
+      received = true;
+      options.onDelta(delta);
+    }
+    if (choice?.finish_reason) finished = true;
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        consume(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+      }
+      if (done) {
+        if (buffer.trim()) consume(buffer);
+        break;
+      }
+    }
+    if (!finished) throw new Error("连接提前断开，已接收的内容已保留。");
+    if (!received) throw new Error("服务未返回回复内容，请检查账号状态后重试。");
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
-export async function createVideoGenerationTask(body: { client_task_id?: string; prompt: string; model?: string; size?: string; seconds?: number }) {
+export async function createVideoGenerationTask(body: {
+  client_task_id?: string;
+  prompt: string;
+  model?: string;
+  size?: string;
+  seconds?: number;
+}) {
   return httpRequest<VideoTask>("/v1/videos/generations", { method: "POST", body });
 }
 
@@ -1477,7 +1838,9 @@ export async function fetchVideoTasks(ids: string[] = []) {
   const params = new URLSearchParams();
   if (ids.length) params.set("ids", ids.join(","));
   params.set("_t", String(Date.now()));
-  return httpRequest<{ items: VideoTask[]; missing_ids: string[] }>(`/v1/videos?${params.toString()}`);
+  return httpRequest<{ items: VideoTask[]; missing_ids: string[] }>(
+    `/v1/videos?${params.toString()}`,
+  );
 }
 
 export async function fetchVideoTask(taskId: string) {
@@ -1491,6 +1854,18 @@ export async function cancelVideoTask(taskId: string) {
   });
 }
 
-export function getVideoContentUrl(taskId: string) {
-  return `/v1/videos/${encodeURIComponent(taskId)}/content`;
+export function fetchVideoContent(taskId: string, signal?: AbortSignal) {
+  return httpRequest<Blob>("/v1/videos/" + encodeURIComponent(taskId) + "/content", {
+    signal,
+    responseType: "blob",
+    timeout: 120000,
+    redirectOnUnauthorized: false,
+  });
+}
+
+export async function setProxyFailover(profileId: string, enabled: boolean) {
+  return httpRequest<{ profile: RuntimeProfile }>("/api/runtime-profiles/proxy-policy", {
+    method: "POST",
+    body: { profile_id: profileId, enabled },
+  });
 }

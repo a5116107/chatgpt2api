@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import webConfig from "@/constants/common-env";
 import { parseChangelog, type ReleaseInfo } from "@/lib/release";
 
-const latestVersionUrl =
-  "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
+const latestVersionUrl = "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
 const latestChangelogUrl =
   "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/CHANGELOG.md";
 
@@ -33,7 +32,7 @@ function isNewerVersion(latestVersion: string, currentVersion: string) {
 
 export function useVersionCheck() {
   const currentVersion = webConfig.appVersion;
-  const localReleases = useMemo(readLocalReleases, []);
+  const localReleases = useMemo(() => readLocalReleases(), []);
   const [latestVersion, setLatestVersion] = useState(currentVersion);
   const [releases, setReleases] = useState<ReleaseInfo[]>(localReleases);
   const [checking, setChecking] = useState(false);

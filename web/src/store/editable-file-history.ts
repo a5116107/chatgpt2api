@@ -16,11 +16,18 @@ const editableFileStorage = localforage.createInstance({
 const draftsKey = (kind: string) => `drafts:${kind}`;
 const deletedKey = (kind: string) => `deleted:${kind}`;
 
-export async function listEditableFileDrafts(kind: string): Promise<Record<string, EditableFileDraft>> {
-  return (await editableFileStorage.getItem<Record<string, EditableFileDraft>>(draftsKey(kind))) || {};
+export async function listEditableFileDrafts(
+  kind: string,
+): Promise<Record<string, EditableFileDraft>> {
+  return (
+    (await editableFileStorage.getItem<Record<string, EditableFileDraft>>(draftsKey(kind))) || {}
+  );
 }
 
-export async function saveEditableFileDrafts(kind: string, drafts: Record<string, EditableFileDraft>): Promise<void> {
+export async function saveEditableFileDrafts(
+  kind: string,
+  drafts: Record<string, EditableFileDraft>,
+): Promise<void> {
   await editableFileStorage.setItem(draftsKey(kind), drafts);
 }
 

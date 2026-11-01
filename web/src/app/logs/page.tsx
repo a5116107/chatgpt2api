@@ -1,7 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, ImageIcon, LoaderCircle, RefreshCw, Search, Trash2 } from "lucide-react";
+import NextImage from "next/image";
+
+import { useEffect, useMemo, useState, useCallback } from "react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  ImageIcon,
+  LoaderCircle,
+  RefreshCw,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { DateRangeFilter } from "@/components/date-range-filter";
@@ -11,9 +21,29 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
@@ -71,23 +101,28 @@ function LogsContent() {
   const safePage = Math.min(page, pageCount);
   const currentRows = items.slice((safePage - 1) * pageSize, safePage * pageSize);
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
-  const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
+  const currentPageSelected =
+    currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = async () => {
-    setIsLoading(true);
-    try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
-      setItems(data.items);
-      setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
-      setPage(1);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载日志失败");
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
+  const loadLogs = useCallback(
+    () =>
+      fetchSystemLogs({ type, start_date: startDate, end_date: endDate })
+        .then((data) => {
+          setItems(data.items);
+          setSelectedIds((current) =>
+            current.filter((id) => data.items.some((item) => item.id === id)),
+          );
+          setPage(1);
+        })
+        .catch((error: unknown) => {
+          toast.error(error instanceof Error ? error.message : "加载日志失败");
+        })
+        .finally(() => {
+          setIsLoading(false);
+        }),
+    [type, startDate, endDate],
+  );
   const clearFilters = () => {
     setStartDate("");
     setEndDate("");
@@ -105,7 +140,11 @@ function LogsContent() {
   };
 
   const toggleIds = (ids: string[], checked: boolean) => {
-    setSelectedIds((current) => checked ? Array.from(new Set([...current, ...ids])) : current.filter((id) => !ids.includes(id)));
+    setSelectedIds((current) =>
+      checked
+        ? Array.from(new Set([...current, ...ids]))
+        : current.filter((id) => !ids.includes(id)),
+    );
   };
 
   const confirmDelete = async () => {
@@ -131,58 +170,117 @@ function LogsContent() {
 
   useEffect(() => {
     void loadLogs();
-  }, [type, startDate, endDate]);
+  }, [loadLogs]);
 
   return (
     <section className="space-y-5">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+      <div className="workbench-toolbar">
         <div className="space-y-1">
-          <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Logs</div>
+          <div className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+            Logs
+          </div>
           <h1 className="text-2xl font-semibold tracking-tight">日志管理</h1>
         </div>
         <div className="flex flex-wrap gap-2">
           <Select value={type} onValueChange={setType}>
-            <SelectTrigger className="h-10 w-[150px] rounded-xl border-stone-200 bg-white"><SelectValue /></SelectTrigger>
+            <SelectTrigger
+              className="h-10 w-[150px] rounded-xl border-border bg-card"
+              aria-label="筛选类型"
+            >
+              <SelectValue />
+            </SelectTrigger>
             <SelectContent>
               <SelectItem value={LogType.Call}>调用日志</SelectItem>
               <SelectItem value={LogType.Account}>账号管理日志</SelectItem>
             </SelectContent>
           </Select>
-          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
-          <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
+          <DateRangeFilter
+            startDate={startDate}
+            endDate={endDate}
+            onChange={(start, end) => {
+              setStartDate(start);
+              setEndDate(end);
+            }}
+          />
+          <Button
+            variant="outline"
+            onClick={clearFilters}
+            className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80"
+          >
             清除筛选条件
           </Button>
-          <Button onClick={() => void loadLogs()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
-            {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
+          <Button
+            onClick={() => void loadLogs()}
+            disabled={isLoading}
+            className="h-10 rounded-xl bg-primary px-4 text-primary-foreground hover:bg-primary/90"
+          >
+            {isLoading ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <Search className="size-4" />
+            )}
             查询
           </Button>
         </div>
       </div>
 
-      <Card className="overflow-hidden rounded-2xl border-white/80 bg-white/90 shadow-sm">
+      <Card className="overflow-hidden rounded-2xl border-border bg-card shadow-sm">
         <CardContent className="p-0">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
-            <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
+            <div className="flex flex-wrap items-center gap-3 text-sm text-foreground/80">
               <span>共 {items.length} 条</span>
               <label className="flex items-center gap-2">
-                <Checkbox checked={currentPageSelected} onCheckedChange={(checked) => toggleIds(currentRows.map((item) => item.id), Boolean(checked))} />
+                <Checkbox
+                  checked={currentPageSelected}
+                  onCheckedChange={(checked) =>
+                    toggleIds(
+                      currentRows.map((item) => item.id),
+                      Boolean(checked),
+                    )
+                  }
+                  aria-label="本页全选"
+                />
                 本页全选
               </label>
               <label className="flex items-center gap-2">
-                <Checkbox checked={allSelected} onCheckedChange={(checked) => toggleIds(items.map((item) => item.id), Boolean(checked))} />
+                <Checkbox
+                  checked={allSelected}
+                  onCheckedChange={(checked) =>
+                    toggleIds(
+                      items.map((item) => item.id),
+                      Boolean(checked),
+                    )
+                  }
+                  aria-label="全选结果"
+                />
                 全选结果
               </label>
               {selectedIds.length > 0 ? <span>已选 {selectedIds.length} 条</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs()} disabled={isLoading}>
+              <Button
+                variant="ghost"
+                className="h-8 rounded-lg px-3 text-muted-foreground"
+                onClick={() => void loadLogs()}
+                disabled={isLoading}
+              >
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>
-              <button type="button" className="text-sm text-stone-500 hover:text-stone-900 disabled:text-stone-300" onClick={() => setSelectedIds([])} disabled={selectedIds.length === 0 || isDeleting}>
+              <button
+                type="button"
+                className="text-sm text-muted-foreground hover:text-foreground disabled:text-muted-foreground"
+                onClick={() => setSelectedIds([])}
+                disabled={selectedIds.length === 0 || isDeleting}
+              >
                 取消选择
               </button>
-              <Button variant="outline" className="h-8 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50" onClick={() => setDeletingItems(items.filter((item) => selectedSet.has(item.id)))} disabled={selectedIds.length === 0 || isDeleting}>
+              <Button
+                variant="outline"
+                className="h-8 rounded-lg border-destructive/25 bg-card px-3 text-destructive hover:bg-destructive/10"
+                onClick={() => setDeletingItems(items.filter((item) => selectedSet.has(item.id)))}
+                disabled={selectedIds.length === 0 || isDeleting}
+              >
                 <Trash2 className="size-4" />
                 删除所选
               </Button>
@@ -207,17 +305,28 @@ function LogsContent() {
                 {currentRows.map((item) => {
                   const urls = getUrls(item);
                   return (
-                    <TableRow key={item.id} className="text-stone-600">
+                    <TableRow key={item.id} className="text-foreground/80">
                       <TableCell>
-                        <Checkbox checked={selectedSet.has(item.id)} onCheckedChange={(checked) => toggleIds([item.id], Boolean(checked))} />
+                        <Checkbox
+                          checked={selectedSet.has(item.id)}
+                          onCheckedChange={(checked) => toggleIds([item.id], Boolean(checked))}
+                          aria-label="选择此项"
+                        />
                       </TableCell>
                       <TableCell className="whitespace-nowrap">{item.time}</TableCell>
-                      <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
+                      <TableCell>
+                        <Badge variant="secondary" className="rounded-md">
+                          {typeLabels[item.type] || item.type}
+                        </Badge>
+                      </TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
                       {isCallLog ? (
                         <TableCell>
-                          <Badge variant={item.detail?.status === "failed" ? "danger" : "success"} className="rounded-md">
+                          <Badge
+                            variant={item.detail?.status === "failed" ? "danger" : "success"}
+                            className="rounded-md"
+                          >
                             {getStatus(item)}
                           </Badge>
                         </TableCell>
@@ -230,30 +339,48 @@ function LogsContent() {
                                 <button
                                   key={`${url}-${imageIndex}`}
                                   type="button"
-                                  className="relative size-9 overflow-hidden rounded-lg border border-stone-200 bg-stone-100"
+                                  className="relative size-9 overflow-hidden rounded-lg border border-border bg-muted"
                                   onClick={() => openLogImage(item, imageIndex)}
                                   title="预览图片"
+                                  aria-label="预览图片"
                                 >
-                                  <ImageThumbnail src={url} thumbnailSrc={getImageThumbnailUrl(url)} className="h-full w-full" />
+                                  <ImageThumbnail
+                                    src={url}
+                                    thumbnailSrc={getImageThumbnailUrl(url)}
+                                    className="h-full w-full"
+                                  />
                                 </button>
                               ))}
-                              {urls.length > 3 ? <span className="text-xs text-stone-400">+{urls.length - 3}</span> : null}
+                              {urls.length > 3 ? (
+                                <span className="text-xs text-muted-foreground">
+                                  +{urls.length - 3}
+                                </span>
+                              ) : null}
                             </div>
                           ) : (
-                            <span className="inline-flex items-center gap-1 text-xs text-stone-400">
-                              <ImageIcon className="size-3.5" />
-                              -
+                            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                              <ImageIcon className="size-3.5" />-
                             </span>
                           )}
                         </TableCell>
                       ) : null}
-                      <TableCell className="max-w-[420px] truncate text-stone-500">{item.summary || "-"}</TableCell>
+                      <TableCell className="max-w-[420px] truncate text-muted-foreground">
+                        {item.summary || "-"}
+                      </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
-                          <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-600" onClick={() => openDetail(item)}>
+                          <Button
+                            variant="ghost"
+                            className="h-8 rounded-lg px-3 text-foreground/80"
+                            onClick={() => openDetail(item)}
+                          >
                             查看详情
                           </Button>
-                          <Button variant="ghost" className="h-8 rounded-lg px-3 text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={() => setDeletingItems([item])}>
+                          <Button
+                            variant="ghost"
+                            className="h-8 rounded-lg px-3 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                            onClick={() => setDeletingItems([item])}
+                          >
                             删除
                           </Button>
                         </div>
@@ -264,32 +391,52 @@ function LogsContent() {
               </TableBody>
             </Table>
           </div>
-          <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-            <span>第 {safePage} / {pageCount} 页，共 {items.length} 条</span>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+          <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3 text-sm text-muted-foreground">
+            <span>
+              第 {safePage} / {pageCount} 页，共 {items.length} 条
+            </span>
+            <Button
+              variant="outline"
+              size="icon"
+              className="size-9 rounded-lg border-border bg-card"
+              disabled={safePage <= 1}
+              onClick={() => setPage((value) => Math.max(1, value - 1))}
+              aria-label="上一页"
+            >
               <ChevronLeft className="size-4" />
             </Button>
-            <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage >= pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+            <Button
+              variant="outline"
+              size="icon"
+              className="size-9 rounded-lg border-border bg-card"
+              disabled={safePage >= pageCount}
+              onClick={() => setPage((value) => Math.min(pageCount, value + 1))}
+              aria-label="下一页"
+            >
               <ChevronRight className="size-4" />
             </Button>
           </div>
-          {!isLoading && items.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">没有找到日志</div> : null}
+          {!isLoading && items.length === 0 ? (
+            <div className="px-6 py-14 text-center text-sm text-muted-foreground">没有找到日志</div>
+          ) : null}
         </CardContent>
       </Card>
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
         <DialogContent className="flex h-[min(88vh,860px)] w-[min(92vw,920px)] flex-col overflow-hidden rounded-2xl p-0">
-          <DialogHeader className="shrink-0 border-b border-stone-100 px-6 py-5">
+          <DialogHeader className="shrink-0 border-b border-border px-6 py-5">
             <DialogTitle>日志详情</DialogTitle>
           </DialogHeader>
           <div className="flex-1 overflow-y-auto px-6 py-5">
             <div className="space-y-4">
-              <div className="grid gap-3 rounded-xl border border-stone-200 bg-white p-4 text-sm text-stone-600 md:grid-cols-2">
+              <div className="grid gap-3 rounded-xl border border-border bg-card p-4 text-sm text-foreground/80 md:grid-cols-2">
                 {Object.entries(detailLog?.detail || {})
                   .filter(([key, value]) => key !== "urls" && typeof value !== "object")
                   .map(([key, value]) => (
                     <div key={key} className="flex items-start justify-between gap-4">
-                      <span className="text-stone-400">{key}</span>
-                      <span className="text-right font-medium break-all text-stone-700">{String(value)}</span>
+                      <span className="text-muted-foreground">{key}</span>
+                      <span className="text-right font-medium break-all text-foreground/80">
+                        {String(value)}
+                      </span>
                     </div>
                   ))}
               </div>
@@ -299,18 +446,25 @@ function LogsContent() {
                     <button
                       key={url}
                       type="button"
-                      className="aspect-square overflow-hidden rounded-xl border border-stone-200 bg-stone-100"
+                      className="aspect-square overflow-hidden rounded-xl border border-border bg-muted"
                       onClick={() => {
                         setLightboxIndex(index);
                         setLightboxOpen(true);
                       }}
                     >
-                      <img src={url} alt="" className="h-full w-full object-cover" />
+                      <NextImage
+                        src={url}
+                        alt=""
+                        className="h-full w-full object-cover"
+                        unoptimized
+                        width={1200}
+                        height={1200}
+                      />
                     </button>
                   ))}
                 </div>
               ) : null}
-              <pre className="max-h-[72vh] overflow-auto rounded-xl border border-stone-200 bg-stone-50 p-4 text-xs leading-6 text-stone-700">
+              <pre className="max-h-[72vh] overflow-auto rounded-xl border border-border bg-muted p-4 text-xs leading-6 text-foreground/80">
                 {JSON.stringify(detailLog?.detail || {}, null, 2)}
               </pre>
             </div>
@@ -324,7 +478,10 @@ function LogsContent() {
         onOpenChange={setLightboxOpen}
         onIndexChange={setLightboxIndex}
       />
-      <Dialog open={deletingItems.length > 0} onOpenChange={(open) => (!open ? setDeletingItems([]) : null)}>
+      <Dialog
+        open={deletingItems.length > 0}
+        onOpenChange={(open) => (!open ? setDeletingItems([]) : null)}
+      >
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>{deletingItems.length === 1 ? "删除日志" : "删除所选日志"}</DialogTitle>
@@ -333,10 +490,19 @@ function LogsContent() {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" className="rounded-xl" onClick={() => setDeletingItems([])} disabled={isDeleting}>
+            <Button
+              variant="outline"
+              className="rounded-xl"
+              onClick={() => setDeletingItems([])}
+              disabled={isDeleting}
+            >
               取消
             </Button>
-            <Button className="rounded-xl bg-rose-600 text-white hover:bg-rose-700" onClick={() => void confirmDelete()} disabled={isDeleting || deletingItems.length === 0}>
+            <Button
+              className="rounded-xl bg-destructive text-white hover:bg-destructive"
+              onClick={() => void confirmDelete()}
+              disabled={isDeleting || deletingItems.length === 0}
+            >
               {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : null}
               确认删除
             </Button>
@@ -350,7 +516,11 @@ function LogsContent() {
 export default function LogsPage() {
   const { isCheckingAuth, session } = useAuthGuard(["admin"]);
   if (isCheckingAuth || !session || session.role !== "admin") {
-    return <div className="flex min-h-[40vh] items-center justify-center"><LoaderCircle className="size-5 animate-spin text-stone-400" /></div>;
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
   }
   return <LogsContent />;
 }

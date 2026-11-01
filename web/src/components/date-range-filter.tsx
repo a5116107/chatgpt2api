@@ -29,8 +29,11 @@ export function DateRangeFilter({ startDate, endDate, onChange }: DateRangeFilte
     <Field className="w-[240px]">
       <Popover>
         <PopoverTrigger asChild>
-          <Button variant="outline" className="h-10 justify-start rounded-xl border-stone-200 bg-white px-3 font-normal text-stone-700">
-            <CalendarIcon className="size-4 text-stone-400" />
+          <Button
+            variant="outline"
+            className="h-10 justify-start rounded-xl border-border bg-card px-3 font-normal text-foreground/80"
+          >
+            <CalendarIcon className="size-4 text-muted-foreground" />
             {label}
           </Button>
         </PopoverTrigger>
@@ -39,7 +42,12 @@ export function DateRangeFilter({ startDate, endDate, onChange }: DateRangeFilte
             mode="range"
             defaultMonth={selected?.from}
             selected={selected}
-            onSelect={(value) => onChange(value?.from ? format(value.from, "yyyy-MM-dd") : "", value?.to ? format(value.to, "yyyy-MM-dd") : "")}
+            onSelect={(value) =>
+              onChange(
+                value?.from ? format(value.from, "yyyy-MM-dd") : "",
+                value?.to ? format(value.to, "yyyy-MM-dd") : "",
+              )
+            }
             numberOfMonths={2}
           />
         </PopoverContent>

@@ -20,7 +20,9 @@ export default function HomePage() {
       router.replace(session ? getDefaultRouteForRole(session.role) : "/login");
     };
 
-    void redirect();
+    void redirect().catch(() => {
+      if (active) router.replace("/login");
+    });
     return () => {
       active = false;
     };

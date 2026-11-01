@@ -1,5 +1,7 @@
 "use client";
 
+import NextImage from "next/image";
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Download, X } from "lucide-react";
@@ -87,7 +89,7 @@ function normalizeTransform(transform: ImageTransform) {
   };
 }
 
-export function ImageLightbox({
+function LightboxViewport({
   images,
   currentIndex,
   open,
@@ -137,13 +139,6 @@ export function ImageLightbox({
     }
   }, []);
 
-  const resetTransform = useCallback(() => {
-    cancelScheduledTransform();
-    setTransform({ scale: 1, x: 0, y: 0 });
-    setIsGesturing(false);
-    gestureRef.current = null;
-  }, [cancelScheduledTransform]);
-
   const goPrev = useCallback(() => {
     if (hasPrev) onIndexChange(currentIndex - 1);
   }, [hasPrev, currentIndex, onIndexChange]);
@@ -151,10 +146,6 @@ export function ImageLightbox({
   const goNext = useCallback(() => {
     if (hasNext) onIndexChange(currentIndex + 1);
   }, [hasNext, currentIndex, onIndexChange]);
-
-  useEffect(() => {
-    resetTransform();
-  }, [current?.id, open, resetTransform]);
 
   useEffect(() => {
     return () => {
@@ -268,9 +259,7 @@ export function ImageLightbox({
           center.y -
           viewportCenterY -
           (gesture.startCenterY - viewportCenterY - gesture.startTransform.y) * effectiveRatio;
-        scheduleTransform(
-          normalizeTransform({ scale: targetScale, x: nextX, y: nextY }),
-        );
+        scheduleTransform(normalizeTransform({ scale: targetScale, x: nextX, y: nextY }));
         return;
       }
 
@@ -349,9 +338,7 @@ export function ImageLightbox({
           className="fixed inset-0 z-50 flex items-center justify-center outline-none"
           onPointerDownOutside={(e) => e.preventDefault()}
         >
-          <DialogPrimitive.Title className="sr-only">
-            图片预览
-          </DialogPrimitive.Title>
+          <DialogPrimitive.Title className="sr-only">图片预览</DialogPrimitive.Title>
 
           <div className="absolute top-[calc(env(safe-area-inset-top)+1rem)] right-4 z-10 flex items-center gap-2">
             {current.sizeLabel || current.dimensions ? (
@@ -397,13 +384,15 @@ export function ImageLightbox({
             onTouchEnd={handleTouchEnd}
             onTouchCancel={handleTouchCancel}
           >
-            <img
+            <NextImage
               src={current.src}
               alt=""
               className={cn(
                 "max-h-[90vh] max-w-[90vw] rounded-lg object-contain will-change-transform",
                 isGesturing ? "" : "transition-transform duration-150 ease-out",
-                transform.scale > minScale ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in",
+                transform.scale > minScale
+                  ? "cursor-grab active:cursor-grabbing"
+                  : "cursor-zoom-in",
               )}
               style={{
                 transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
@@ -414,6 +403,9 @@ export function ImageLightbox({
                 toggleZoom();
               }}
               draggable={false}
+              unoptimized
+              width={1200}
+              height={1200}
             />
           </div>
 
@@ -431,4 +423,9 @@ export function ImageLightbox({
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
   );
+}
+
+export function ImageLightbox(props: ImageLightboxProps) {
+  const current = props.images[props.currentIndex];
+  return <LightboxViewport key={(current?.id || "empty") + String(props.open)} {...props} />;
 }

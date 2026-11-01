@@ -1,1 +1,7 @@
 DEPLOY_MANIFEST.txt text eol=lf
+web/**/*.ts text eol=lf
+web/**/*.tsx text eol=lf
+web/**/*.css text eol=lf
+web/**/*.mjs text eol=lf
+web/**/*.json text eol=lf
+web/**/*.md text eol=lf

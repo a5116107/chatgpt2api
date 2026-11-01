@@ -41,7 +41,10 @@ export function ChatPanel() {
         setConversationId(result.conversation_id);
       }
       setRaw(result);
-      setMessages([...nextMessages, { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
+      setMessages([
+        ...nextMessages,
+        { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") },
+      ]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -58,22 +61,37 @@ export function ChatPanel() {
 
   return (
     <div className="grid h-full min-h-0 gap-8 lg:grid-cols-[360px_minmax(0,1fr)]">
-      <section className="flex min-h-0 flex-col lg:border-r lg:border-stone-200/70 lg:pr-8 dark:lg:border-white/10">
-        <div className="border-b border-stone-200/70 pb-3 dark:border-white/10">
-          <h2 className="text-sm font-medium text-stone-500 dark:text-stone-400">请求</h2>
+      <section className="flex min-h-0 flex-col lg:border-r lg:border-border/70 lg:pr-8 ">
+        <div className="border-b border-border/70 pb-3 ">
+          <h2 className="text-sm font-medium text-muted-foreground ">请求</h2>
         </div>
         <div className="min-h-0 flex-1 space-y-4 overflow-auto pt-4">
           <div className="space-y-2">
             <Label htmlFor="chat-model">Model</Label>
-            <Input id="chat-model" value={model} onChange={(event) => setModel(event.target.value)} className="rounded-md border-stone-200/70 bg-transparent shadow-none dark:border-white/10" />
+            <Input
+              id="chat-model"
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              className="rounded-md border-border/70 bg-transparent shadow-none "
+            />
           </div>
           <div className="space-y-2">
             <Label htmlFor="chat-conversation">Conversation ID</Label>
-            <Input id="chat-conversation" value={conversationId || "自动创建"} readOnly className="rounded-md border-stone-200/70 bg-transparent text-xs shadow-none dark:border-white/10" />
+            <Input
+              id="chat-conversation"
+              value={conversationId || "自动创建"}
+              readOnly
+              className="rounded-md border-border/70 bg-transparent text-xs shadow-none "
+            />
           </div>
           <div className="space-y-2">
             <Label htmlFor="chat-input">Message</Label>
-            <Textarea id="chat-input" value={input} onChange={(event) => setInput(event.target.value)} className="min-h-32 rounded-md border-stone-200/70 bg-transparent shadow-none dark:border-white/10" />
+            <Textarea
+              id="chat-input"
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              className="min-h-32 rounded-md border-border/70 bg-transparent shadow-none "
+            />
           </div>
           <div className="flex gap-2">
             <Button size="sm" onClick={() => void sendChat()} disabled={loading || !input.trim()}>
@@ -84,22 +102,38 @@ export function ChatPanel() {
               清空
             </Button>
           </div>
-          {error ? <div className="rounded-md border border-rose-200 bg-rose-50/60 px-3 py-2 text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/20 dark:text-rose-300">{error}</div> : null}
-          <Textarea value={raw ? pretty(raw) : "{\n  \"messages\": []\n}"} readOnly className="min-h-72 resize-none rounded-md border-stone-200/70 bg-stone-50/50 p-4 font-mono text-xs leading-5 text-stone-600 shadow-none dark:border-white/10 dark:bg-white/[0.03] dark:text-stone-300" />
+          {error ? (
+            <div className="rounded-md border border-destructive/25 bg-destructive/60 px-3 py-2 text-sm text-destructive   ">
+              {error}
+            </div>
+          ) : null}
+          <Textarea
+            value={raw ? pretty(raw) : '{\n  "messages": []\n}'}
+            readOnly
+            className="min-h-72 resize-none rounded-md border-border/70 bg-muted/50 p-4 font-mono text-xs leading-5 text-foreground/80 shadow-none  dark:bg-white/[0.03] "
+          />
         </div>
       </section>
       <section className="flex min-h-0 flex-col">
-        <div className="border-b border-stone-200/70 pb-3 dark:border-white/10">
-          <h2 className="text-sm font-medium text-stone-500 dark:text-stone-400">对话</h2>
+        <div className="border-b border-border/70 pb-3 ">
+          <h2 className="text-sm font-medium text-muted-foreground ">对话</h2>
         </div>
         <div className="min-h-0 flex-1 space-y-4 overflow-auto pt-4">
-          {messages.length ? messages.map((message, index) => (
-            <div key={`${message.role}-${index}`} className="space-y-1.5 text-sm">
-              <div className="text-xs font-medium uppercase tracking-wide text-stone-400 dark:text-stone-500">{message.role}</div>
-              <div className="whitespace-pre-wrap leading-7 text-stone-700 dark:text-stone-300">{message.content}</div>
+          {messages.length ? (
+            messages.map((message, index) => (
+              <div key={`${message.role}-${index}`} className="space-y-1.5 text-sm">
+                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground ">
+                  {message.role}
+                </div>
+                <div className="whitespace-pre-wrap leading-7 text-foreground/80 ">
+                  {message.content}
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground ">
+              暂无对话消息
             </div>
-          )) : (
-            <div className="flex h-full items-center justify-center text-sm text-stone-400 dark:text-stone-500">暂无对话消息</div>
           )}
         </div>
       </section>

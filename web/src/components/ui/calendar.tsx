@@ -21,22 +21,27 @@ function Calendar({
         month: "relative",
         month_caption: "flex h-9 items-center justify-center font-medium",
         nav: "absolute inset-x-2 top-2 flex items-center justify-between",
-        button_previous: "inline-flex size-8 items-center justify-center rounded-lg hover:bg-stone-100",
-        button_next: "inline-flex size-8 items-center justify-center rounded-lg hover:bg-stone-100",
-        weekdays: "mt-2 grid grid-cols-7 text-xs text-stone-400",
+        button_previous: "inline-flex size-8 items-center justify-center rounded-lg hover:bg-muted",
+        button_next: "inline-flex size-8 items-center justify-center rounded-lg hover:bg-muted",
+        weekdays: "mt-2 grid grid-cols-7 text-xs text-muted-foreground",
         weekday: "flex h-8 items-center justify-center font-normal",
         week: "grid grid-cols-7",
         day: "size-9 p-0 text-center",
-        day_button: "size-9 rounded-lg text-sm transition hover:bg-stone-100",
-        today: "font-semibold text-stone-950",
-        selected: "[&_button]:bg-stone-950 [&_button]:text-white [&_button]:hover:bg-stone-800",
-        outside: "text-stone-300",
-        disabled: "text-stone-300 opacity-50",
+        day_button: "size-9 rounded-lg text-sm transition hover:bg-muted",
+        today: "font-semibold text-foreground",
+        selected:
+          "[&_button]:bg-primary [&_button]:text-primary-foreground [&_button]:hover:bg-primary/90",
+        outside: "text-muted-foreground",
+        disabled: "text-muted-foreground opacity-50",
         ...classNames,
       }}
       components={{
         Chevron: ({ orientation }) =>
-          orientation === "left" ? <ChevronLeft className="size-4" /> : <ChevronRight className="size-4" />,
+          orientation === "left" ? (
+            <ChevronLeft className="size-4" />
+          ) : (
+            <ChevronRight className="size-4" />
+          ),
       }}
       {...props}
     />

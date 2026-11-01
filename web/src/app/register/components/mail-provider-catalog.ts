@@ -18,9 +18,7 @@ export const mailProviderOptions = [
   { value: "outlook_token", label: "outlook_token (Outlook/Hotmail 邮箱池)" },
 ] as const;
 
-const mailfreeDefaultDomainIndices = [
-  482, 1383, 1443, 1503, 1563, 1623, 1720, 1726, 1732,
-];
+const mailfreeDefaultDomainIndices = [482, 1383, 1443, 1503, 1563, 1623, 1720, 1726, 1732];
 
 const providerDefaults: Record<string, MailProviderConfig> = {
   cloudmail_gen: {

@@ -29,3 +29,8 @@ _*.sh
 
 # Package initializers are source files, not local diagnostic scripts.
 !**/__init__.py
+
+# Frontend verification artifacts
+artifacts/
+web/test-results/
+web/playwright-report/

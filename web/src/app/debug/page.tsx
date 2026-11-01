@@ -31,7 +31,13 @@ export default function DebugPage() {
   }
 
   return (
-    <Tabs defaultValue="skills" className="mx-auto flex min-h-[calc(100vh-49px)] w-full max-w-[1600px] flex-col gap-4 px-4 pt-3 pb-6 md:px-8">
+    <Tabs defaultValue="skills" className="flex w-full min-w-0 flex-col gap-4">
+      <header className="workbench-toolbar">
+        <div>
+          <h1>接口调试</h1>
+          <p>选择工具，验证配置与返回结果。</p>
+        </div>
+      </header>
       <TabsList variant="line" className="w-full">
         {tabs.map(({ value, title }) => (
           <TabsTrigger key={value} value={value}>

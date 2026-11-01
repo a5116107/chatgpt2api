@@ -4,11 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { getValidatedAuthSession } from "@/lib/auth-session";
-import {
-  getDefaultRouteForRole,
-  type AuthRole,
-  type StoredAuthSession,
-} from "@/store/auth";
+import { getDefaultRouteForRole, type AuthRole, type StoredAuthSession } from "@/store/auth";
 
 type UseAuthGuardResult = {
   isCheckingAuth: boolean;
@@ -49,7 +45,9 @@ export function useAuthGuard(allowedRoles?: AuthRole[]): UseAuthGuardResult {
       setIsCheckingAuth(false);
     };
 
-    void load();
+    void load().catch(() => {
+      if (active) setIsCheckingAuth(false);
+    });
     return () => {
       active = false;
     };
@@ -79,7 +77,9 @@ export function useRedirectIfAuthenticated() {
       setIsCheckingAuth(false);
     };
 
-    void load();
+    void load().catch(() => {
+      if (active) setIsCheckingAuth(false);
+    });
     return () => {
       active = false;
     };

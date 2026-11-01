@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import NextImage from "next/image";
+
+import { useId, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import type { ComponentProps } from "react";
 import {
   Ban,
@@ -23,6 +25,9 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useProgressPolling } from "@/hooks/use-progress-polling";
+import { ResourceError } from "@/components/resource-error";
+import { ActionMenu } from "@/components/action-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -46,6 +51,10 @@ import {
 import {
   deleteAccounts,
   fetchAccounts,
+  checkAccountHealth,
+  fetchAccountHealthProgress,
+  fetchCurrentAccountHealth,
+  type AccountHealthProgress,
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
@@ -55,10 +64,8 @@ import {
   testProxy,
   updateAccount,
   type Account,
-  type AccountRefreshResponse,
   type AccountStatus,
   type Model,
-  type RefreshProgressResponse,
   backfillRuntimeProfiles,
   repairRuntimeProfile,
 } from "@/lib/api";
@@ -66,6 +73,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
+import { AccountHealthStatus, healthLabels } from "./components/account-health-status";
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
   { label: "全部状态", value: "all" },
@@ -89,12 +97,12 @@ const statusMeta: Record<
 };
 
 const metricCards = [
-  { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
-  { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
-  { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
-  { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
-  { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "total", label: "账户总数", color: "text-foreground", icon: UserRound },
+  { key: "active", label: "正常账户", color: "text-success", icon: CheckCircle2 },
+  { key: "limited", label: "限流账户", color: "text-warning", icon: CircleAlert },
+  { key: "abnormal", label: "异常账户", color: "text-destructive", icon: CircleOff },
+  { key: "disabled", label: "禁用账户", color: "text-muted-foreground", icon: Ban },
+  { key: "quota", label: "剩余额度", color: "text-info", icon: RefreshCw },
 ] as const;
 
 function isUnlimitedImageQuotaAccount(account: Account) {
@@ -154,7 +162,9 @@ function formatQuotaSummary(accounts: Account[]) {
   if (availableAccounts.some(imageQuotaUnknown)) {
     return "未知";
   }
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  return formatCompact(
+    availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0),
+  );
 }
 
 function maskToken(token?: string) {
@@ -179,7 +189,9 @@ function displayAccountType(account: Account) {
 }
 
 function displayAccountSource(account: Account) {
-  const source = String(account.source_type || "").trim().toLowerCase();
+  const source = String(account.source_type || "")
+    .trim()
+    .toLowerCase();
   if (!source) {
     return "web";
   }
@@ -214,6 +226,7 @@ function displayAccountProfileUa(account: Account) {
 }
 
 function AccountsPageContent() {
+  const fieldId = useId();
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
@@ -227,10 +240,14 @@ function AccountsPageContent() {
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
   const [editProxy, setEditProxy] = useState("");
   const [isTestingProxy, setIsTestingProxy] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isProbing, setIsProbing] = useState(false);
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
+  const [healthProgress, setHealthProgress] = useState<AccountHealthProgress | null>(null);
+  const [healthNow, setHealthNow] = useState(() => Date.now());
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -250,37 +267,79 @@ function AccountsPageContent() {
     message: "",
     email: "",
   });
-  const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
+  const pollProgress = useProgressPolling();
+  const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(
+    null,
+  );
 
-  const loadAccounts = async (silent = false) => {
+  const loadAccounts = useCallback(async (silent = false) => {
     if (!silent) {
       setIsLoading(true);
     }
     try {
       const data = await fetchAccounts();
+      setLoadError("");
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : "加载账户失败";
+      setLoadError(message);
       toast.error(message);
     } finally {
       if (!silent) {
         setIsLoading(false);
       }
     }
-  };
+  }, []);
 
-  const loadModels = async () => {
+  const loadModels = useCallback(async () => {
     setIsLoadingModels(true);
     try {
       const data = await fetchModels();
       setAvailableModels(Array.isArray(data.data) ? data.data : []);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : "加载模型列表失败";
       toast.error(message);
     } finally {
       setIsLoadingModels(false);
+    }
+  }, []);
+
+  const trackHealthCheck = useCallback(
+    async (id: string) => {
+      setIsCheckingHealth(true);
+      try {
+        await pollProgress<AccountHealthProgress>(
+          (signal) => fetchAccountHealthProgress(id, signal),
+          setHealthProgress,
+        );
+        await loadAccounts(true);
+        toast.success("账号状态检测完成");
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        toast.error(error instanceof Error ? error.message : "账号状态检测失败");
+      } finally {
+        setIsCheckingHealth(false);
+      }
+    },
+    [loadAccounts, pollProgress],
+  );
+
+  const handleCheckHealth = async () => {
+    setIsCheckingHealth(true);
+    try {
+      const job = await checkAccountHealth(selectedIds);
+      setHealthProgress(job);
+      await trackHealthCheck(job.progress_id);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      toast.error(error instanceof Error ? error.message : "启动检测失败");
+    } finally {
+      setIsCheckingHealth(false);
     }
   };
 
@@ -289,10 +348,13 @@ function AccountsPageContent() {
     try {
       const data = await probeImagePool(20);
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
       const failureText = data.failures.length > 0 ? `，失败 ${data.failures.length} 个` : "";
       toast.success(`号池探测完成：检查 ${data.checked} 个，健康 ${data.healthy} 个${failureText}`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       toast.error(error instanceof Error ? error.message : "号池探测失败");
     } finally {
       setIsProbing(false);
@@ -306,18 +368,30 @@ function AccountsPageContent() {
     didLoadRef.current = true;
     void loadAccounts();
     void loadModels();
+    void fetchCurrentAccountHealth()
+      .then((data) => {
+        if (data.job && !data.job.done) {
+          setHealthProgress(data.job);
+          void trackHealthCheck(data.job.progress_id);
+        }
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        toast.error(error instanceof Error ? error.message : "读取检测进度失败，请刷新重试");
+      });
+  }, [loadAccounts, loadModels, trackHealthCheck]);
 
-    // 清理进度条定时器
-    return () => {
-      if (progressRef.current) clearInterval(progressRef.current);
-    };
+  useEffect(() => {
+    const timer = setInterval(() => setHealthNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
   }, []);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return accounts.filter((account) => {
       const searchMatched =
-        normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
+        normalizedQuery.length === 0 ||
+        (account.email ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
       const statusMatched = statusFilter === "all" || account.status === statusFilter;
       return searchMatched && typeMatched && statusMatched;
@@ -345,14 +419,19 @@ function AccountsPageContent() {
   const accountTypeOptions = useMemo(
     () => [
       { label: "全部类型", value: "all" },
-      ...Array.from(new Set(accounts.map(displayAccountType))).map((type) => ({ label: type, value: type })),
+      ...Array.from(new Set(accounts.map(displayAccountType))).map((type) => ({
+        label: type,
+        value: type,
+      })),
     ],
     [accounts],
   );
 
   const selectedTokens = useMemo(() => {
     const selectedSet = new Set(selectedIds);
-    return accounts.filter((item) => selectedSet.has(item.access_token)).map((item) => item.access_token);
+    return accounts
+      .filter((item) => selectedSet.has(item.access_token))
+      .map((item) => item.access_token);
   }, [accounts, selectedIds]);
 
   const abnormalTokens = useMemo(() => {
@@ -383,9 +462,12 @@ function AccountsPageContent() {
     try {
       const data = await deleteAccounts(tokens);
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : "删除账户失败";
       toast.error(message);
     } finally {
@@ -404,13 +486,21 @@ function AccountsPageContent() {
       try {
         const { progress_id } = await refreshAccounts(accessTokens);
         // 单账号：轮询等待完成
-        await pollRefreshProgress(progress_id, (progress) => {
-          if (progress.done && progress.result) {
-            setAccounts(progress.result.items);
-            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => item.access_token === id)));
-          }
-        });
+        await pollProgress(
+          (signal) => fetchRefreshProgress(progress_id, signal),
+          (progress) => {
+            if (progress.done && progress.result) {
+              setAccounts(progress.result.items);
+              setSelectedIds((prev) =>
+                prev.filter((id) =>
+                  progress.result!.items.some((item) => item.access_token === id),
+                ),
+              );
+            }
+          },
+        );
       } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
         const message = error instanceof Error ? error.message : "刷新账户失败";
         toast.error(message);
       } finally {
@@ -450,112 +540,53 @@ function AccountsPageContent() {
     try {
       const { progress_id } = await refreshAccounts(accessTokens);
 
-      // 轮询进度到完成
-      const data = await new Promise<AccountRefreshResponse>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchRefreshProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              if (!p.result) {
-                reject(new Error("刷新结果为空"));
-                return;
-              }
-              // 更新最终进度显示
-              setProgress((prev) => ({
-                ...prev,
-                current: prev.total,
-                message: "刷新完成",
-              }));
-              // 清除联动统计
-              setRefreshSummary(null);
-              resolve(p.result);
+      const finalProgress = await pollProgress(
+        (signal) => fetchRefreshProgress(progress_id, signal),
+        (p) => {
+          if (!p.done) {
+            // 实时更新进度
+            setProgress((prev) => ({
+              ...prev,
+              current: p.processed,
+            }));
+            // 实时更新统计卡片：基数 + 已刷新的累加结果
+            const runningActive = baseActive + (p.status_counts?.["正常"] ?? 0);
+            const runningLimited = baseLimited + (p.status_counts?.["限流"] ?? 0);
+            const runningAbnormal = baseAbnormal + (p.status_counts?.["异常"] ?? 0);
+            const runningDisabled = baseDisabled + (p.status_counts?.["禁用"] ?? 0);
+            let runningQuota: string | number;
+            if (baseHasUnlimited) {
+              runningQuota = "∞";
+            } else if (baseHasUnknown) {
+              runningQuota = "未知";
             } else {
-              // 实时更新进度
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-              }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              let runningQuota: string | number;
-              if (baseHasUnlimited) {
-                runningQuota = "∞";
-              } else if (baseHasUnknown) {
-                runningQuota = "未知";
-              } else {
-                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: runningQuota,
-              });
+              runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
             }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
+            setRefreshSummary({
+              total: accounts.length,
+              active: runningActive,
+              limited: runningLimited,
+              abnormal: runningAbnormal,
+              disabled: runningDisabled,
+              quota: runningQuota,
+            });
           }
-        }, 300);
-      });
+        },
+      );
+      if (!finalProgress.result) throw new Error("刷新结果为空");
+      const data = finalProgress.result;
+      setRefreshSummary(null);
 
       // 刷新完成，更新数据
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
 
       const relogined = data.relogined ?? 0;
 
-      // 显示重新登录进度
-      if (relogined > 0) {
-        setProgress({
-          visible: true,
-          current: 0,
-          total: relogined,
-          message: `正在尝试对 ${relogined} 个账号进行移除异常状态`,
-          email: "",
-        });
-        // 模拟重新登录进度
-        let reCount = 0;
-        await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            reCount += 1;
-            if (reCount >= relogined) {
-              clearInterval(timer);
-              setProgress({
-                visible: true,
-                current: relogined,
-                total: relogined,
-                message: "移除异常状态完成",
-                email: "",
-              });
-              setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-              resolve();
-            } else {
-              setProgress((prev) => ({ ...prev, current: reCount }));
-            }
-          }, 150);
-          setTimeout(resolve, 2000);
-        });
-      } else {
-        setProgress({
-          visible: true,
-          current: total,
-          total,
-          message: "刷新完成",
-          email: "",
-        });
-        setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-      }
+      // 后台返回的是已触发的恢复数，不制造虚假的完成进度。
+      setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
 
       if ((data.errors ?? []).length > 0) {
         const firstError = data.errors?.[0]?.error;
@@ -563,9 +594,12 @@ function AccountsPageContent() {
           `刷新成功 ${data.refreshed} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
         );
       } else {
-        toast.success(`刷新成功 ${data.refreshed} 个账户${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`);
+        toast.success(
+          `刷新成功 ${data.refreshed} 个账户${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`,
+        );
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
       setRefreshSummary(null);
       const message = error instanceof Error ? error.message : "刷新账户失败";
@@ -573,31 +607,6 @@ function AccountsPageContent() {
     } finally {
       setIsRefreshing(false);
     }
-  };
-
-  const pollRefreshProgress = async (
-    progressId: string,
-    onUpdate: (p: RefreshProgressResponse) => void,
-  ): Promise<void> => {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setInterval(async () => {
-        try {
-          const p = await fetchRefreshProgress(progressId);
-          if (p.done) {
-            clearInterval(timer);
-            if (p.error) {
-              reject(new Error(p.error));
-            } else {
-              onUpdate(p);
-              resolve();
-            }
-          }
-        } catch (err) {
-          clearInterval(timer);
-          reject(err);
-        }
-      }, 500);
-    });
   };
 
   const handleReLogin = async (accessTokens: string[]) => {
@@ -633,89 +642,71 @@ function AccountsPageContent() {
 
     // 显示进度条（真实进度）
     const total = abnormalTokens.length;
-    setProgress({ visible: true, current: 0, total, message: "正在尝试恢复异常账号...", email: "" });
+    setProgress({
+      visible: true,
+      current: 0,
+      total,
+      message: "正在尝试恢复异常账号...",
+      email: "",
+    });
 
     try {
       const { progress_id } = await reLoginAccounts(abnormalTokens);
 
-      // 轮询进度到完成
-      await new Promise<void>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchReLoginProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
-              setRefreshSummary(null);
-              resolve();
-            } else {
-              // 实时更新进度
-              const results = p.results ?? [];
-              // 找到最新一条有错误的结果
-              const lastErrorResult = [...results].reverse().find((r) => r.error);
-              const emailHint = lastErrorResult
-                ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
-                : `已处理 ${p.processed}/${p.total}`;
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-                email: emailHint,
-                message: "正在尝试恢复异常账号...",
-              }));
+      await pollProgress(
+        (signal) => fetchReLoginProgress(progress_id, signal),
+        (p) => {
+          if (!p.done) {
+            // 实时更新进度
+            const results = p.results ?? [];
+            // 找到最新一条有错误的结果
+            const lastErrorResult = [...results].reverse().find((r) => r.error);
+            const emailHint = lastErrorResult
+              ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
+              : `已处理 ${p.processed}/${p.total}`;
+            setProgress((prev) => ({
+              ...prev,
+              current: p.processed,
+              email: emailHint,
+              message: "正在尝试恢复异常账号...",
+            }));
 
-              // 实时更新统计卡片：基数 + 已处理的恢复结果
-              let runningActive = baseActive;
-              let runningAbnormal = baseAbnormal;
-              let runningDisabled = baseDisabled;
-              for (const r of results) {
-                if (r.status === "成功") {
-                  runningActive += 1;
-                  runningAbnormal -= 1;
-                } else if (r.status === "禁用") {
-                  runningDisabled += 1;
-                  runningAbnormal -= 1;
-                }
-                // "异常"或"跳过"：保持异常状态不变
+            // 实时更新统计卡片：基数 + 已处理的恢复结果
+            let runningActive = baseActive;
+            let runningAbnormal = baseAbnormal + abnormalTokens.length;
+            let runningDisabled = baseDisabled;
+            for (const r of results) {
+              if (r.status === "成功") {
+                runningActive += 1;
+                runningAbnormal -= 1;
+              } else if (r.status === "禁用") {
+                runningDisabled += 1;
+                runningAbnormal -= 1;
               }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: baseLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: summary.quota,
-              });
+              // "异常"或"跳过"：保持异常状态不变
             }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
+            setRefreshSummary({
+              total: accounts.length,
+              active: runningActive,
+              limited: baseLimited,
+              abnormal: runningAbnormal,
+              disabled: runningDisabled,
+              quota: summary.quota,
+            });
           }
-        }, 300);
-      });
+        },
+      );
 
-      // 等待后台线程完成，再拉取最新数据
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-      try {
-        const freshData = await fetchAccounts();
-        setAccounts(freshData.items);
-        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
-      } catch { /* 静默失败 */ }
-
-      setProgress({
-        visible: true,
-        current: total,
-        total,
-        message: "恢复完成",
-        email: "",
-      });
-      setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-
-      toast.success(`恢复流程已全部完成`);
+      const freshData = await fetchAccounts();
+      setAccounts(freshData.items);
+      setSelectedIds((prev) =>
+        prev.filter((id) => freshData.items.some((item) => item.access_token === id)),
+      );
+      setRefreshSummary(null);
+      setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+      toast.success("恢复流程已结束，请以最新账号状态为准");
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
       setRefreshSummary(null);
       const message = error instanceof Error ? error.message : "重新登录失败";
@@ -740,10 +731,11 @@ function AccountsPageContent() {
     setIsTestingProxy(true);
     try {
       const data = await testProxy(candidate);
-      data.result.ok
-        ? toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`)
-        : toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      if (data.result.ok)
+        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+      else toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       toast.error(error instanceof Error ? error.message : "测试代理失败");
     } finally {
       setIsTestingProxy(false);
@@ -762,10 +754,13 @@ function AccountsPageContent() {
         proxy: editProxy.trim(),
       });
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
       setEditingAccount(null);
       toast.success("账号信息已更新");
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : "更新账号失败";
       toast.error(message);
     } finally {
@@ -778,9 +773,12 @@ function AccountsPageContent() {
     try {
       const data = await backfillRuntimeProfiles(selectedTokens);
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) =>
+        prev.filter((id) => data.items.some((item) => item.access_token === id)),
+      );
       toast.success(`画像回填完成：修复 ${data.repaired} 个，重绑定 ${data.rebounded} 个`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       toast.error(error instanceof Error ? error.message : "回填画像失败");
     } finally {
       setIsRepairingProfiles(false);
@@ -795,6 +793,7 @@ function AccountsPageContent() {
       setAccounts((prev) => prev.map((item) => (item.access_token === token ? data.item : item)));
       toast.success(`画像已修复：${shortProfileId(data.profile.id)}`);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       toast.error(error instanceof Error ? error.message : "修复画像失败");
     } finally {
       setRepairingProfiles((prev) => {
@@ -807,58 +806,38 @@ function AccountsPageContent() {
 
   const toggleSelectAll = (checked: boolean) => {
     if (checked) {
-      setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map((item) => item.access_token)])));
+      setSelectedIds((prev) =>
+        Array.from(new Set([...prev, ...currentRows.map((item) => item.access_token)])),
+      );
       return;
     }
-    setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.access_token === id)));
+    setSelectedIds((prev) =>
+      prev.filter((id) => !currentRows.some((row) => row.access_token === id)),
+    );
   };
+
+  if (loadError && accounts.length === 0 && !isLoading)
+    return <ResourceError message={loadError} onRetry={() => loadAccounts()} />;
 
   return (
     <>
-      <section className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div className="space-y-1">
-          <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">
-            Account Pool
+      <section className="workbench-toolbar">
+        <div className="shrink-0 space-y-1">
+          <div className="text-xs font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+            ACCOUNT POOL
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight">号池管理</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">账号池</h1>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80 hover:bg-card"
             onClick={() => void loadAccounts()}
             disabled={isLoading || isRefreshing || isProbing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
             刷新
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleProbeImagePool()}
-            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
-          >
-            {isProbing ? <LoaderCircle className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
-            执行号池探测
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0}
-          >
-            <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
-            一键刷新所有账号信息和额度
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleBackfillRuntimeProfiles()}
-            disabled={isLoading || isRepairingProfiles || accounts.length === 0}
-          >
-            {isRepairingProfiles ? <LoaderCircle className="size-4 animate-spin" /> : <Fingerprint className="size-4" />}
-            {selectedTokens.length > 0 ? "回填所选画像" : "回填全部画像"}
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isProbing || isDeleting}
@@ -870,40 +849,131 @@ function AccountsPageContent() {
           />
           <Button
             variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => downloadTokens(accounts)}
-            disabled={accounts.length === 0}
+            onClick={() => void handleCheckHealth()}
+            disabled={
+              isLoading || isCheckingHealth || isRefreshing || isProbing || accounts.length === 0
+            }
           >
-            <Download className="size-4" />
-            导出全部 Token
+            {isCheckingHealth ? (
+              <LoaderCircle className="size-4 animate-spin" />
+            ) : (
+              <CheckCircle2 className="size-4" />
+            )}
+            {isCheckingHealth
+              ? "正在检测"
+              : selectedIds.length
+                ? `检测所选（${selectedIds.length}）`
+                : "检测账号状态"}
           </Button>
+          <ActionMenu>
+            <Button
+              variant="outline"
+              className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80 hover:bg-card"
+              onClick={() => void handleProbeImagePool()}
+              disabled={
+                isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0
+              }
+            >
+              {isProbing ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <CheckCircle2 className="size-4" />
+              )}
+              执行号池探测
+            </Button>
+            <Button
+              variant="outline"
+              className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80 hover:bg-card"
+              onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
+              disabled={
+                isLoading || isRefreshing || isProbing || isDeleting || accounts.length === 0
+              }
+            >
+              <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
+              一键刷新所有账号信息和额度
+            </Button>
+            <Button
+              variant="outline"
+              className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80 hover:bg-card"
+              onClick={() => void handleBackfillRuntimeProfiles()}
+              disabled={isLoading || isRepairingProfiles || accounts.length === 0}
+            >
+              {isRepairingProfiles ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Fingerprint className="size-4" />
+              )}
+              {selectedTokens.length > 0 ? "回填所选画像" : "回填全部画像"}
+            </Button>
+            <Button
+              variant="outline"
+              className="h-10 rounded-xl border-border bg-card px-4 text-foreground/80 hover:bg-card"
+              onClick={() => downloadTokens(accounts)}
+              disabled={accounts.length === 0}
+            >
+              <Download className="size-4" />
+              导出全部 Token
+            </Button>
+          </ActionMenu>
         </div>
       </section>
+      <div
+        className="rounded-xl border border-border bg-card px-4 py-3 text-sm"
+        data-testid="account-health-summary"
+        role="status"
+        aria-live="polite"
+      >
+        <p className="font-medium">
+          {healthProgress
+            ? `${healthProgress.done ? "检测完成" : "正在检测账号"} · ${healthProgress.processed} / ${healthProgress.total}`
+            : "一键检查登录与连接状态"}
+        </p>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          检测保留登录信息与代理绑定，不发起对话或生图。结果有效期 15 分钟，1
+          分钟内重复检测沿用最近结果。展开账号检测结果可查看原因。
+        </p>
+        {healthProgress && (
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            {Object.entries(healthProgress.counts).map(([state, count]) => (
+              <span key={state}>
+                {healthLabels[state] || "检测未完成"} {count}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* 进度条 */}
       {progress.visible && (
-        <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white/90 shadow-sm">
+        <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
           <div className="px-4 py-3">
             <div className="flex items-center justify-between text-sm">
-              <span className="text-stone-600">
+              <span className="text-foreground/80">
                 {progress.message}
-                {progress.email && <span className="ml-1 font-medium text-stone-700">{progress.email}</span>}
+                {progress.email && (
+                  <span className="ml-1 font-medium text-foreground/80">{progress.email}</span>
+                )}
               </span>
-              <span className="font-medium text-stone-700">
+              <span className="font-medium text-foreground/80">
                 {progress.current}/{progress.total}
               </span>
             </div>
-            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-stone-100">
+            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-muted">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-amber-400 to-orange-500 transition-all duration-300 ease-out"
-                style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }}
+                style={{
+                  width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%`,
+                }}
               />
             </div>
           </div>
         </div>
       )}
 
-      <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}>
+      <Dialog
+        open={Boolean(editingAccount)}
+        onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}
+      >
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>编辑账户</DialogTitle>
@@ -913,9 +983,17 @@ function AccountsPageContent() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">状态</label>
-              <Select value={editStatus} onValueChange={(value) => setEditStatus(value as AccountStatus)}>
-                <SelectTrigger className="h-11 rounded-xl border-stone-200 bg-white">
+              <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-1"}>
+                状态
+              </label>
+              <Select
+                value={editStatus}
+                onValueChange={(value) => setEditStatus(value as AccountStatus)}
+              >
+                <SelectTrigger
+                  className="h-11 rounded-xl border-border bg-card"
+                  id={fieldId + "-1"}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -930,21 +1008,28 @@ function AccountsPageContent() {
               </Select>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">账号代理</label>
+              <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-2"}>
+                账号代理
+              </label>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   value={editProxy}
                   onChange={(event) => setEditProxy(event.target.value)}
                   placeholder="留空走全局代理，例如 http://127.0.0.1:7890"
-                  className="h-11 rounded-xl border-stone-200 bg-white"
+                  className="h-11 rounded-xl border-border bg-card"
+                  id={fieldId + "-2"}
                 />
                 <Button
                   variant="outline"
-                  className="h-11 rounded-xl border-stone-200 bg-white px-4 text-stone-700 sm:w-24"
+                  className="h-11 rounded-xl border-border bg-card px-4 text-foreground/80 sm:w-24"
                   onClick={() => void handleTestAccountProxy()}
                   disabled={isTestingProxy}
                 >
-                  {isTestingProxy ? <LoaderCircle className="size-4 animate-spin" /> : <Link2 className="size-4" />}
+                  {isTestingProxy ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <Link2 className="size-4" />
+                  )}
                   测试
                 </Button>
               </div>
@@ -953,14 +1038,14 @@ function AccountsPageContent() {
           <DialogFooter className="pt-2">
             <Button
               variant="secondary"
-              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              className="h-10 rounded-xl bg-muted px-5 text-foreground/80 hover:bg-secondary"
               onClick={() => setEditingAccount(null)}
               disabled={isUpdating}
             >
               取消
             </Button>
             <Button
-              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
               onClick={() => void handleUpdateAccount()}
               disabled={isUpdating}
             >
@@ -972,16 +1057,16 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];
             return (
-              <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+              <Card key={item.key} className="rounded-2xl border-border bg-card shadow-sm">
                 <CardContent className="p-4">
                   <div className="mb-4 flex items-start justify-between">
-                    <span className="text-xs font-medium text-stone-400">{item.label}</span>
-                    <Icon className="size-4 text-stone-400" />
+                    <span className="text-xs font-medium text-muted-foreground">{item.label}</span>
+                    <Icon className="size-4 text-muted-foreground" />
                   </div>
                   <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>
                     <span className={typeof value === "number" ? "" : "text-[1.1rem]"}>
@@ -993,11 +1078,11 @@ function AccountsPageContent() {
             );
           })}
         </div>
-        <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+        <Card className="rounded-2xl border-border bg-card shadow-sm">
           <CardContent className="p-4">
-            <div className="mb-3 text-sm font-medium text-stone-700">
-              系统可用模型
-              <span className="ml-1 text-stone-400">({availableModels.length})</span>
+            <div className="mb-3 text-sm font-medium text-foreground/80">
+              已配置模型
+              <span className="ml-1 text-muted-foreground">({availableModels.length})</span>
             </div>
             <div className="flex flex-wrap gap-2">
               {availableModels.length > 0 ? (
@@ -1005,26 +1090,29 @@ function AccountsPageContent() {
                   <button
                     key={model.id}
                     type="button"
-                    className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
+                    className="inline-flex cursor-pointer items-center rounded-full border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground/80 transition hover:border-input hover:bg-muted"
                     onClick={() => {
                       void navigator.clipboard.writeText(model.id);
                       toast.success("模型名已复制");
                     }}
                     title={`点击复制 ${model.id}`}
                   >
-                    <img
+                    <NextImage
                       src="/openai.svg"
                       alt=""
                       aria-hidden="true"
                       className="mr-1.5 size-3.5 shrink-0"
+                      unoptimized
+                      width={1200}
+                      height={1200}
                     />
                     {model.id}
                   </button>
                 ))
               ) : isLoadingModels ? (
-                <span className="text-sm text-stone-400">正在加载模型列表...</span>
+                <span className="text-sm text-muted-foreground">正在加载模型列表...</span>
               ) : (
-                <span className="text-sm text-stone-400">当前暂无可用模型</span>
+                <span className="text-sm text-muted-foreground">当前暂无可用模型</span>
               )}
             </div>
           </CardContent>
@@ -1035,14 +1123,17 @@ function AccountsPageContent() {
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">账户列表</h2>
-            <Badge variant="secondary" className="rounded-lg bg-stone-200 px-2 py-0.5 text-stone-700">
+            <Badge
+              variant="secondary"
+              className="rounded-lg bg-secondary px-2 py-0.5 text-foreground/80"
+            >
               {filteredAccounts.length}
             </Badge>
           </div>
 
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-            <div className="relative min-w-[260px]">
-              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
+            <div className="relative min-w-0 lg:min-w-[260px]">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={query}
                 onChange={(event) => {
@@ -1050,7 +1141,7 @@ function AccountsPageContent() {
                   setPage(1);
                 }}
                 placeholder="搜索邮箱"
-                className="h-10 rounded-xl border-stone-200 bg-white/85 pl-10"
+                className="h-10 rounded-xl border-border bg-card pl-10"
               />
             </div>
             <Select
@@ -1060,7 +1151,10 @@ function AccountsPageContent() {
                 setPage(1);
               }}
             >
-              <SelectTrigger className="h-10 w-full rounded-xl border-stone-200 bg-white/85 lg:w-[150px]">
+              <SelectTrigger
+                className="h-10 w-full rounded-xl border-border bg-card lg:w-[150px]"
+                aria-label="筛选类型"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1078,7 +1172,10 @@ function AccountsPageContent() {
                 setPage(1);
               }}
             >
-              <SelectTrigger className="h-10 w-full rounded-xl border-stone-200 bg-white/85 lg:w-[150px]">
+              <SelectTrigger
+                className="h-10 w-full rounded-xl border-border bg-card lg:w-[150px]"
+                aria-label="筛选状态"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1093,14 +1190,14 @@ function AccountsPageContent() {
         </div>
 
         {isLoading && accounts.length === 0 ? (
-          <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+          <Card className="rounded-2xl border-border bg-card shadow-sm">
             <CardContent className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
-              <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
+              <div className="rounded-xl bg-muted p-3 text-muted-foreground">
                 <LoaderCircle className="size-5 animate-spin" />
               </div>
               <div className="space-y-1">
-                <p className="text-sm font-medium text-stone-700">正在加载账户</p>
-                <p className="text-sm text-stone-500">从后端同步账号列表和状态。</p>
+                <p className="text-sm font-medium text-foreground/80">正在加载账户</p>
+                <p className="text-sm text-muted-foreground">从后端同步账号列表和状态。</p>
               </div>
             </CardContent>
           </Card>
@@ -1108,66 +1205,88 @@ function AccountsPageContent() {
 
         <Card
           className={cn(
-            "overflow-hidden rounded-2xl border-white/80 bg-white/90 shadow-sm",
+            "overflow-hidden rounded-2xl border-border bg-card shadow-sm",
             isLoading && accounts.length === 0 ? "hidden" : "",
           )}
         >
           <CardContent className="space-y-0 p-0">
-            <div className="flex flex-col gap-3 border-b border-stone-100 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
+            <div className="flex flex-col gap-3 border-b border-border px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
+                  className="h-8 rounded-lg px-3 text-muted-foreground hover:bg-muted"
                   onClick={() => void handleRefreshAccounts(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isRefreshing}
                 >
-                  {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  {isRefreshing ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-4" />
+                  )}
                   刷新选中账号信息和额度
                 </Button>
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
+                  className="h-8 rounded-lg px-3 text-warning hover:bg-warning/10 hover:text-warning"
                   onClick={() => void handleReLogin(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isRelogining}
                   title="尝试密码登录恢复账号"
                 >
-                  {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+                  {isRelogining ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <LogIn className="size-4" />
+                  )}
                   尝试恢复异常账号
                 </Button>
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                  className="h-8 rounded-lg px-3 text-destructive hover:bg-destructive/10 hover:text-destructive"
                   onClick={() => void handleDeleteTokens(abnormalTokens)}
                   disabled={abnormalTokens.length === 0 || isDeleting}
                 >
-                  {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                  {isDeleting ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="size-4" />
+                  )}
                   移除异常账号
                 </Button>
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                  className="h-8 rounded-lg px-3 text-destructive hover:bg-destructive/10 hover:text-destructive"
                   onClick={() => void handleDeleteTokens(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isDeleting}
                 >
-                  {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                  {isDeleting ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="size-4" />
+                  )}
                   删除所选
                 </Button>
                 {selectedIds.length > 0 ? (
-                  <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600">
+                  <span className="rounded-lg bg-muted px-2.5 py-1 text-xs font-medium text-foreground/80">
                     已选择 {selectedIds.length} 项
                   </span>
                 ) : null}
               </div>
             </div>
 
-            <div className="overflow-x-auto">
-                <table className="w-full min-w-[1160px] text-left">
-                <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
+            <div
+              className="overflow-x-auto"
+              tabIndex={0}
+              role="region"
+              aria-label="账户明细，可左右滚动"
+            >
+              <table className="w-full min-w-[1560px] text-left">
+                <thead className="whitespace-nowrap border-b border-border text-[11px] text-muted-foreground uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
                       <Checkbox
                         checked={allCurrentSelected}
                         onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
+                        aria-label="全选当前页"
                       />
                     </th>
                     <th className="w-56 px-4 py-3">token</th>
@@ -1193,7 +1312,7 @@ function AccountsPageContent() {
                     return (
                       <tr
                         key={account.access_token}
-                        className="border-b border-stone-100/80 text-sm text-stone-600 transition-colors hover:bg-stone-50/70"
+                        className="border-b border-border/80 text-sm text-foreground/80 transition-colors hover:bg-muted/70"
                       >
                         <td className="px-4 py-3">
                           <Checkbox
@@ -1205,32 +1324,40 @@ function AccountsPageContent() {
                                   : prev.filter((item) => item !== account.access_token),
                               );
                             }}
+                            aria-label="选择此项"
                           />
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium tracking-tight text-stone-700">
+                            <span className="font-medium tracking-tight text-foreground/80">
                               {maskToken(account.access_token)}
                             </span>
                             <button
                               type="button"
-                              className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="rounded-lg p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
                               onClick={() => {
                                 void navigator.clipboard.writeText(account.access_token);
                                 toast.success("token 已复制");
                               }}
+                              aria-label="复制"
                             >
                               <Copy className="size-4" />
                             </button>
                           </div>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="secondary" className="rounded-md bg-stone-100 text-stone-700">
+                          <Badge
+                            variant="secondary"
+                            className="rounded-md bg-muted text-foreground/80"
+                          >
                             {displayAccountType(account)}
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
+                          <Badge
+                            variant="outline"
+                            className="rounded-md border-border text-foreground/80"
+                          >
                             {displayAccountSource(account)}
                           </Badge>
                         </td>
@@ -1245,17 +1372,48 @@ function AccountsPageContent() {
                             </Badge>
                             {account.image_pool_state ? (
                               <Badge
-                                variant={account.image_pool_state === "ready" ? "success" : account.image_pool_state === "cooldown" ? "warning" : "secondary"}
+                                variant={
+                                  account.image_pool_state === "ready"
+                                    ? "success"
+                                    : account.image_pool_state === "cooldown"
+                                      ? "warning"
+                                      : "secondary"
+                                }
                                 className="rounded-md px-2 py-1"
                                 title={account.image_pool_reason || undefined}
                               >
-                                {imagePoolStateLabels[account.image_pool_state] || account.image_pool_state}
+                                {imagePoolStateLabels[account.image_pool_state] ||
+                                  account.image_pool_state}
                               </Badge>
                             ) : null}
+                            {account.text_schedulable !== undefined ? (
+                              <span className="text-xs text-muted-foreground">
+                                对话{account.text_schedulable ? "可分配" : "暂停分配"}
+                              </span>
+                            ) : null}
+                            {account.image_schedulable !== undefined ? (
+                              <span className="text-xs text-muted-foreground">
+                                生图
+                                {!account.image_schedulable
+                                  ? "暂停分配"
+                                  : account.image_pool_state === "ready"
+                                    ? "已验证 · 可分配"
+                                    : "待验证 · 可尝试"}
+                              </span>
+                            ) : null}
+                            {account.image_last_probe_error &&
+                            /403/.test(account.image_last_probe_error) ? (
+                              <span className="max-w-48 text-xs text-destructive">
+                                最近生图连接被上游拒绝（403），额度不代表可用
+                              </span>
+                            ) : null}
+                            <AccountHealthStatus check={account.health_check} now={healthNow} />
                           </div>
                         </td>
                         <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                          <div className="text-xs leading-5 text-muted-foreground">
+                            {account.email ?? "—"}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-start gap-2">
@@ -1263,43 +1421,62 @@ function AccountsPageContent() {
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <Badge
                                   variant={account.runtime_profile_id ? "outline" : "warning"}
-                                  className="rounded-md border-stone-200 text-stone-600"
+                                  className="rounded-md border-border text-foreground/80"
                                 >
                                   {shortProfileId(account.runtime_profile_id)}
                                 </Badge>
-                                <Badge variant="secondary" className="rounded-md bg-stone-100 text-stone-600">
+                                <Badge
+                                  variant="secondary"
+                                  className="rounded-md bg-muted text-foreground/80"
+                                >
                                   {displayAccountProfileTls(account)}
                                 </Badge>
                               </div>
-                              <div className="truncate text-xs leading-5 text-stone-400" title={displayAccountProfileUa(account)}>
+                              <div
+                                className="truncate text-xs leading-5 text-muted-foreground"
+                                title={displayAccountProfileUa(account)}
+                              >
                                 {displayAccountProfileUa(account)}
                               </div>
-                              <div className="text-[11px] text-stone-400">
-                                状态：{account.profile_status || account.profile_snapshot?.status || "active"}
+                              <div className="text-[11px] text-muted-foreground">
+                                状态：
+                                {account.profile_status ||
+                                  account.profile_snapshot?.status ||
+                                  "active"}
                               </div>
                             </div>
                             <button
                               type="button"
-                              className="mt-0.5 rounded-lg p-1.5 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="mt-0.5 rounded-lg p-1.5 text-muted-foreground transition hover:bg-muted hover:text-foreground"
                               onClick={() => void handleRepairRuntimeProfile(account)}
                               disabled={repairingProfiles.has(account.access_token)}
                               title="修复/重绑该账号画像"
+                              aria-label="修复/重绑该账号画像"
                             >
-                              {repairingProfiles.has(account.access_token)
-                                ? <LoaderCircle className="size-4 animate-spin" />
-                                : <Fingerprint className="size-4" />}
+                              {repairingProfiles.has(account.access_token) ? (
+                                <LoaderCircle className="size-4 animate-spin" />
+                              ) : (
+                                <Fingerprint className="size-4" />
+                              )}
                             </button>
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                        <td className="px-4 py-3 text-xs leading-5 text-muted-foreground">
                           {(() => {
                             const raw = (account as any).created_at;
                             if (!raw) return "—";
                             try {
                               const d = new Date(raw + "Z");
                               if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-                            } catch { return String(raw).slice(0, 10); }
+                              return d.toLocaleDateString("zh-CN", {
+                                month: "2-digit",
+                                day: "2-digit",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              });
+                            } catch {
+                              return String(raw).slice(0, 10);
+                            }
                           })()}
                         </td>
                         <td className="px-4 py-3">
@@ -1308,24 +1485,34 @@ function AccountsPageContent() {
                               {formatQuota(account)}
                             </Badge>
                             {account.image_quota_confidence ? (
-                              <div className="text-[11px] text-stone-400">
-                                {account.image_quota_confidence === "verified" ? "已校准" : account.image_quota_confidence === "unknown" ? "未知" : "估算"}
+                              <div className="text-[11px] text-muted-foreground">
+                                {account.image_quota_confidence === "verified"
+                                  ? "已校准"
+                                  : account.image_quota_confidence === "unknown"
+                                    ? "未知"
+                                    : "估算"}
                               </div>
                             ) : null}
                             {typeof account.image_success_ema === "number" ? (
-                              <div className="text-[11px] text-stone-400">
+                              <div className="text-[11px] text-muted-foreground">
                                 健康 {Math.round(account.image_success_ema * 100)}%
-                                {account.image_latency_ema_ms ? ` · ${(account.image_latency_ema_ms / 1000).toFixed(1)}s` : ""}
+                                {account.image_latency_ema_ms
+                                  ? ` · ${(account.image_latency_ema_ms / 1000).toFixed(1)}s`
+                                  : ""}
                               </div>
                             ) : null}
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                        <td className="px-4 py-3 text-xs leading-5 text-muted-foreground">
                           {(() => {
                             const restore = formatRestoreAt(account.restore_at);
                             return (
                               <div className="space-y-0.5">
-                                {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}
+                                {restore.relative ? (
+                                  <div className="font-medium text-foreground/80">
+                                    {restore.relative}
+                                  </div>
+                                ) : null}
                                 <div>{restore.absolute}</div>
                               </div>
                             );
@@ -1338,8 +1525,8 @@ function AccountsPageContent() {
                               <span
                                 className={
                                   inflight > 0
-                                    ? "font-semibold text-amber-600"
-                                    : "text-stone-400"
+                                    ? "font-semibold text-warning"
+                                    : "text-muted-foreground"
                                 }
                                 title={
                                   inflight > 0
@@ -1352,31 +1539,41 @@ function AccountsPageContent() {
                             );
                           })()}
                         </td>
-                        <td className="px-4 py-3 text-stone-500">{account.success}</td>
-                        <td className="px-4 py-3 text-stone-500">{account.fail}</td>
+                        <td className="px-4 py-3 text-muted-foreground">{account.success}</td>
+                        <td className="px-4 py-3 text-muted-foreground">{account.fail}</td>
                         <td className="px-4 py-3">
-                          <div className="flex items-center gap-1 text-stone-400">
+                          <div className="flex items-center gap-1 text-muted-foreground">
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="rounded-lg p-2 transition hover:bg-muted hover:text-foreground"
                               onClick={() => openEditDialog(account)}
                               disabled={isUpdating}
+                              aria-label="编辑"
                             >
                               <Pencil className="size-4" />
                             </button>
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              className="rounded-lg p-2 transition hover:bg-muted hover:text-foreground"
                               onClick={() => void handleRefreshAccounts([account.access_token])}
                               disabled={isRefreshing || refreshingTokens.has(account.access_token)}
+                              aria-label="刷新"
                             >
-                              <RefreshCw className={cn("size-4", (isRefreshing || refreshingTokens.has(account.access_token)) ? "animate-spin" : "")} />
+                              <RefreshCw
+                                className={cn(
+                                  "size-4",
+                                  isRefreshing || refreshingTokens.has(account.access_token)
+                                    ? "animate-spin"
+                                    : "",
+                                )}
+                              />
                             </button>
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
+                              className="rounded-lg p-2 transition hover:bg-destructive/10 hover:text-destructive"
                               onClick={() => void handleDeleteTokens([account.access_token])}
                               disabled={isDeleting}
+                              aria-label="删除"
                             >
                               <Trash2 className="size-4" />
                             </button>
@@ -1390,26 +1587,28 @@ function AccountsPageContent() {
 
               {!isLoading && currentRows.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
-                  <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
+                  <div className="rounded-xl bg-muted p-3 text-muted-foreground">
                     <Search className="size-5" />
                   </div>
                   <div className="space-y-1">
-                    <p className="text-sm font-medium text-stone-700">没有匹配的账户</p>
-                    <p className="text-sm text-stone-500">调整筛选条件或搜索关键字后重试。</p>
+                    <p className="text-sm font-medium text-foreground/80">没有匹配的账户</p>
+                    <p className="text-sm text-muted-foreground">
+                      调整筛选条件或搜索关键字后重试。
+                    </p>
                   </div>
                 </div>
               ) : null}
             </div>
 
-            <div className="border-t border-stone-100 px-4 py-4">
-              <div className="flex items-center justify-center gap-3 overflow-x-auto whitespace-nowrap">
-                <div className="shrink-0 text-sm text-stone-500">
-                显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
-                {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
-                {filteredAccounts.length} 条
+            <div className="border-t border-border px-4 py-4">
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <div className="shrink-0 text-sm text-muted-foreground">
+                  显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
+                  {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
+                  {filteredAccounts.length} 条
                 </div>
 
-                <span className="shrink-0 text-sm leading-none text-stone-500">
+                <span className="shrink-0 text-sm leading-none text-muted-foreground">
                   {safePage} / {pageCount} 页
                 </span>
                 <Select
@@ -1419,7 +1618,10 @@ function AccountsPageContent() {
                     setPage(1);
                   }}
                 >
-                  <SelectTrigger className="h-10 w-[108px] shrink-0 rounded-lg border-stone-200 bg-white text-sm leading-none">
+                  <SelectTrigger
+                    className="h-10 w-[108px] shrink-0 rounded-lg border-border bg-card text-sm leading-none"
+                    aria-label="每页数量"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1432,15 +1634,16 @@ function AccountsPageContent() {
                 <Button
                   variant="outline"
                   size="icon"
-                  className="size-10 shrink-0 rounded-lg border-stone-200 bg-white"
+                  className="size-10 shrink-0 rounded-lg border-border bg-card"
                   disabled={safePage <= 1}
                   onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                  aria-label="上一页"
                 >
                   <ChevronLeft className="size-4" />
                 </Button>
                 {paginationItems.map((item, index) =>
                   item === "..." ? (
-                    <span key={`ellipsis-${index}`} className="px-1 text-sm text-stone-400">
+                    <span key={`ellipsis-${index}`} className="px-1 text-sm text-muted-foreground">
                       ...
                     </span>
                   ) : (
@@ -1450,8 +1653,8 @@ function AccountsPageContent() {
                       className={cn(
                         "h-10 min-w-10 shrink-0 rounded-lg px-3",
                         item === safePage
-                          ? "bg-stone-950 text-white hover:bg-stone-800"
-                          : "border-stone-200 bg-white text-stone-700",
+                          ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                          : "border-border bg-card text-foreground/80",
                       )}
                       onClick={() => setPage(item)}
                     >
@@ -1462,9 +1665,10 @@ function AccountsPageContent() {
                 <Button
                   variant="outline"
                   size="icon"
-                  className="size-10 shrink-0 rounded-lg border-stone-200 bg-white"
+                  className="size-10 shrink-0 rounded-lg border-border bg-card"
                   disabled={safePage >= pageCount}
                   onClick={() => setPage((prev) => Math.min(pageCount, prev + 1))}
+                  aria-label="下一页"
                 >
                   <ChevronRight className="size-4" />
                 </Button>
@@ -1483,7 +1687,7 @@ export default function AccountsPage() {
   if (isCheckingAuth || !session || session.role !== "admin") {
     return (
       <div className="flex min-h-[40vh] items-center justify-center">
-        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+        <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
       </div>
     );
   }

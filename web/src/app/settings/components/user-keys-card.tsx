@@ -1,7 +1,16 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Ban, CheckCircle2, Copy, KeyRound, LoaderCircle, Pencil, Plus, Trash2 } from "lucide-react";
+import { useId, useEffect, useRef, useState } from "react";
+import {
+  Ban,
+  CheckCircle2,
+  Copy,
+  KeyRound,
+  LoaderCircle,
+  Pencil,
+  Plus,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -16,7 +25,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { createUserKey, deleteUserKey, fetchUserKeys, updateUserKey, type UserKey } from "@/lib/api";
+import {
+  createUserKey,
+  deleteUserKey,
+  fetchUserKeys,
+  updateUserKey,
+  type UserKey,
+} from "@/lib/api";
 
 function formatDateTime(value?: string | null) {
   if (!value) {
@@ -36,6 +51,7 @@ function formatDateTime(value?: string | null) {
 }
 
 export function UserKeysCard() {
+  const fieldId = useId();
   const didLoadRef = useRef(false);
   const [items, setItems] = useState<UserKey[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -173,33 +189,38 @@ export function UserKeysCard() {
 
   return (
     <>
-      <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+      <Card className="rounded-2xl border-border bg-card shadow-sm">
         <CardContent className="space-y-6 p-6">
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="flex size-10 items-center justify-center rounded-xl bg-stone-100">
-                <KeyRound className="size-5 text-stone-600" />
+              <div className="flex size-10 items-center justify-center rounded-xl bg-muted">
+                <KeyRound className="size-5 text-foreground/80" />
               </div>
               <div>
                 <h2 className="text-lg font-semibold tracking-tight">用户密钥管理</h2>
-                <p className="text-sm text-stone-500">为普通用户创建专用密钥；普通用户只能进入画图页，不能查看设置和号池。</p>
+                <p className="text-sm text-muted-foreground">
+                  为普通用户创建专用密钥；普通用户只能进入画图页，不能查看设置和号池。
+                </p>
               </div>
             </div>
-            <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => setIsDialogOpen(true)}>
+            <Button
+              className="h-9 rounded-xl bg-primary px-4 text-primary-foreground hover:bg-primary/90"
+              onClick={() => setIsDialogOpen(true)}
+            >
               <Plus className="size-4" />
               创建用户密钥
             </Button>
           </div>
 
           {revealedKey ? (
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-4 text-sm text-emerald-900">
+            <div className="rounded-xl border border-success/25 bg-success/10 px-4 py-4 text-sm text-success">
               <div className="font-medium">新密钥仅展示一次，请立即保存：</div>
-              <div className="mt-3 flex flex-col gap-3 rounded-lg border border-emerald-200 bg-white/80 p-3 md:flex-row md:items-center md:justify-between">
+              <div className="mt-3 flex flex-col gap-3 rounded-lg border border-success/25 bg-card p-3 md:flex-row md:items-center md:justify-between">
                 <code className="break-all font-mono text-[13px]">{revealedKey}</code>
                 <Button
                   type="button"
                   variant="outline"
-                  className="h-9 rounded-xl border-emerald-200 bg-white px-4 text-emerald-700"
+                  className="h-9 rounded-xl border-success/25 bg-card px-4 text-success"
                   onClick={() => void handleCopy(revealedKey)}
                 >
                   <Copy className="size-4" />
@@ -211,10 +232,10 @@ export function UserKeysCard() {
 
           {isLoading ? (
             <div className="flex items-center justify-center py-10">
-              <LoaderCircle className="size-5 animate-spin text-stone-400" />
+              <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
             </div>
           ) : items.length === 0 ? (
-            <div className="rounded-xl bg-stone-50 px-6 py-10 text-center text-sm text-stone-500">
+            <div className="rounded-xl bg-muted px-6 py-10 text-center text-sm text-muted-foreground">
               暂无普通用户密钥。点击右上角按钮后即可创建并分发给其他人。
             </div>
           ) : (
@@ -222,15 +243,23 @@ export function UserKeysCard() {
               {items.map((item) => {
                 const isPending = pendingIds.has(item.id);
                 return (
-                  <div key={item.id} className="flex flex-col gap-3 rounded-xl border border-stone-200 bg-white px-4 py-4 md:flex-row md:items-center md:justify-between">
+                  <div
+                    key={item.id}
+                    className="flex flex-col gap-3 rounded-xl border border-border bg-card px-4 py-4 md:flex-row md:items-center md:justify-between"
+                  >
                     <div className="min-w-0 space-y-2">
                       <div className="flex flex-wrap items-center gap-2">
-                        <div className="truncate text-sm font-medium text-stone-800">{item.name}</div>
-                        <Badge variant={item.enabled ? "success" : "secondary"} className="rounded-md">
+                        <div className="truncate text-sm font-medium text-foreground">
+                          {item.name}
+                        </div>
+                        <Badge
+                          variant={item.enabled ? "success" : "secondary"}
+                          className="rounded-md"
+                        >
                           {item.enabled ? "已启用" : "已禁用"}
                         </Badge>
                       </div>
-                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-500">
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                         <span>创建时间 {formatDateTime(item.created_at)}</span>
                         <span>最近使用 {formatDateTime(item.last_used_at)}</span>
                       </div>
@@ -240,17 +269,21 @@ export function UserKeysCard() {
                       <Button
                         type="button"
                         variant="outline"
-                        className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                        className="h-9 rounded-xl border-border bg-card px-4 text-foreground/80"
                         onClick={() => openEditDialog(item)}
                         disabled={isPending}
                       >
-                        {isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Pencil className="size-4" />}
+                        {isPending ? (
+                          <LoaderCircle className="size-4 animate-spin" />
+                        ) : (
+                          <Pencil className="size-4" />
+                        )}
                         编辑
                       </Button>
                       <Button
                         type="button"
                         variant="outline"
-                        className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                        className="h-9 rounded-xl border-border bg-card px-4 text-foreground/80"
                         onClick={() => void handleToggle(item)}
                         disabled={isPending}
                       >
@@ -266,11 +299,15 @@ export function UserKeysCard() {
                       <Button
                         type="button"
                         variant="outline"
-                        className="h-9 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
+                        className="h-9 rounded-xl border-destructive/25 bg-card px-4 text-destructive hover:bg-destructive/10 hover:text-destructive"
                         onClick={() => setDeletingItem(item)}
                         disabled={isPending}
                       >
-                        {isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                        {isPending ? (
+                          <LoaderCircle className="size-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-4" />
+                        )}
                         删除
                       </Button>
                     </div>
@@ -291,19 +328,22 @@ export function UserKeysCard() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <label className="text-sm font-medium text-stone-700">名称（可选）</label>
+            <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-1"}>
+              名称（可选）
+            </label>
             <Input
               value={name}
               onChange={(event) => setName(event.target.value)}
               placeholder="例如：设计同学 A、运营临时账号"
-              className="h-11 rounded-xl border-stone-200 bg-white"
+              className="h-11 rounded-xl border-border bg-card"
+              id={fieldId + "-1"}
             />
           </div>
           <DialogFooter>
             <Button
               type="button"
               variant="secondary"
-              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              className="h-10 rounded-xl bg-muted px-5 text-foreground/80 hover:bg-secondary"
               onClick={() => setIsDialogOpen(false)}
               disabled={isCreating}
             >
@@ -311,18 +351,25 @@ export function UserKeysCard() {
             </Button>
             <Button
               type="button"
-              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
               onClick={() => void handleCreate()}
               disabled={isCreating}
             >
-              {isCreating ? <LoaderCircle className="size-4 animate-spin" /> : <Plus className="size-4" />}
+              {isCreating ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Plus className="size-4" />
+              )}
               创建
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={Boolean(deletingItem)} onOpenChange={(open) => (!open ? setDeletingItem(null) : null)}>
+      <Dialog
+        open={Boolean(deletingItem)}
+        onOpenChange={(open) => (!open ? setDeletingItem(null) : null)}
+      >
         <DialogContent className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>删除用户密钥</DialogTitle>
@@ -334,7 +381,7 @@ export function UserKeysCard() {
             <Button
               type="button"
               variant="secondary"
-              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              className="h-10 rounded-xl bg-muted px-5 text-foreground/80 hover:bg-secondary"
               onClick={() => setDeletingItem(null)}
               disabled={deletingItem ? pendingIds.has(deletingItem.id) : false}
             >
@@ -342,11 +389,15 @@ export function UserKeysCard() {
             </Button>
             <Button
               type="button"
-              className="h-10 rounded-xl bg-rose-600 px-5 text-white hover:bg-rose-700"
+              className="h-10 rounded-xl bg-destructive px-5 text-white hover:bg-destructive"
               onClick={() => void handleDelete()}
               disabled={deletingItem ? pendingIds.has(deletingItem.id) : false}
             >
-              {deletingItem && pendingIds.has(deletingItem.id) ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              {deletingItem && pendingIds.has(deletingItem.id) ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Trash2 className="size-4" />
+              )}
               删除
             </Button>
           </DialogFooter>
@@ -371,23 +422,29 @@ export function UserKeysCard() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">名称</label>
+              <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-2"}>
+                名称
+              </label>
               <Input
                 value={editName}
                 onChange={(event) => setEditName(event.target.value)}
                 placeholder="例如：设计同学 A、运营临时账号"
-                className="h-11 rounded-xl border-stone-200 bg-white"
+                className="h-11 rounded-xl border-border bg-card"
+                id={fieldId + "-2"}
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium text-stone-700">新的专用密钥（可选）</label>
+              <label className="text-sm font-medium text-foreground/80" htmlFor={fieldId + "-3"}>
+                新的专用密钥（可选）
+              </label>
               <Input
                 value={editKey}
                 onChange={(event) => setEditKey(event.target.value)}
                 placeholder="例如：sk-your-custom-user-key"
-                className="h-11 rounded-xl border-stone-200 bg-white font-mono"
+                className="h-11 rounded-xl border-border bg-card font-mono"
+                id={fieldId + "-3"}
               />
-              <p className="text-xs leading-5 text-stone-500">
+              <p className="text-xs leading-5 text-muted-foreground">
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
             </div>
@@ -396,7 +453,7 @@ export function UserKeysCard() {
             <Button
               type="button"
               variant="secondary"
-              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              className="h-10 rounded-xl bg-muted px-5 text-foreground/80 hover:bg-secondary"
               onClick={() => {
                 setEditingItem(null);
                 setEditKey("");
@@ -407,11 +464,15 @@ export function UserKeysCard() {
             </Button>
             <Button
               type="button"
-              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              className="h-10 rounded-xl bg-primary px-5 text-primary-foreground hover:bg-primary/90"
               onClick={() => void handleEdit()}
               disabled={editingItem ? pendingIds.has(editingItem.id) : false}
             >
-              {editingItem && pendingIds.has(editingItem.id) ? <LoaderCircle className="size-4 animate-spin" /> : <Pencil className="size-4" />}
+              {editingItem && pendingIds.has(editingItem.id) ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Pencil className="size-4" />
+              )}
               保存
             </Button>
           </DialogFooter>

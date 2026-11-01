@@ -1,16 +1,23 @@
 "use client";
 
 import { login } from "@/lib/api";
-import { clearStoredAuthSession, getStoredAuthSession, setStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import { HttpRequestError } from "@/lib/request";
+import {
+  clearStoredAuthSession,
+  getStoredAuthKey,
+  getStoredAuthSession,
+  setStoredAuthSession,
+  type StoredAuthSession,
+} from "@/store/auth";
 
-export async function getValidatedAuthSession(): Promise<StoredAuthSession | null> {
+let pendingValidation: Promise<StoredAuthSession | null> | null = null;
+
+async function validateSession(): Promise<StoredAuthSession | null> {
   const storedSession = await getStoredAuthSession();
-  if (!storedSession) {
-    return null;
-  }
-
+  if (!storedSession) return null;
   try {
     const data = await login(storedSession.key);
+    if ((await getStoredAuthKey()) !== storedSession.key) return null;
     const nextSession: StoredAuthSession = {
       key: storedSession.key,
       role: data.role,
@@ -19,8 +26,19 @@ export async function getValidatedAuthSession(): Promise<StoredAuthSession | nul
     };
     await setStoredAuthSession(nextSession);
     return nextSession;
-  } catch {
-    await clearStoredAuthSession();
-    return null;
+  } catch (error) {
+    if (error instanceof HttpRequestError && (error.status === 401 || error.status === 403)) {
+      if ((await getStoredAuthKey()) === storedSession.key) await clearStoredAuthSession();
+      return null;
+    }
+    throw error;
   }
+}
+
+export function getValidatedAuthSession(): Promise<StoredAuthSession | null> {
+  if (!pendingValidation)
+    pendingValidation = validateSession().finally(() => {
+      pendingValidation = null;
+    });
+  return pendingValidation;
 }

@@ -1,13 +1,29 @@
 "use client";
 
-/* eslint-disable @next/next/no-img-element -- generated images use runtime blob and external URLs */
-
-import { memo, useEffect, useRef, useState } from "react";
-import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
-
+import NextImage from "next/image";
+import { useEffect, useRef, useState } from "react";
+import {
+  AlertCircle,
+  Clock3,
+  Download,
+  EyeOff,
+  ImageIcon,
+  LoaderCircle,
+  RotateCcw,
+  SlidersHorizontal,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { creativeErrorDetail, creativeErrorSummary } from "@/lib/creative-error";
 import { cn } from "@/lib/utils";
-import type { ImageConversation, ImageTurnStatus, StoredImage, StoredReferenceImage } from "@/store/image-conversations";
+import type {
+  ImageConversation,
+  ImageTurnStatus,
+  StoredImage,
+  StoredReferenceImage,
+} from "@/store/image-conversations";
 
 export type ImageLightboxItem = {
   id: string;
@@ -30,61 +46,87 @@ type ImageResultsProps = {
   formatConversationTime: (value: string) => string;
 };
 
-// Blob URL 缓存：避免 base64 超长字符串在 DOM 中，改用短小的 blob: URL
-const b64BlobUrlCache = new Map<string, string>();
+function imageBlob(base64: string) {
+  const binary = atob(base64);
+  return new Blob([Uint8Array.from(binary, (char) => char.charCodeAt(0))], { type: "image/png" });
+}
 
-function getStoredImageSrc(image: StoredImage) {
-  if (image.b64_json) {
-    let url = b64BlobUrlCache.get(image.b64_json);
-    if (!url) {
-      const binary = atob(image.b64_json);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: "image/png" });
-      url = URL.createObjectURL(blob);
-      b64BlobUrlCache.set(image.b64_json, url);
+function useImageSources(conversation: ImageConversation | null) {
+  const cache = useRef(new Map<string, string>());
+  const [sources, setSources] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const needed = new Set<string>();
+    for (const turn of conversation?.turns || []) {
+      if (turn.resultsDeleted) continue;
+      for (const image of turn.images)
+        if (image.status === "success" && image.b64_json) needed.add(image.b64_json);
     }
-    return url;
-  }
-  return image.url || "";
+    for (const [key, url] of cache.current)
+      if (!needed.has(key)) {
+        URL.revokeObjectURL(url);
+        cache.current.delete(key);
+      }
+    for (const key of needed)
+      if (!cache.current.has(key)) {
+        try {
+          cache.current.set(key, URL.createObjectURL(imageBlob(key)));
+        } catch {
+          /* Corrupt historical image renders a recoverable error. */
+        }
+      }
+    setSources(Object.fromEntries(cache.current));
+  }, [conversation]);
+  useEffect(() => {
+    const owned = cache.current;
+    return () => {
+      for (const url of owned.values()) URL.revokeObjectURL(url);
+      owned.clear();
+    };
+  }, []);
+  return sources;
 }
 
 async function downloadStoredImage(image: StoredImage, index: number, original = false) {
-  let blob: Blob | null = null;
-  const selectedUrl = original ? image.originalUrl || image.url : image.url;
   try {
-    if (image.b64_json && !original) {
-      const binary = atob(image.b64_json);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      blob = new Blob([bytes], { type: "image/png" });
-    } else if (selectedUrl) {
-      // 确保 URL 是绝对路径
-      const url = selectedUrl.startsWith("http") ? selectedUrl : `${window.location.origin}${selectedUrl}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      blob = await res.blob();
-    } else {
-      return;
+    let blob: Blob;
+    if (image.b64_json && !original) blob = imageBlob(image.b64_json);
+    else {
+      const source = original ? image.originalUrl || image.url : image.url;
+      if (!source) throw new Error("没有可下载的图片资源");
+      const url = new URL(source, window.location.origin);
+      if (!["http:", "https:", "blob:", "data:"].includes(url.protocol))
+        throw new Error("图片地址格式无效");
+      const response = await fetch(url, { signal: AbortSignal.timeout(60000) });
+      if (!response.ok) throw new Error("图片下载失败（" + response.status + "）");
+      blob = await response.blob();
+      if (!blob.type.startsWith("image/")) throw new Error("服务器返回的不是图片文件");
     }
-  } catch (err) {
-    console.error("Failed to download image:", err);
-    // 如果 fetch 失败，尝试直接在新窗口打开
-    if (selectedUrl) {
-      window.open(selectedUrl, "_blank");
-    }
-    return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const extension = blob.type.includes("jpeg")
+      ? "jpg"
+      : blob.type.includes("webp")
+        ? "webp"
+        : "png";
+    a.download = "image-" + (index + 1) + (original ? "-original" : "") + "." + extension;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    toast.error(e instanceof Error ? creativeErrorSummary(e.message) : "下载失败，请重试");
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `image-${index + 1}${original ? "-original" : ""}.png`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+}
+
+function ErrorDetails({ error }: { error: string }) {
+  return (
+    <div className="creative-error">
+      <p>{creativeErrorSummary(error)}</p>
+      <details>
+        <summary>查看错误详情</summary>
+        <pre>{creativeErrorDetail(error)}</pre>
+      </details>
+    </div>
+  );
 }
 
 export function ImageResults({
@@ -100,480 +142,370 @@ export function ImageResults({
   onDismissErrors,
   formatConversationTime,
 }: ImageResultsProps) {
-  const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
-  const [currentTime, setCurrentTime] = useState(0);
-  
-  // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
-  const hasLoadingImages = selectedConversation?.turns.some(
+  const sources = useImageSources(selectedConversation);
+  const [now, setNow] = useState(0);
+  const hasLoading = selectedConversation?.turns.some(
     (turn) => !turn.resultsDeleted && turn.images.some((image) => image.status === "loading"),
   );
   useEffect(() => {
-    if (!hasLoadingImages) return;
-    const timer = setInterval(() => {
-      setCurrentTime(Date.now());
-    }, 500);
+    if (!hasLoading) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [hasLoadingImages]);
+  }, [hasLoading]);
+  const src = (image: StoredImage) =>
+    image.b64_json ? sources[image.b64_json] || "" : image.url || "";
 
-  const updateImageDimensions = (id: string, width: number, height: number) => {
-    const dimensions = formatImageDimensions(width, height);
-    setImageDimensions((current) => current[id] === dimensions ? current : { ...current, [id]: dimensions });
-  };
-
-  if (!selectedConversation) {
+  if (!selectedConversation || selectedConversation.turns.length === 0)
     return (
-      <div className="flex h-full min-h-[260px] items-center justify-center text-center sm:min-h-[420px]">
-        <div className="w-full max-w-4xl">
-          <h1
-            className="text-2xl font-semibold tracking-tight text-stone-950 sm:text-3xl md:text-5xl"
-            style={{
-              fontFamily: '"Palatino Linotype","Book Antiqua","URW Palladio L","Times New Roman",serif',
-            }}
-          >
-            Turn ideas into images
-          </h1>
-          <p
-            className="mx-auto mt-3 max-w-[280px] text-sm italic tracking-[0.01em] text-stone-500 sm:mt-4 sm:max-w-none sm:text-[15px]"
-            style={{
-              fontFamily: '"Palatino Linotype","Book Antiqua","URW Palladio L","Times New Roman",serif',
-            }}
-          >
-            在同一窗口里保留本地历史与任务状态，并从已有结果图继续发起新的无状态编辑。
-          </p>
+      <div className="studio-empty">
+        <span className="studio-empty-mark">
+          <ImageIcon className="size-7" strokeWidth={1.4} />
+        </span>
+        <h2>让想象，有画面。</h2>
+        <p>用文字描述你的想法，或添加参考图继续创作。</p>
+        <div className="image-empty-examples">
+          <span>产品视觉</span>
+          <span>插画设计</span>
+          <span>场景探索</span>
+          <span>图片编辑</span>
         </div>
       </div>
     );
-  }
 
   return (
-    <div className="mx-auto flex w-full max-w-[980px] flex-col gap-5 sm:gap-8">
+    <div className="image-thread">
       {selectedConversation.turns.map((turn, turnIndex) => {
-        const referenceLightboxImages = turn.referenceImages.map((image, index) => ({
-          id: `${turn.id}-reference-${index}`,
-          src: image.dataUrl,
-        }));
-        const successfulTurnImages = turn.images.flatMap((image) => {
-          const src = image.status === "success" ? getStoredImageSrc(image) : "";
-          return src
-            ? [
-                {
-                  id: image.id,
-                  src,
-                  sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: image.width && image.height
-                    ? formatImageDimensions(image.width, image.height)
-                    : imageDimensions[image.id],
-                },
-              ]
-            : [];
-        });
-
+        const successful = turn.images
+          .filter((image) => image.status === "success" && src(image))
+          .map((image) => ({
+            id: image.id,
+            src: src(image),
+            dimensions:
+              image.width && image.height ? image.width + " × " + image.height : undefined,
+          }));
+        const busy = turn.status === "generating" || turn.status === "queued";
         return (
-          <div key={turn.id} className="flex flex-col gap-3 sm:gap-4">
-            {!turn.promptDeleted ? (
-              <div className="flex justify-end">
-                <div className="max-w-[90%] px-1 py-1 text-[14px] leading-6 text-stone-900 sm:max-w-[82%] sm:text-[15px] sm:leading-7">
-                  <div className="mb-1.5 flex flex-wrap justify-end gap-2 text-[11px] text-stone-400 sm:mb-2">
-                    <span>第 {turnIndex + 1} 轮</span>
-                    <span>
-                      {turn.mode === "edit" ? "编辑图" : "文生图"}
-                    </span>
-                    <span>{getTurnStatusLabel(turn.status)}</span>
-                    <span>{formatConversationTime(turn.createdAt)}</span>
-                  </div>
-                  <div className="text-right">{turn.prompt}</div>
-                  <div className="mt-2 flex flex-wrap justify-end gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => void onReuseTurnConfig(selectedConversation.id, turn.id)}
-                      className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 text-[11px] font-medium text-stone-600 transition hover:bg-stone-200 hover:text-stone-900"
-                    >
-                      复用配置
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onDeletePrompt(selectedConversation.id, turn.id)}
-                      className="inline-flex size-6 items-center justify-center rounded-full text-stone-300 transition hover:bg-rose-50 hover:text-rose-500"
-                      aria-label="删除提示词记录"
-                    >
-                      <Trash2 className="size-3" />
-                    </button>
-                  </div>
+          <article
+            key={turn.id}
+            className="image-turn"
+            aria-label={"第 " + (turnIndex + 1) + " 轮生成"}
+          >
+            {!turn.promptDeleted && (
+              <div className="ml-auto max-w-[92%] sm:max-w-[80%]">
+                <div className="chat-user-bubble">
+                  <p className="whitespace-pre-wrap break-words text-sm leading-7">{turn.prompt}</p>
+                  {turn.referenceImages.length > 0 && (
+                    <div className="mt-3 flex gap-2 overflow-x-auto">
+                      {turn.referenceImages.map((image, index) => (
+                        <button
+                          key={index}
+                          type="button"
+                          className="size-16 shrink-0 overflow-hidden rounded-xl"
+                          aria-label={"查看参考图 " + (index + 1)}
+                          onClick={() =>
+                            onOpenLightbox(
+                              turn.referenceImages.map((ref, i) => ({
+                                id: turn.id + "-ref-" + i,
+                                src: ref.dataUrl,
+                              })),
+                              index,
+                            )
+                          }
+                        >
+                          <NextImage
+                            src={image.dataUrl}
+                            alt={image.name || "参考图"}
+                            unoptimized
+                            width={64}
+                            height={64}
+                            className="h-full w-full object-cover"
+                          />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-2 flex flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
+                  <span className="mr-2">{formatConversationTime(turn.createdAt)}</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2 text-xs"
+                    onClick={() => void onReuseTurnConfig(selectedConversation.id, turn.id)}
+                  >
+                    <SlidersHorizontal className="size-3.5" />
+                    复用参数
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-8"
+                    aria-label="删除提示词"
+                    onClick={() => onDeletePrompt(selectedConversation.id, turn.id)}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
                 </div>
               </div>
-            ) : null}
-
-            {!turn.resultsDeleted ? (
-              <div className="flex justify-start">
-                <div className="w-full p-1">
-                  {turn.referenceImages.length > 0 ? (
-                    <div className="mb-4 flex flex-col items-end">
-                      <div className="mb-3 text-xs font-medium text-stone-500">本轮参考图</div>
-                      <div className="flex flex-wrap justify-end gap-3">
-                        {turn.referenceImages.map((image, index) => (
-                          <div key={`${turn.id}-${image.name}-${index}`} className="flex flex-col items-end gap-2">
-                            <button
-                              type="button"
-                              onClick={() => onOpenLightbox(referenceLightboxImages, index)}
-                              className="group relative h-24 w-24 overflow-hidden border border-stone-200/80 bg-stone-100/60 text-left transition hover:border-stone-300"
-                              aria-label={`预览参考图 ${image.name || index + 1}`}
-                            >
-                              <img
-                                src={image.dataUrl}
-                                alt={image.name || `参考图 ${index + 1}`}
-                                className="absolute inset-0 h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
-                              />
-                            </button>
+            )}
+            {!turn.resultsDeleted && (
+              <div className="mt-6">
+                <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
+                  <span className="inline-flex items-center gap-2 font-semibold text-foreground">
+                    <Sparkles className="size-4" />
+                    图像创作
+                  </span>
+                  <span>{getTurnStatusLabel(turn.status)}</span>
+                  <span>
+                    {turn.count} 张 · {turn.size || "自动尺寸"} ·{" "}
+                    {turn.quality === "auto" ? "自动质量" : turn.quality}
+                  </span>
+                  <span className="max-w-[220px] truncate" title={turn.model}>
+                    {turn.model}
+                  </span>
+                </div>
+                <div
+                  className={cn(
+                    "image-result-grid",
+                    turn.images.length === 1 && "image-result-single",
+                  )}
+                >
+                  {turn.images.map((image, index) => {
+                    if (image.status === "success") {
+                      const imageSrc = src(image);
+                      return (
+                        <div key={image.id} className="image-result-card">
+                          {imageSrc ? (
+                            <ResultImage
+                              src={imageSrc}
+                              onOpen={() =>
+                                onOpenLightbox(
+                                  successful,
+                                  successful.findIndex((item) => item.id === image.id),
+                                )
+                              }
+                              label={"查看生成图片 " + (index + 1)}
+                            />
+                          ) : (
+                            <div className="grid min-h-48 place-items-center rounded-2xl bg-muted text-sm text-muted-foreground">
+                              {image.b64_json && !sources[image.b64_json]
+                                ? "正在读取图片，或历史资源已损坏"
+                                : "图片资源缺失"}
+                            </div>
+                          )}
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                            <span className="text-[11px] text-muted-foreground">
+                              {image.width && image.height
+                                ? image.width + " × " + image.height
+                                : "图片 " + (index + 1)}
+                              {image.durationMs != null
+                                ? " · " + (image.durationMs / 1000).toFixed(1) + "s"
+                                : ""}
+                            </span>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 text-xs"
+                                onClick={() => onContinueEdit(selectedConversation.id, image)}
+                              >
+                                <Sparkles className="size-3.5" />
+                                编辑
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="size-8"
+                                aria-label="下载图片"
+                                onClick={() => void downloadStoredImage(image, index)}
+                              >
+                                <Download className="size-4" />
+                              </Button>
+                              {image.outputTransform === "lanczos_upscale" && image.originalUrl && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-8 px-2 text-xs"
+                                  aria-label="下载原图"
+                                  onClick={() => void downloadStoredImage(image, index, true)}
+                                >
+                                  原图
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+                    if (image.status === "error")
+                      return (
+                        <div key={image.id} className="image-failure-card">
+                          <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                            <AlertCircle className="size-4 text-destructive" />
+                            图片 {index + 1} 未完成
+                          </div>
+                          <ErrorDetails error={image.error || "生成失败，请重试"} />
+                          {image.accountHash ? (
+                            <p className="text-xs text-muted-foreground">
+                              本次使用账号：{image.accountHash}
+                            </p>
+                          ) : null}
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {image.taskId && /超时|timeout/i.test(image.error || "") && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => void onTimeoutRetryContinue(image.taskId!)}
+                              >
+                                继续等待
+                              </Button>
+                            )}
                             <Button
                               variant="outline"
                               size="sm"
-                              className="rounded-full border-stone-200 bg-white text-stone-700 hover:bg-stone-50"
-                              onClick={() => onContinueEdit(selectedConversation.id, image)}
+                              disabled={!turn.prompt.trim() || busy}
+                              onClick={() =>
+                                void onRetryImage(selectedConversation.id, turn.id, image.id)
+                              }
                             >
-                              <Sparkles className="size-4" />
-                              加入编辑
+                              <RotateCcw className="size-3.5" />
+                              重新生成这一张
                             </Button>
                           </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-
-                  <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11px] text-stone-500 sm:mb-4 sm:gap-2 sm:text-xs">
-                    <span className="rounded-full bg-stone-100 px-3 py-1">{turn.count} 张</span>
-                    <span className="rounded-full bg-stone-100 px-3 py-1">{getTurnStatusLabel(turn.status)}</span>
-                    {turn.status === "queued" ? (
-                      <span className="rounded-full bg-amber-50 px-3 py-1 text-amber-700">等待当前对话中的前序任务完成</span>
-                    ) : null}
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2 sm:block sm:columns-2 sm:gap-4 sm:space-y-4 xl:columns-3">
-                    {turn.images.map((image, index) => {
-                      const imageSrc = image.status === "success" ? getStoredImageSrc(image) : "";
-                      if (image.status === "success" && imageSrc) {
-                        const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
-                        const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = image.width && image.height
-                          ? formatImageDimensions(image.width, image.height)
-                          : imageDimensions[image.id];
-                        const sourceDimensions = image.sourceWidth && image.sourceHeight
-                          ? formatImageDimensions(image.sourceWidth, image.sourceHeight)
-                          : "";
-                        const transformed = image.outputTransform === "lanczos_upscale";
-                        const imageMeta = [
-                          sizeLabel,
-                          dimensions,
-                          transformed && sourceDimensions ? `源图 ${sourceDimensions}` : "",
-                          transformed ? "LANCZOS 放大" : "原始输出",
-                        ].filter(Boolean).join(" · ");
-
-                        return (
-                          <div
-                            key={image.id}
-                            className="break-inside-avoid"
-                          >
-                            <LazyImage
-                              src={imageSrc}
-                              alt={`Generated result ${index + 1}`}
-                              className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
-                              onLoad={(event) => {
-                                updateImageDimensions(
-                                  image.id,
-                                  event.currentTarget.naturalWidth,
-                                  event.currentTarget.naturalHeight,
-                                );
-                              }}
-                              onOpen={() => onOpenLightbox(successfulTurnImages, currentIndex)}
-                            />
-                            <div className="flex flex-col gap-1 px-0.5 py-1 text-[10px] sm:flex-row sm:items-center sm:justify-between sm:gap-2 sm:px-3 sm:py-3 sm:text-xs">
-                              <div className="min-w-0 text-stone-500">
-                                <span>结果 {index + 1}</span>
-                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
-                                {imageMeta ? <span className="block text-stone-400">{imageMeta}</span> : null}
-                              </div>
-                              <div className="flex items-center gap-1.5">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
-                                  onClick={() => onContinueEdit(selectedConversation.id, image)}
-                                  aria-label="加入编辑"
-                                >
-                                  <Sparkles className="size-3 sm:size-4" />
-                                  <span className="hidden sm:inline">加入编辑</span>
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
-                                  onClick={() => void downloadStoredImage(image, index)}
-                                  aria-label={transformed ? "下载高清图" : "下载图片"}
-                                >
-                                  <Download className="size-3 sm:size-4" />
-                                  <span className="hidden sm:inline">{transformed ? "高清图" : "下载"}</span>
-                                </Button>
-                                {transformed && image.originalUrl ? (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
-                                    onClick={() => void downloadStoredImage(image, index, true)}
-                                    aria-label="下载原图"
-                                  >
-                                    <Download className="size-3 sm:size-4" />
-                                    <span className="hidden sm:inline">原图</span>
-                                  </Button>
-                                ) : null}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      if (image.status === "error") {
-                        const isTimeoutError = image.error?.includes("超时") && image.taskId;
-                        return (
-                          <div key={image.id} className="break-inside-avoid">
-                            <div
-                              className={cn(
-                                "overflow-hidden rounded-xl border border-rose-200 bg-rose-50",
-                                "aspect-square",
-                                turn.ratio === "1:1" && "sm:aspect-square",
-                                turn.ratio === "16:9" && "sm:aspect-video",
-                                turn.ratio === "9:16" && "sm:aspect-[9/16]",
-                                turn.ratio === "4:3" && "sm:aspect-[4/3]",
-                                turn.ratio === "3:4" && "sm:aspect-[3/4]",
-                              )}
-                            >
-                            <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-2 py-2 text-center text-[11px] leading-4 text-rose-600 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
-                              <p className="font-medium">图片 {index + 1}/{turn.images.length}</p>
-                              <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
-                              <div className="flex items-center gap-2">
-                                {isTimeoutError && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void onTimeoutRetryContinue(image.taskId!)}
-                                    className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-medium text-emerald-600 shadow-sm transition hover:bg-emerald-200 sm:px-3 sm:text-xs"
-                                  >
-                                    继续等待
-                                  </button>
-                                )}
-                                <button
-                                  type="button"
-                                  onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}
-                                  className="rounded-full bg-white px-2 py-1 text-[10px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:px-3 sm:text-xs"
-                                >
-                                  重新生成这一张
-                                </button>
-                              </div>
-                            </div>
-                            </div>
-                            <div className="flex flex-col gap-1 px-0.5 py-1 text-[10px] sm:flex-row sm:items-center sm:justify-between sm:gap-2 sm:px-3 sm:py-3 sm:text-xs">
-                              <div className="min-w-0 text-stone-500">
-                                <span>结果 {index + 1}</span>
-                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
-                                <span className="block text-transparent">-</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      const imageTaskStatus = image.taskStatus || (turn.status === "queued" ? "queued" : "running");
-                      const imageStatusLabel = imageTaskStatus === "queued" ? "排队中" : getProgressLabel(image.progress);
-                      const showElapsed = imageTaskStatus === "running" && image.elapsedSecs != null;
-                      const elapsedDisplay = showElapsed
-                        ? formatElapsed(
-                            image.elapsedUpdatedAt != null
-                              ? image.elapsedSecs! + ((currentTime || image.elapsedUpdatedAt!) - image.elapsedUpdatedAt!) / 1000
-                              : image.elapsedSecs!,
-                          )
-                        : null;
-                      return (
-                        <div key={image.id} className="break-inside-avoid">
-                          <div
-                            className={cn(
-                              "overflow-hidden rounded-xl border border-stone-200/80 bg-stone-100/80 relative",
-                              turn.ratio === "1:1" && "aspect-square",
-                              turn.ratio === "16:9" && "aspect-video",
-                              turn.ratio === "9:16" && "aspect-[9/16]",
-                              turn.ratio === "4:3" && "aspect-[4/3]",
-                              turn.ratio === "3:4" && "aspect-[3/4]",
-                            )}
-                          >
-                          <div className="flex h-full flex-col items-center justify-center gap-1.5 px-2 py-3 text-center text-stone-500 sm:gap-3 sm:px-6 sm:py-8">
-                            <div className="rounded-full bg-white p-2 shadow-sm sm:p-3">
-                              {imageTaskStatus === "queued" ? (
-                                <Clock3 className="size-4 sm:size-5" />
-                              ) : (
-                                <LoaderCircle className="size-4 animate-spin sm:size-5" />
-                              )}
-                            </div>
-                            <p className="text-[11px] font-medium leading-4 sm:text-sm">
-                              图片 {index + 1}/{turn.images.length}
-                            </p>
-                            <p className="text-[10px] leading-4 text-stone-400 sm:text-xs">
-                              {imageStatusLabel}
-                            </p>
-                          </div>
-                          </div>
-                          {elapsedDisplay != null && (
-                            <div className="px-0.5 py-1 text-[10px] text-stone-400 sm:px-3 sm:py-3 sm:text-xs">{elapsedDisplay}</div>
-                          )}
                         </div>
                       );
-                    })}
+                    const queued = image.taskStatus === "queued" || turn.status === "queued";
+                    const elapsed =
+                      image.elapsedSecs != null
+                        ? Math.max(
+                            0,
+                            image.elapsedSecs +
+                              (image.elapsedUpdatedAt && now
+                                ? (now - image.elapsedUpdatedAt) / 1000
+                                : 0),
+                          )
+                        : null;
+                    return (
+                      <div key={image.id} className="image-loading-card" role="status">
+                        <div className="mb-3 grid size-12 place-items-center rounded-2xl bg-background">
+                          {queued ? (
+                            <Clock3 className="size-5" />
+                          ) : (
+                            <LoaderCircle className="size-5 animate-spin" />
+                          )}
+                        </div>
+                        <p className="text-sm font-medium">
+                          {queued ? "已加入队列" : getProgressLabel(image.progress)}
+                        </p>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          图片 {index + 1} / {turn.images.length}
+                          {elapsed !== null && !queued ? " · " + elapsed.toFixed(0) + "s" : ""}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+                {turn.error && !turn.images.some((image) => image.status === "error") && (
+                  <div className="mt-3">
+                    <ErrorDetails error={turn.error} />
                   </div>
-
-                  {turn.status === "error" && turn.error ? (
-                    <div className="mt-4 flex items-center justify-between border-l-2 border-amber-300 bg-amber-50/70 px-4 py-3 text-sm leading-6 text-amber-700">
-                      <span>{turn.error}</span>
-                      <button
-                        type="button"
-                        onClick={() => void onDismissErrors(selectedConversation.id, turn.id)}
-                        className="ml-3 inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-700 transition hover:bg-amber-200 hover:text-amber-900"
-                      >
-                        <EyeOff className="size-3" />
-                        忽略错误
-                      </button>
-                    </div>
-                  ) : null}
-
-                  <div className="mt-3 flex items-center gap-1.5 text-[11px] sm:mt-4">
-                    <button
-                      type="button"
-                      onClick={() => void onRegenerateTurn(selectedConversation.id, turn.id)}
-                      className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 font-medium text-stone-500 transition hover:bg-stone-200 hover:text-stone-900"
+                )}
+                <div className="mt-3 flex flex-wrap items-center gap-1 text-muted-foreground">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2 text-xs"
+                    disabled={busy || !turn.prompt.trim()}
+                    onClick={() => void onRegenerateTurn(selectedConversation.id, turn.id)}
+                  >
+                    <RotateCcw className="size-3.5" />
+                    全部重新生成
+                  </Button>
+                  {turn.images.some((image) => image.status === "error") && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 px-2 text-xs"
+                      onClick={() => void onDismissErrors(selectedConversation.id, turn.id)}
                     >
-                      <RotateCcw className="size-3" />
-                      全部重新生成
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onDeleteResults(selectedConversation.id, turn.id)}
-                      className="inline-flex size-6 items-center justify-center rounded-full text-stone-300 transition hover:bg-rose-50 hover:text-rose-500"
-                      aria-label="删除生成结果"
-                    >
-                      <Trash2 className="size-3" />
-                    </button>
-                  </div>
+                      <EyeOff className="size-3.5" />
+                      隐藏失败项
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-8"
+                    aria-label="删除生成结果"
+                    onClick={() => onDeleteResults(selectedConversation.id, turn.id)}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
                 </div>
               </div>
-            ) : null}
-          </div>
+            )}
+          </article>
         );
       })}
     </div>
   );
 }
 
-function getTurnStatusLabel(status: ImageTurnStatus) {
-  if (status === "queued") {
-    return "排队中";
-  }
-  if (status === "generating") {
-    return "处理中";
-  }
-  if (status === "success") {
-    return "已完成";
-  }
-  return "失败";
-}
-
-const PROGRESS_LABELS: Record<string, string> = {
-  getting_account: "确认可用账号",
-  uploading: "上传图片",
-  bootstrapping: "预热首页",
-  getting_token: "获取 token",
-  preparing_conversation: "准备会话",
-  starting_generation: "启动生成",
-  generating: "生成中",
-  receiving_image: "接收图片中",
-};
-
-function getProgressLabel(progress?: string) {
-  if (!progress) {
-    return "生成中";
-  }
-  return PROGRESS_LABELS[progress] || "生成中";
-}
-
-function formatElapsed(seconds: number): string {
-  return `${seconds.toFixed(1)}s`;
-}
-
-function formatDuration(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
-const base64SizeCache = new Map<string, string>();
-function formatBase64ImageSize(base64: string) {
-  let cached = base64SizeCache.get(base64);
-  if (cached !== undefined) return cached;
-  const normalized = base64.replace(/\s/g, "");
-  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
-  const bytes = Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
-
-  if (bytes >= 1024 * 1024) {
-    cached = `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-  } else if (bytes >= 1024) {
-    cached = `${(bytes / 1024).toFixed(1)} KB`;
-  } else {
-    cached = `${bytes} B`;
-  }
-  base64SizeCache.set(base64, cached);
-  return cached;
-}
-
-function formatImageDimensions(width: number, height: number) {
-  return `${width} x ${height}`;
-}
-
-const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen }: {
-  src: string;
-  alt: string;
-  className: string;
-  onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void;
-  onOpen?: () => void;
-}) {
-  const [isVisible, setIsVisible] = useState(false);
-  const imgRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const element = imgRef.current;
-    if (!element) return;
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setIsVisible(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "400px" },
-    );
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  return (
-    <div ref={imgRef} className="relative">
-      {isVisible ? (
-        <button
-          type="button"
-          onClick={onOpen}
-          className={className}
+function ResultImage({ src, label, onOpen }: { src: string; label: string; onOpen: () => void }) {
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  if (failed)
+    return (
+      <div className="grid min-h-52 place-items-center gap-2 rounded-2xl bg-muted p-6 text-sm text-muted-foreground">
+        <p>图片加载失败，历史记录已保留。</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setAttempt((value) => value + 1);
+            setFailed(false);
+          }}
         >
-          <img
-            src={src}
-            alt={alt}
-            className="block h-full w-full object-cover transition duration-200 group-hover:brightness-90 sm:h-auto sm:object-contain"
-            onLoad={onLoad}
-          />
-        </button>
-      ) : (
-        <div className={`animate-pulse rounded-xl bg-stone-100 min-h-[200px] sm:min-h-[280px] ${className}`} />
-      )}
-    </div>
+          重新加载图片
+        </Button>
+      </div>
+    );
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={label}
+      className="group block w-full overflow-hidden rounded-2xl bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <NextImage
+        key={attempt}
+        src={src}
+        alt={label}
+        unoptimized
+        width={1000}
+        height={1000}
+        onError={() => setFailed(true)}
+        className="max-h-[540px] w-full object-contain transition duration-200 group-hover:brightness-95"
+      />
+    </button>
   );
-});
+}
+
+function getTurnStatusLabel(status: ImageTurnStatus) {
+  return { queued: "排队中", generating: "处理中", success: "已完成", error: "部分或全部失败" }[
+    status
+  ];
+}
+const PROGRESS_LABELS: Record<string, string> = {
+  getting_account: "正在准备账号",
+  uploading: "正在上传参考图",
+  bootstrapping: "正在连接服务",
+  getting_token: "正在验证会话",
+  preparing_conversation: "正在准备创作",
+  starting_generation: "正在启动生成",
+  generating: "正在生成画面",
+  receiving_image: "正在接收图片",
+};
+function getProgressLabel(progress?: string) {
+  return progress ? PROGRESS_LABELS[progress] || "正在生成画面" : "正在生成画面";
+}

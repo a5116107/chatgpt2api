@@ -44,9 +44,33 @@ export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
 
+export function registerDraft(config: RegisterConfig) {
+  return {
+    mail: config.mail,
+    proxy: config.proxy,
+    proxy_session_ttl_seconds: config.proxy_session_ttl_seconds,
+    proxy_ttl_unit: config.proxy_ttl_unit,
+    proxy_region: config.proxy_region,
+    total: config.total,
+    threads: config.threads,
+    max_attempts: config.max_attempts,
+    mode: config.mode,
+    target_quota: config.target_quota,
+    target_available: config.target_available,
+    check_interval: config.check_interval,
+  };
+}
+
+export function registerHasChanges(draft: RegisterConfig | null, saved: RegisterConfig | null) {
+  return Boolean(
+    draft && saved && JSON.stringify(registerDraft(draft)) !== JSON.stringify(registerDraft(saved)),
+  );
+}
+
 const mailfreeDefaultDomainIndices = [482, 1383, 1443, 1503, 1563, 1623, 1720, 1726, 1732];
 
 const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
+  platform_url: "",
   enabled: false,
   egress_mode: "direct",
   proxy_url: "",
@@ -58,7 +82,8 @@ const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
     mode: "none",
     cf_cookies: "",
     cf_clearance: "",
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    user_agent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
     browser: "chrome",
     flaresolverr_url: "",
     timeout_sec: 60,
@@ -77,18 +102,21 @@ const DEFAULT_THIRD_PARTY_APPS: ThirdPartyAppsSettings = {
 };
 
 function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
-  const source = typeof value === "object" && value !== null ? value as Partial<ProxyRuntimeSettings> : {};
-  const clearanceSource = typeof source.clearance === "object" && source.clearance !== null
-    ? source.clearance as Partial<ProxyRuntimeSettings["clearance"]>
-    : {};
+  const source =
+    typeof value === "object" && value !== null ? (value as Partial<ProxyRuntimeSettings>) : {};
+  const clearanceSource =
+    typeof source.clearance === "object" && source.clearance !== null
+      ? (source.clearance as Partial<ProxyRuntimeSettings["clearance"]>)
+      : {};
   const egressMode = source.egress_mode === "single_proxy" ? "single_proxy" : "direct";
-  const clearanceMode: ProxyRuntimeClearanceMode = clearanceSource.mode === "manual" || clearanceSource.mode === "flaresolverr"
-    ? clearanceSource.mode
-    : "none";
+  const clearanceMode: ProxyRuntimeClearanceMode =
+    clearanceSource.mode === "manual" || clearanceSource.mode === "flaresolverr"
+      ? clearanceSource.mode
+      : "none";
   const statusCodes = Array.isArray(source.reset_session_status_codes)
     ? source.reset_session_status_codes
-      .map((item) => Number(item))
-      .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item >= 100 && item <= 599)
     : [];
   return {
     ...DEFAULT_PROXY_RUNTIME,
@@ -96,6 +124,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
     enabled: Boolean(source.enabled),
     egress_mode: egressMode as ProxyRuntimeEgressMode,
     proxy_url: String(source.proxy_url || ""),
+    platform_url: String(source.platform_url || ""),
     resource_proxy_url: String(source.resource_proxy_url || ""),
     skip_ssl_verify: Boolean(source.skip_ssl_verify),
     reset_session_status_codes: statusCodes.length > 0 ? statusCodes : [403],
@@ -119,10 +148,12 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 }
 
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
-  const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
-  const canvas: Partial<ThirdPartyAppsSettings["infinite_canvas"]> = typeof source.infinite_canvas === "object" && source.infinite_canvas
-    ? source.infinite_canvas as Partial<ThirdPartyAppsSettings["infinite_canvas"]>
-    : {};
+  const source =
+    typeof value === "object" && value !== null ? (value as Partial<ThirdPartyAppsSettings>) : {};
+  const canvas: Partial<ThirdPartyAppsSettings["infinite_canvas"]> =
+    typeof source.infinite_canvas === "object" && source.infinite_canvas
+      ? (source.infinite_canvas as Partial<ThirdPartyAppsSettings["infinite_canvas"]>)
+      : {};
   return {
     infinite_canvas: {
       enabled: Boolean(canvas.enabled),
@@ -132,48 +163,51 @@ function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
 }
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
-  const imageStorage = typeof config.image_storage === "object" && config.image_storage
-    ? config.image_storage as ImageStorageSettings
-    : {
-      enabled: false,
-      mode: "local",
-      webdav_url: "",
-      webdav_username: "",
-      webdav_password: "",
-      webdav_root_path: "chatgpt2api/images",
-      public_base_url: "",
-    };
-  const imageStorageMode: ImageStorageMode = imageStorage.enabled && imageStorage.mode === "both"
-    ? "both"
-    : imageStorage.enabled && imageStorage.mode === "webdav"
-      ? "webdav"
-      : "local";
-  const backup = typeof config.backup === "object" && config.backup
-    ? config.backup as BackupSettings
-    : {
-      enabled: false,
-      provider: "cloudflare_r2",
-      account_id: "",
-      access_key_id: "",
-      secret_access_key: "",
-      bucket: "",
-      prefix: "backups",
-      interval_minutes: 360,
-      rotation_keep: 10,
-      encrypt: false,
-      passphrase: "",
-      include: {
-        config: true,
-        register: true,
-        cpa: true,
-        sub2api: true,
-        logs: true,
-        image_tasks: true,
-        accounts_snapshot: true,
-        auth_keys_snapshot: true,
-        images: false,
-      },
-    };
+  const imageStorage =
+    typeof config.image_storage === "object" && config.image_storage
+      ? (config.image_storage as ImageStorageSettings)
+      : {
+          enabled: false,
+          mode: "local",
+          webdav_url: "",
+          webdav_username: "",
+          webdav_password: "",
+          webdav_root_path: "chatgpt2api/images",
+          public_base_url: "",
+        };
+  const imageStorageMode: ImageStorageMode =
+    imageStorage.enabled && imageStorage.mode === "both"
+      ? "both"
+      : imageStorage.enabled && imageStorage.mode === "webdav"
+        ? "webdav"
+        : "local";
+  const backup =
+    typeof config.backup === "object" && config.backup
+      ? (config.backup as BackupSettings)
+      : {
+          enabled: false,
+          provider: "cloudflare_r2",
+          account_id: "",
+          access_key_id: "",
+          secret_access_key: "",
+          bucket: "",
+          prefix: "backups",
+          interval_minutes: 360,
+          rotation_keep: 10,
+          encrypt: false,
+          passphrase: "",
+          include: {
+            config: true,
+            register: true,
+            cpa: true,
+            sub2api: true,
+            logs: true,
+            image_tasks: true,
+            accounts_snapshot: true,
+            auth_keys_snapshot: true,
+            images: false,
+          },
+        };
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
@@ -267,6 +301,7 @@ type SettingsStore = {
   isSyncingImageStorage: boolean;
 
   registerConfig: RegisterConfig | null;
+  savedRegisterConfig: RegisterConfig | null;
   isLoadingRegister: boolean;
   isSavingRegister: boolean;
 
@@ -314,12 +349,24 @@ type SettingsStore = {
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
-  setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
+  setAIReviewField: (
+    key: "enabled" | "base_url" | "api_key" | "model" | "prompt",
+    value: string | boolean,
+  ) => void;
   setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
-  setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
-  setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
+  setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(
+    key: K,
+    value: ProxyRuntimeSettings[K],
+  ) => void;
+  setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(
+    key: K,
+    value: ProxyRuntimeSettings["clearance"][K],
+  ) => void;
   setProxyRuntimeStatusCodesText: (value: string) => void;
-  setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
+  setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(
+    key: K,
+    value: ThirdPartyAppsSettings["infinite_canvas"][K],
+  ) => void;
   testImageStorage: () => Promise<void>;
   syncImagesToWebDAV: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
@@ -338,7 +385,10 @@ type SettingsStore = {
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
-  setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
+  setRegisterMailField: (
+    key: "request_timeout" | "wait_timeout" | "wait_interval",
+    value: string,
+  ) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: RegisterMailProvider) => void;
   deleteRegisterProvider: (index: number) => void;
@@ -382,6 +432,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isSyncingImageStorage: false,
 
   registerConfig: null,
+  savedRegisterConfig: null,
   isLoadingRegister: true,
   isSavingRegister: false,
 
@@ -411,10 +462,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     await Promise.allSettled([get().loadConfig(), get().loadPools()]);
     const backup = get().config?.backup;
     const isConfigured = Boolean(
-      String(backup?.account_id || "").trim()
-      && String(backup?.access_key_id || "").trim()
-      && String(backup?.secret_access_key || "").trim()
-      && String(backup?.bucket || "").trim(),
+      String(backup?.account_id || "").trim() &&
+      String(backup?.access_key_id || "").trim() &&
+      String(backup?.secret_access_key || "").trim() &&
+      String(backup?.bucket || "").trim(),
     );
     if (isConfigured) {
       await get().loadBackups();
@@ -448,7 +499,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const data = await updateSettingsConfig({
         ...config,
-        refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
+        refresh_account_interval_minute: Math.max(
+          1,
+          Number(config.refresh_account_interval_minute) || 1,
+        ),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
@@ -461,7 +515,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
-        sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
+        sensitive_words: (config.sensitive_words || [])
+          .map((item) => String(item).trim())
+          .filter(Boolean),
         ai_review: {
           enabled: Boolean(config.ai_review?.enabled),
           base_url: String(config.ai_review?.base_url || "").trim(),
@@ -471,11 +527,17 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
         image_storage: {
           enabled: Boolean(config.image_storage?.enabled),
-          mode: config.image_storage?.enabled && ["webdav", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
+          mode:
+            config.image_storage?.enabled &&
+            ["webdav", "both"].includes(String(config.image_storage?.mode))
+              ? config.image_storage.mode
+              : "local",
           webdav_url: String(config.image_storage?.webdav_url || "").trim(),
           webdav_username: String(config.image_storage?.webdav_username || "").trim(),
           webdav_password: String(config.image_storage?.webdav_password || "").trim(),
-          webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
+          webdav_root_path: String(
+            config.image_storage?.webdav_root_path || "chatgpt2api/images",
+          ).trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
         },
         proxy_runtime: {
@@ -491,17 +553,28 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
             ...normalizeProxyRuntime(config.proxy_runtime).clearance,
             cf_cookies: String(config.proxy_runtime?.clearance?.cf_cookies || "").trim(),
             cf_clearance: String(config.proxy_runtime?.clearance?.cf_clearance || "").trim(),
-            user_agent: String(config.proxy_runtime?.clearance?.user_agent || DEFAULT_PROXY_RUNTIME.clearance.user_agent).trim(),
+            user_agent: String(
+              config.proxy_runtime?.clearance?.user_agent ||
+                DEFAULT_PROXY_RUNTIME.clearance.user_agent,
+            ).trim(),
             browser: String(config.proxy_runtime?.clearance?.browser || "chrome").trim(),
-            flaresolverr_url: String(config.proxy_runtime?.clearance?.flaresolverr_url || "").trim(),
+            flaresolverr_url: String(
+              config.proxy_runtime?.clearance?.flaresolverr_url || "",
+            ).trim(),
             timeout_sec: Math.max(1, Number(config.proxy_runtime?.clearance?.timeout_sec) || 60),
-            refresh_interval: Math.max(60, Number(config.proxy_runtime?.clearance?.refresh_interval) || 3600),
+            refresh_interval: Math.max(
+              60,
+              Number(config.proxy_runtime?.clearance?.refresh_interval) || 3600,
+            ),
           },
         },
         third_party_apps: {
           infinite_canvas: {
             enabled: Boolean(config.third_party_apps?.infinite_canvas?.enabled),
-            url: String(config.third_party_apps?.infinite_canvas?.url || DEFAULT_THIRD_PARTY_APPS.infinite_canvas.url).trim(),
+            url: String(
+              config.third_party_apps?.infinite_canvas?.url ||
+                DEFAULT_THIRD_PARTY_APPS.infinite_canvas.url,
+            ).trim(),
           },
         },
         backup: {
@@ -545,40 +618,63 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setImageRetentionDays: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, image_retention_days: value } } : {},
+    );
   },
 
   setImagePollTimeoutSecs: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {},
+    );
   },
 
   setImageAccountConcurrency: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, image_account_concurrency: value } } : {},
+    );
   },
 
   setImageSettleEnabled: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_settle_enabled: value, image_check_before_hit_enabled: value } } : {});
+    set((state) =>
+      state.config
+        ? {
+            config: {
+              ...state.config,
+              image_settle_enabled: value,
+              image_check_before_hit_enabled: value,
+            },
+          }
+        : {},
+    );
   },
 
   setImageCheckBeforeHitEnabled: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_check_before_hit_enabled: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, image_check_before_hit_enabled: value } } : {},
+    );
   },
 
   setImageSettleSecs: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_settle_secs: value } } : {});
+    set((state) => (state.config ? { config: { ...state.config, image_settle_secs: value } } : {}));
   },
 
   setImageTimeoutRetrySecs: (value) => {
-    set((state) => state.config ? { config: { ...state.config, image_timeout_retry_secs: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, image_timeout_retry_secs: value } } : {},
+    );
   },
 
   setAutoRemoveInvalidAccounts: (value) => {
-    set((state) => state.config ? { config: { ...state.config, auto_remove_invalid_accounts: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, auto_remove_invalid_accounts: value } } : {},
+    );
   },
 
-
   setAutoReloginAfterRefresh: (value) => {
-    set((state) => state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {},
+    );
   },
 
   setLogLevel: (level, enabled) => {
@@ -620,15 +716,28 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setGlobalSystemPrompt: (value) => {
-    set((state) => state.config ? { config: { ...state.config, global_system_prompt: value } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, global_system_prompt: value } } : {},
+    );
   },
 
   setSensitiveWordsText: (value) => {
-    set((state) => state.config ? { config: { ...state.config, sensitive_words: value.split("\n") } } : {});
+    set((state) =>
+      state.config ? { config: { ...state.config, sensitive_words: value.split("\n") } } : {},
+    );
   },
 
   setAIReviewField: (key, value) => {
-    set((state) => state.config ? { config: { ...state.config, ai_review: { ...(state.config.ai_review || {}), [key]: value } } } : {});
+    set((state) =>
+      state.config
+        ? {
+            config: {
+              ...state.config,
+              ai_review: { ...(state.config.ai_review || {}), [key]: value },
+            },
+          }
+        : {},
+    );
   },
 
   setImageStorageField: (key, value) => {
@@ -767,7 +876,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await syncImageStorage();
-      toast.success(`同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`);
+      toast.success(
+        `同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`,
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "同步图片失败");
     } finally {
@@ -883,7 +994,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      get().setRegisterConfig(data.register);
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -892,75 +1003,141 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set((state) => ({
+      registerConfig: registerHasChanges(state.registerConfig, state.savedRegisterConfig)
+        ? { ...config, ...registerDraft(state.registerConfig!) }
+        : config,
+      savedRegisterConfig: config,
+      isLoadingRegister: false,
+    }));
   },
 
   setRegisterProxy: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {},
+    );
   },
 
   setRegisterProxySessionTtl: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_session_ttl_seconds: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? {
+            registerConfig: {
+              ...state.registerConfig,
+              proxy_session_ttl_seconds: Number(value) || 0,
+            },
+          }
+        : {},
+    );
   },
 
   setRegisterProxyTtlUnit: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_ttl_unit: value } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, proxy_ttl_unit: value } }
+        : {},
+    );
   },
 
   setRegisterProxyRegion: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_region: value.toUpperCase() } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, proxy_region: value.toUpperCase() } }
+        : {},
+    );
   },
 
   setRegisterTotal: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterThreads: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterMaxAttempts: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, max_attempts: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, max_attempts: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterMode: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {});
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {},
+    );
   },
 
   setRegisterTargetQuota: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_quota: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, target_quota: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterTargetAvailable: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_available: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, target_available: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterCheckInterval: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } } : {});
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } }
+        : {},
+    );
   },
 
   setRegisterMailField: (key, value) => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
-      },
-    } : {});
+    set((state) =>
+      state.registerConfig
+        ? {
+            registerConfig: {
+              ...state.registerConfig,
+              mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
+            },
+          }
+        : {},
+    );
   },
 
   addRegisterProvider: () => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: {
-          ...state.registerConfig.mail,
-          providers: [
-            ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "mailfree", api_base: "https://mailfree.cavanal.workers.dev", admin_password: "", domain_index: 4, domain_indices: mailfreeDefaultDomainIndices },
-          ],
-        },
-      },
-    } : {});
+    set((state) =>
+      state.registerConfig
+        ? {
+            registerConfig: {
+              ...state.registerConfig,
+              mail: {
+                ...state.registerConfig.mail,
+                providers: [
+                  ...(state.registerConfig.mail.providers || []),
+                  {
+                    enable: true,
+                    type: "mailfree",
+                    api_base: "https://mailfree.cavanal.workers.dev",
+                    admin_password: "",
+                    domain_index: 4,
+                    domain_indices: mailfreeDefaultDomainIndices,
+                  },
+                ],
+              },
+            },
+          }
+        : {},
+    );
   },
 
   updateRegisterProvider: (index, updates) => {
@@ -968,20 +1145,31 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!state.registerConfig) return {};
       const providers = [...(state.registerConfig.mail.providers || [])];
       providers[index] = { ...(providers[index] || {}), ...updates };
-      return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
+      return {
+        registerConfig: {
+          ...state.registerConfig,
+          mail: { ...state.registerConfig.mail, providers },
+        },
+      };
     });
   },
 
   deleteRegisterProvider: (index) => {
-    set((state) => state.registerConfig ? {
-      registerConfig: {
-        ...state.registerConfig,
-        mail: {
-          ...state.registerConfig.mail,
-          providers: (state.registerConfig.mail.providers || []).filter((_, itemIndex) => itemIndex !== index),
-        },
-      },
-    } : {});
+    set((state) =>
+      state.registerConfig
+        ? {
+            registerConfig: {
+              ...state.registerConfig,
+              mail: {
+                ...state.registerConfig.mail,
+                providers: (state.registerConfig.mail.providers || []).filter(
+                  (_, itemIndex) => itemIndex !== index,
+                ),
+              },
+            },
+          }
+        : {},
+    );
   },
 
   saveRegister: async () => {
@@ -992,7 +1180,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const data = await updateRegisterConfig({
         mail: registerConfig.mail,
         proxy: registerConfig.proxy.trim(),
-        proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+        proxy_session_ttl_seconds: Math.min(
+          3600,
+          Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900),
+        ),
         proxy_ttl_unit: registerConfig.proxy_ttl_unit === "minutes" ? "minutes" : "seconds",
         proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
         total: Math.max(1, Number(registerConfig.total) || 1),
@@ -1003,7 +1194,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
       });
-      set({ registerConfig: data.register });
+      set({ registerConfig: data.register, savedRegisterConfig: data.register });
       toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
@@ -1018,10 +1209,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       if (!registerConfig.enabled) {
-        await updateRegisterConfig({
+        const saved = await updateRegisterConfig({
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
-          proxy_session_ttl_seconds: Math.min(3600, Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900)),
+          proxy_session_ttl_seconds: Math.min(
+            3600,
+            Math.max(60, Number(registerConfig.proxy_session_ttl_seconds) || 900),
+          ),
           proxy_ttl_unit: registerConfig.proxy_ttl_unit === "minutes" ? "minutes" : "seconds",
           proxy_region: registerConfig.proxy_region.trim().toUpperCase(),
           total: Math.max(1, Number(registerConfig.total) || 1),
@@ -1032,10 +1226,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
           check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
         });
+        set({ registerConfig: saved.register, savedRegisterConfig: saved.register });
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
-      toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
+      set({ registerConfig: data.register, savedRegisterConfig: data.register });
+      if (!registerConfig.enabled && data.register.stats.start_blocked_reason) {
+        toast.error(data.register.stats.last_error || "准备条件未满足，请查看任务提示。");
+      } else if (data.register.enabled) {
+        toast.success("注册任务已启动");
+      } else {
+        toast.success(
+          registerConfig.enabled ? "已请求停止，请等待当前任务结束" : "任务已结束，请查看运行结果",
+        );
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
     } finally {
@@ -1047,7 +1250,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
+      get().setRegisterConfig(data.register);
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");
@@ -1060,8 +1263,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetOutlookPoolApi(scope);
-      set({ registerConfig: data.register });
-      toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
+      get().setRegisterConfig(data.register);
+      toast.success(
+        scope === "unused"
+          ? "已清空未使用邮箱"
+          : scope === "failed"
+            ? "已清除失败/占用的邮箱状态"
+            : "Outlook 邮箱池状态已全部重置",
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
     } finally {
