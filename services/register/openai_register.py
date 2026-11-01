@@ -12,7 +12,7 @@ from curl_cffi import requests
 from curl_cffi.const import CurlHttpVersion
 
 from services.account_service import account_service
-from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+from services.proxy_platform import report_proxy_denial
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider, openai_registration_policy, openai_signup_primitives
 from services.runtime_profile_service import runtime_profile_service
@@ -229,14 +229,22 @@ _authorize_continue_required = openai_signup_primitives.authorize_continue_requi
 _redact_url_secrets = openai_signup_primitives.redact_url_secrets
 
 
-def _normalize_registration_proxy(proxy: str) -> str:
+def _normalize_registration_proxy(
+    proxy: str,
+    *,
+    region_override: str | None = None,
+) -> str:
     try:
         lease_seconds = int(config.get("proxy_session_ttl_seconds") or 900)
     except (TypeError, ValueError, OverflowError):
         lease_seconds = 900
     return openai_registration_policy.normalize_registration_proxy(
         proxy,
-        region=str(config.get("proxy_region") or ""),
+        region=(
+            str(config.get("proxy_region") or "")
+            if region_override is None
+            else str(region_override)
+        ),
         lease_seconds=lease_seconds,
         ttl_unit=str(config.get("proxy_ttl_unit") or "seconds"),
     )
@@ -408,6 +416,15 @@ class PlatformRegistrar:
             source="register",
             save=True,
         )
+        proxy_policy = self.runtime_profile.get("proxy_policy")
+        if isinstance(proxy_policy, dict) and str(proxy_policy.get("register_proxy") or "").strip():
+            # Preserve the endpoint selected by the account group, including
+            # imported direct proxies and existing fixed gateway policies.
+            fixed_group = str(proxy_policy.get("mode") or "") in {"account_sticky_us", "account_sticky"}
+            self.proxy = _normalize_registration_proxy(
+                str(proxy_policy["register_proxy"]),
+                region_override="" if fixed_group else None,
+            )
         self.fp = _profile_fp(self.runtime_profile)
         proxy_account = {"runtime_profile_id": self.runtime_profile.get("id"), "profile_snapshot": self.runtime_profile, "fp": self.fp}
         self.egress_proxy = proxy_settings.get_profile(account=proxy_account, proxy=self.proxy, upstream=True).proxy_url or self.proxy
@@ -455,13 +472,11 @@ class PlatformRegistrar:
             owner=self,
             project_root=str(base_dir),
         )
-        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
 
     def close(self) -> None:
         self.session.close()
 
-    def _report_dynamic_proxy_denial(self, resp: Any, stage: str) -> None:
+    def _report_proxy_denial(self, resp: Any, stage: str) -> None:
         if resp is None:
             return
         status_code = int(getattr(resp, "status_code", 0) or 0)
@@ -472,8 +487,9 @@ class PlatformRegistrar:
         reason = code or f"{stage}_http_{status_code}"
         response_url = str(getattr(resp, "url", "") or "")
         response_host = urlsplit(response_url).hostname or "auth.openai.com"
-        report_dynamic_proxy_denial(
+        report_proxy_denial(
             self._active_proxy(),
+            scenario="browser",
             target=f"{response_host}:443",
             status_code=status_code,
             reason=reason,
@@ -550,8 +566,6 @@ class PlatformRegistrar:
 
     def _platform_authorize(self, email: str, index: int) -> bool:
         step(index, "开始 platform authorize")
-        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
         self.code_verifier, code_challenge = openai_signup_primitives.create_pkce()
         self.oauth_state = openai_signup_primitives.secure_url_token(32)
         params = {
@@ -620,7 +634,7 @@ class PlatformRegistrar:
                 stage="platform_authorize",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(resp, "platform_authorize_clearance_refresh_failed")
+                self._report_proxy_denial(resp, "platform_authorize_clearance_refresh_failed")
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             retry_headers = _headers_with_clearance(
                 self._navigate_headers(f"{platform_base}/"),
@@ -640,10 +654,10 @@ class PlatformRegistrar:
                 retry_attempts=4,
             )
             if _is_cloudflare_challenge(resp):
-                self._report_dynamic_proxy_denial(resp, "platform_authorize_clearance_retry")
+                self._report_proxy_denial(resp, "platform_authorize_clearance_retry")
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code != 200:
-            self._report_dynamic_proxy_denial(resp, "platform_authorize")
+            self._report_proxy_denial(resp, "platform_authorize")
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             debug = _response_debug_detail(resp)
@@ -698,7 +712,7 @@ class PlatformRegistrar:
                 stage="authorize_continue",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(
+                self._report_proxy_denial(
                     resp,
                     "authorize_continue_clearance_refresh_failed",
                 )
@@ -710,7 +724,7 @@ class PlatformRegistrar:
                 )
             resp, error = send_request()
         if resp is None or resp.status_code != 200:
-            self._report_dynamic_proxy_denial(resp, "authorize_continue")
+            self._report_proxy_denial(resp, "authorize_continue")
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(
@@ -789,7 +803,7 @@ class PlatformRegistrar:
                 stage="oauth_continue",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(
+                self._report_proxy_denial(
                     resp,
                     "oauth_continue_clearance_refresh_failed",
                 )
@@ -818,7 +832,7 @@ class PlatformRegistrar:
                 retry_attempts=4,
             )
         if resp is None or not 200 <= int(resp.status_code) < 400:
-            self._report_dynamic_proxy_denial(resp, "oauth_continue")
+            self._report_proxy_denial(resp, "oauth_continue")
             raise RuntimeError(
                 error
                 or f"oauth_continue_http_{getattr(resp, 'status_code', 'unknown')}"
@@ -862,17 +876,17 @@ class PlatformRegistrar:
                 stage="user_register",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(resp, "user_register_clearance_refresh_failed")
+                self._report_proxy_denial(resp, "user_register_clearance_refresh_failed")
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/create-account/password")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fp)
             headers = _headers_with_clearance(headers, url, self._active_proxy(), self.clearance_user_agent, self.runtime_profile)
             resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False, timeout=register_request_timeout, retry_attempts=4)
             if _is_cloudflare_challenge(resp):
-                self._report_dynamic_proxy_denial(resp, "user_register_clearance_retry")
+                self._report_proxy_denial(resp, "user_register_clearance_retry")
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code != 200:
-            self._report_dynamic_proxy_denial(resp, "user_register")
+            self._report_proxy_denial(resp, "user_register")
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
                 step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
@@ -897,15 +911,15 @@ class PlatformRegistrar:
                 stage="send_otp",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(resp, "send_otp_clearance_refresh_failed")
+                self._report_proxy_denial(resp, "send_otp_clearance_refresh_failed")
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self._active_proxy(), self.clearance_user_agent, self.runtime_profile)
             resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False, timeout=register_request_timeout, retry_attempts=4)
             if _is_cloudflare_challenge(resp):
-                self._report_dynamic_proxy_denial(resp, "send_otp_clearance_retry")
+                self._report_proxy_denial(resp, "send_otp_clearance_retry")
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code not in (200, 302):
-            self._report_dynamic_proxy_denial(resp, "send_otp")
+            self._report_proxy_denial(resp, "send_otp")
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         state = openai_signup_primitives.extract_continue_state(_response_json(resp))
         step(index, f"发送验证码完成 page={state['page_type'] or 'unknown'}")
@@ -915,7 +929,7 @@ class PlatformRegistrar:
         step(index, f"开始校验验证码（长度={len(str(code))}）")
         resp, error = validate_otp(self.session, self.device_id, code, self.fp)
         if resp is None or resp.status_code != 200:
-            self._report_dynamic_proxy_denial(resp, "validate_otp")
+            self._report_proxy_denial(resp, "validate_otp")
             body = ""
             try:
                 body = (resp.text or "")[:500] if resp is not None else ""
@@ -945,17 +959,17 @@ class PlatformRegistrar:
                 stage="create_account",
             )
             if bundle is None:
-                self._report_dynamic_proxy_denial(resp, "create_account_clearance_refresh_failed")
+                self._report_proxy_denial(resp, "create_account_clearance_refresh_failed")
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/about-you")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account", self.fp)
             headers = _headers_with_clearance(headers, url, self._active_proxy(), self.clearance_user_agent, self.runtime_profile)
             resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False, timeout=register_request_timeout, retry_attempts=4)
             if _is_cloudflare_challenge(resp):
-                self._report_dynamic_proxy_denial(resp, "create_account_clearance_retry")
+                self._report_proxy_denial(resp, "create_account_clearance_retry")
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code not in (200, 302):
-            self._report_dynamic_proxy_denial(resp, "create_account")
+            self._report_proxy_denial(resp, "create_account")
             data = _response_json(resp) if resp is not None else {}
             err = data.get("error") if isinstance(data.get("error"), dict) else {}
             error_code = str(err.get("code") or "").strip()
@@ -1121,11 +1135,12 @@ def worker(index: int) -> dict:
         config.get("max_attempts")
     )
     for attempt in range(1, max_attempts + 1):
-        registrar = PlatformRegistrar(
-            config["proxy"],
-            excluded_mail_domains=set(excluded_mail_domains),
-        )
+        registrar = None
         try:
+            registrar = PlatformRegistrar(
+                config["proxy"],
+                excluded_mail_domains=set(excluded_mail_domains),
+            )
             step(index, "任务启动" if attempt == 1 else f"任务重试启动（第 {attempt}/{max_attempts} 次）", "yellow" if attempt > 1 else "")
             result = registrar.register(index)
             cost = time.time() - start
@@ -1209,6 +1224,11 @@ def worker(index: int) -> dict:
             return {"ok": True, "index": index, "result": result}
         except Exception as e:
             last_error = e
+            if registrar is None:
+                with stats_lock:
+                    stats["done"] += 1
+                    stats["fail"] += 1
+                return {"ok": False, "index": index, "fatal": True, "error_code": "initialization_failed", "error": str(e)}
             try:
                 profile = getattr(registrar, "runtime_profile", None)
                 if isinstance(profile, dict):
@@ -1269,7 +1289,8 @@ def worker(index: int) -> dict:
             log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
             return {"ok": False, "index": index, "error": str(e)}
         finally:
-            registrar.close()
+            if registrar is not None:
+                registrar.close()
     cost = time.time() - start
     with stats_lock:
         stats["done"] += 1

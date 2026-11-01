@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, _public_proxy_url, _restore_proxy_url
 from services.register import (
     mail_provider,
     openai_register,
@@ -27,6 +30,24 @@ except Exception:  # pragma: no cover
 
 REGISTER_FILE = DATA_DIR / "register.json"
 OUTLOOK_POOL_PREVIEW_LIMIT = 20
+MAX_CONSECUTIVE_FAILURES = 5
+MAX_JOB_ATTEMPTS = 100
+
+
+def _error_detail(error: object) -> str:
+    """Bound diagnostics and keep credentials out of persisted job state."""
+    text = str(error)
+    def redact_url(match):
+        try:
+            parsed = urlsplit(match.group(0))
+            return urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, "", ""))
+        except ValueError:
+            return "[redacted-url]"
+    text = re.sub(r"(?:https?|socks5h?)://[^\s\"'<>]+", redact_url, text)
+    text = re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer [redacted]", text)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted-email]", text)
+    text = re.sub(r"(?i)((?:token|password|secret|api_key)\s*[=:]\s*)[^\s,;]+", r"\1[redacted]", text)
+    return text[:1000]
 OPENAI_REGISTER_CONFIG_FIELDS = (
     "mail",
     "proxy",
@@ -103,6 +124,8 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._last_pool_check = None
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
@@ -128,6 +151,10 @@ class RegisterService:
     def get(self) -> dict:
         with self._lock:
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+        snapshot["stats"].update(self._pool_metrics())
+        snapshot["proxy"] = _public_proxy_url(snapshot.get("proxy"))
+        if isinstance(snapshot.get("mail"), dict):
+            snapshot["mail"]["proxy"] = _public_proxy_url(snapshot["mail"].get("proxy"))
         self._redact_outlook_pools(snapshot)
         return snapshot
 
@@ -209,6 +236,12 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            updates = deepcopy(updates)
+            if "proxy" in updates:
+                updates["proxy"] = _restore_proxy_url(updates["proxy"], self._config.get("proxy"))
+            if isinstance(updates.get("mail"), dict) and "proxy" in updates["mail"]:
+                previous_mail = self._config.get("mail") or {}
+                updates["mail"]["proxy"] = _restore_proxy_url(updates["mail"]["proxy"], previous_mail.get("proxy"))
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
@@ -221,14 +254,34 @@ class RegisterService:
     def start(self) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
-                self._config["enabled"] = True
-                self._save()
                 return self.get()
+            try:
+                capacity = openai_register.runtime_profile_service.registration_preflight()
+                metrics = self._pool_metrics()
+                mode = str(self._config.get("mode") or "total")
+                required = (
+                    max(0, int(self._config["target_available"]) - metrics["current_available"])
+                    if mode == "available"
+                    else int(self._config["total"] if mode == "total" else self._config["threads"])
+                )
+                if capacity.get("enabled") and capacity.get("strict") and int(capacity.get("remaining") or 0) < required:
+                    remaining = int(capacity.get("remaining") or 0)
+                    self._config["stats"]["proxy_capacity"] = {**capacity, "required": required, "shortfall": required - remaining}
+                    raise RuntimeError(f"还可绑定 {remaining} 个账号，本次目标需要新增 {required} 个，还差 {required - remaining} 个名额。请调整目标或账号绑定容量；减少同时执行数不会增加账号名额。")
+            except Exception as exc:
+                self._config["enabled"] = False
+                self._config["stats"].update(start_blocked_reason="preflight_failed", last_error=_error_detail(exc), updated_at=_now())
+                self._save()
+                self._append_log("启动检查失败，任务未启动：" + _error_detail(exc), "red")
+                return self.get()
+            self._stop_event.clear()
+            self._last_pool_check = None
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
+            self._config["stats"]["proxy_capacity"] = capacity
             if self._finish_target_reached(self._config, 0):
                 return self.get()
             openai_register.config.update(
@@ -238,13 +291,15 @@ class RegisterService:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
-            self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            self._runner.start()
             return self.get()
 
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
+            self._stop_event.set()
+            self._config["stats"]["finish_reason"] = "stopped_by_user"
             self._config["stats"]["updated_at"] = _now()
             self._save()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
@@ -252,6 +307,8 @@ class RegisterService:
 
     def reset(self) -> dict:
         with self._lock:
+            if self._config["enabled"] or (self._runner and self._runner.is_alive()):
+                raise ValueError("任务仍在运行，请等待停止后重置统计")
             self._logs = []
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
@@ -295,31 +352,50 @@ class RegisterService:
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
         metrics = self._pool_metrics()
-        self._bump(**metrics)
+        if mode == "total":
+            return submitted >= int(cfg.get("total") or 1)
+        fingerprint = (mode, *metrics.values(), cfg.get("target_quota"), cfg.get("target_available"))
+        changed = fingerprint != self._last_pool_check
+        if changed:
+            self._last_pool_check = fingerprint
+            self._bump(**metrics)
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            if changed:
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            if changed:
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
     def _finish_target_reached(self, cfg: dict, submitted: int) -> bool:
-        """Stop a register job once its configured target has been satisfied."""
+        """Close completed work without treating exhausted attempts as success."""
         if not self._target_reached(cfg, submitted):
             return False
-        finished_at = _now()
         with self._lock:
-            self._config["enabled"] = False
             stats = self._config.setdefault("stats", {})
+            if int(stats.get("running") or 0) > 0:
+                return False
+            total_mode = str(cfg.get("mode") or "total") == "total"
+            if total_mode and int(stats.get("done") or 0) < submitted:
+                return False
+            success = int(stats.get("success") or 0)
+            fail = int(stats.get("fail") or 0)
+            target_met = not total_mode or success >= int(cfg.get("total") or 1)
+            finished_at = _now()
+            self._config["enabled"] = False
             stats["running"] = 0
             stats["finished_at"] = finished_at
             stats["updated_at"] = finished_at
-            stats["finish_reason"] = "target_reached"
+            stats["finish_reason"] = "target_reached" if target_met else "attempts_exhausted"
             self._save()
-        self._append_log("注册目标已达成，任务已自动收口", "green")
+        if target_met:
+            self._append_log("注册目标已达成，任务已自动收口", "green")
+        else:
+            self._append_log(f"注册尝试次数已用尽，成功{success}，失败{fail}；未达到成功目标，任务已停止", "yellow")
         return True
 
     def _bump(self, **updates) -> None:
@@ -341,37 +417,79 @@ class RegisterService:
             self._save()
 
     def _run(self) -> None:
-        threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = set()
-            while True:
-                cfg = self.get()
-                if not futures and self._finish_target_reached(cfg, submitted):
-                    break
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
-                    submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
-                    break
-                if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
-                    continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
-                for future in finished:
-                    done += 1
-                    try:
-                        result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
-                    except Exception:
-                        fail += 1
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+        consecutive_failures = 0
+        retry_at = 0.0
+        try:
+            threads = int(self.get()["threads"])
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = set()
+                while True:
+                    cfg = self.get()
+                    if cfg["enabled"] and not futures and self._finish_target_reached(cfg, submitted):
+                        break
+                    if cfg["enabled"] and retry_at and not futures:
+                        delay = max(0.0, retry_at - time.monotonic())
+                        if delay:
+                            self._stop_event.wait(delay)
+                        retry_at = 0.0
+                    while self.get()["enabled"] and not retry_at and len(futures) < threads and not self._target_reached(cfg, submitted):
+                        if str(cfg.get("mode")) != "total" and submitted >= MAX_JOB_ATTEMPTS:
+                            self._halt("attempt_budget_exhausted", "任务已达到安全尝试上限，已停止")
+                            break
+                        submitted += 1
+                        futures.add(executor.submit(openai_register.worker, submitted))
+                    self._bump(running=len(futures), done=done, success=success, fail=fail)
+                    if not futures:
+                        if not self.get()["enabled"]:
+                            break
+                        continue
+                    finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        done += 1
+                        try:
+                            result = future.result()
+                            if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+                                raise ValueError("worker returned an invalid result")
+                        except Exception as exc:
+                            result = {"ok": False, "fatal": True, "error_code": "worker_exception", "error": _error_detail(exc)}
+                        if result["ok"]:
+                            success += 1
+                            consecutive_failures = 0
+                        else:
+                            fail += 1
+                            consecutive_failures += 1
+                            detail = _error_detail(result.get("error") or "unknown worker failure")
+                            self._bump(last_error=detail, consecutive_failures=consecutive_failures)
+                            self._append_log("任务失败：" + detail, "red")
+                            if result.get("fatal"):
+                                self._halt(str(result.get("error_code") or "worker_exception"), detail)
+                            elif consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                                self._halt("consecutive_failures", f"连续失败 {consecutive_failures} 次，已熔断停止：{detail}")
+                            elif self.get()["enabled"]:
+                                delay = min(30.0, 2.0 ** (consecutive_failures - 1))
+                                retry_at = time.monotonic() + delay
+                                self._append_log(f"失败退避 {delay:.0f} 秒，期间不补投任务", "yellow")
+                    self._bump(running=len(futures), done=done, success=success, fail=fail, consecutive_failures=consecutive_failures)
+        except Exception as exc:
+            self._halt("scheduler_error", _error_detail(exc))
+        finally:
+            self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now(), **self._pool_metrics())
+            with self._lock:
+                self._config["enabled"] = False
+                self._save()
+            self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+
+    def _halt(self, reason: str, detail: str) -> None:
         with self._lock:
             self._config["enabled"] = False
+            self._stop_event.set()
+            stats = self._config["stats"]
+            if stats.get("finish_reason") != "stopped_by_user":
+                stats["finish_reason"] = reason
+                stats["last_error"] = _error_detail(detail)
             self._save()
-        self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+            self._append_log("任务已停止：" + _error_detail(detail), "red")
 
 
     def route_stats(self) -> dict:

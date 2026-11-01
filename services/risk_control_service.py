@@ -6,10 +6,11 @@ import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from services.account_service import account_service
 from services.config import DATA_DIR, config
@@ -22,6 +23,9 @@ RISK_EVENTS_FILE = RISK_DIR / "risk_events.json"
 PROXIES_FILE = RISK_DIR / "proxy_nodes.json"
 TASKS_FILE = RISK_DIR / "task_center.json"
 SCHEMA_VERSION = 1
+MAX_PROXY_BATCH_SIZE = 2000
+MAX_PROXY_IMPORT_CHARS = 2_000_000
+PROXY_TEST_WORKERS = 10
 
 TERMINAL_TASK_STATES = {"success", "succeeded", "failed", "error", "cancelled", "stale", "idle"}
 TASK_STATUS_ALIASES = {
@@ -71,6 +75,7 @@ def _atomic_save(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex}")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
     os.replace(tmp, path)
 
 
@@ -219,6 +224,7 @@ def normalize_task_error(error: object = "", status_code: int | None = None) -> 
 
 class RiskControlService:
     def __init__(self) -> None:
+        self._proxy_test_lock = threading.Lock()
         self._lock = threading.RLock()
         self._capability_cache: dict[str, dict[str, Any]] | None = None
         self._capability_cache_mtime_ns: int | None = None
@@ -259,8 +265,10 @@ class RiskControlService:
             return cache
 
     def sync_account_capabilities(self) -> dict[str, Any]:
+        # Account selection reads capabilities while holding the account lock.
+        # Never acquire that lock while holding the capability store lock.
+        accounts = account_service.list_accounts()
         with self._lock:
-            accounts = account_service.list_accounts()
             existing = {str(item.get("account_key")): item for item in self._load_items(CAPABILITIES_FILE) if item.get("account_key")}
             items: list[dict[str, Any]] = []
             created = updated = removed = 0
@@ -299,8 +307,9 @@ class RiskControlService:
         return None
 
     def update_capability(self, key: str, updates: dict[str, Any]) -> dict[str, Any]:
+        self.sync_account_capabilities()
         with self._lock:
-            items = self.list_capabilities()
+            items = self._load_items(CAPABILITIES_FILE)
             for item in items:
                 if item.get("account_key") == key:
                     allowed = {"chat", "responses", "raw_conversation", "search", "image", "image_edit", "image_variation", "file", "audio_tts", "audio_stt", "audio_translation", "video", "plan", "source"}
@@ -500,12 +509,62 @@ class RiskControlService:
 
     def _redact_proxy(self, proxy: str) -> str:
         value = str(proxy or "")
-        parsed = urlparse(value)
-        if parsed.username or parsed.password:
+        if not value:
+            return ""
+        try:
+            parsed = urlparse(value)
             host = parsed.hostname or ""
+            if not host:
+                return "[invalid proxy]"
+            if ":" in host:
+                host = f"[{host}]"
             port = f":{parsed.port}" if parsed.port else ""
-            return f"{parsed.scheme}://***:***@{host}{port}"
-        return value
+            credentials = "***:***@" if parsed.username is not None or parsed.password is not None else ""
+            return f"{parsed.scheme}://{credentials}{host}{port}"
+        except ValueError:
+            return "[invalid proxy]"
+
+    def _public_proxy(self, item: dict[str, Any]) -> dict[str, Any]:
+        result = dict(item)
+        result["proxy"] = self._redact_proxy(str(item.get("proxy") or ""))
+        result["testable"] = self._proxy_testable(str(item.get("proxy") or ""))
+        result["assignment_ready"] = self._route_ready(item) and not bool(item.get("protected"))
+        if not int(item.get("success") or 0) and not int(item.get("fail") or 0):
+            result.update(status="unknown", score=None)
+        observed = max(str(item.get("last_success_at") or ""), str(item.get("last_failure_at") or ""))
+        result["observed_at"] = observed or None
+        result["observation_scope"] = "project_target"
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(observed)).total_seconds()
+            if age > 600 or age < -60:
+                result["status"] = "stale"
+        except (TypeError, ValueError):
+            result.update(status="unknown", score=None)
+        return result
+
+    @staticmethod
+    def _proxy_testable(proxy: str) -> bool:
+        try:
+            parsed = urlparse(proxy)
+            _ = parsed.port
+            return bool(parsed.hostname) and parsed.scheme in {"http", "https", "socks5", "socks5h", "socks"} and not (
+                unquote(parsed.username or "") in {"***", "[REDACTED]"} or unquote(parsed.password or "") in {"***", "[REDACTED]"}
+            )
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _update_proxy_score(item: dict[str, Any]) -> None:
+        total = int(item.get("success") or 0) + int(item.get("fail") or 0)
+        if not total:
+            item.update(status="unknown", score=None)
+            return
+        score = round(100 * int(item.get("success") or 0) / total, 1)
+        score -= min(50, int(item.get("http_403") or 0) * 10)
+        score -= min(40, int(item.get("http_429") or 0) * 8)
+        score -= min(30, int(item.get("timeout") or 0) * 4)
+        item["score"] = max(0, score)
+        item["status"] = "healthy" if item["score"] >= 70 else "cooldown" if item["score"] >= 30 else "dead"
 
     def _ensure_runtime_proxies_locked(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         existing_ids = {str(item.get("id") or "") for item in items}
@@ -517,8 +576,8 @@ class RiskControlService:
             items.append({
                 "id": pid,
                 "proxy": proxy_url,
-                "status": "healthy",
-                "score": 100,
+                "status": "unknown",
+                "score": None,
                 "success": 0,
                 "fail": 0,
                 "http_403": 0,
@@ -542,12 +601,13 @@ class RiskControlService:
             items = self._ensure_runtime_proxies_locked(items)
             if len(items) != before:
                 self._save_items(PROXIES_FILE, items)
-            return items
+            return [self._public_proxy(item) for item in items]
 
     def upsert_proxy(self, proxy: str, **updates: Any) -> dict[str, Any]:
         proxy = str(proxy or "").strip()
-        if not proxy:
-            raise ValueError("proxy is required")
+        proxy = normalize_proxy_url(proxy)
+        if not self._proxy_testable(proxy):
+            raise ValueError("a valid proxy URL with original credentials is required")
         with self._lock:
             items = self._load_items(PROXIES_FILE)
             pid = self.proxy_id(proxy)
@@ -557,14 +617,14 @@ class RiskControlService:
                     item.update(updates)
                     item.setdefault("first_seen_at", now)
                     item["updated_at"] = now
-                    item["proxy"] = self._redact_proxy(proxy)
+                    item["proxy"] = proxy
                     self._save_items(PROXIES_FILE, items)
-                    return item
+                    return self._public_proxy(item)
             item = {
                 "id": pid,
-                "proxy": self._redact_proxy(proxy),
-                "status": "healthy",
-                "score": 100,
+                "proxy": proxy,
+                "status": "unknown",
+                "score": None,
                 "success": 0,
                 "fail": 0,
                 "http_403": 0,
@@ -579,16 +639,96 @@ class RiskControlService:
             }
             items.append(item)
             self._save_items(PROXIES_FILE, items)
-            return item
+            return self._public_proxy(item)
 
-    def report_proxy_event(self, proxy: str, code: str, status_code: int | None = None) -> dict[str, Any] | None:
-        if not proxy:
-            return None
-        if normalize_proxy_url(proxy) in _runtime_aggregate_proxy_urls():
-            return None
-        item = self.upsert_proxy(proxy)
+    def import_proxies(self, text: str, *, provider: str = "imported") -> dict[str, Any]:
+        lines = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1) if line.strip()]
+        if not lines or len(lines) > MAX_PROXY_BATCH_SIZE or len(text) > MAX_PROXY_IMPORT_CHARS:
+            raise ValueError(f"每次请输入 1–{MAX_PROXY_BATCH_SIZE} 条代理地址")
+        valid, invalid = [], []
+        for number, line in lines:
+            try:
+                value = normalize_proxy_url(line)
+                parsed = urlparse(value)
+                if not self._proxy_testable(value) or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or not parsed.port or any(c.isspace() for c in value):
+                    raise ValueError
+                valid.append((number, value.rstrip("/")))
+            except (ValueError, TypeError):
+                invalid.append({"line": number, "reason": "地址格式错误，请检查协议、主机和端口"})
+        imported = duplicates = 0
+        ids = []
+        with self._lock:
+            items = self._load_items(PROXIES_FILE)
+            known = {str(item.get("id")) for item in items}
+            for _, value in valid:
+                identity = self.proxy_id(value)
+                ids.append(identity)
+                if identity in known:
+                    duplicates += 1
+                    continue
+                now = _now()
+                items.append({"id": identity, "proxy": value, "provider": provider[:80], "status": "unknown", "score": None,
+                              "success": 0, "fail": 0, "http_403": 0, "http_429": 0, "timeout": 0,
+                              "first_seen_at": now, "updated_at": now, "assignment_enabled": False})
+                known.add(identity)
+                imported += 1
+            if imported:
+                self._save_items(PROXIES_FILE, items)
+        return {"imported": imported, "duplicates": duplicates, "invalid": invalid, "ids": list(dict.fromkeys(ids))}
+
+    @staticmethod
+    def _route_ready(item: dict[str, Any]) -> bool:
+        probe = item.get("probe") or {}
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(probe.get("observed_at")))).total_seconds()
+        except (ValueError, TypeError):
+            return False
+        return bool(probe.get("network_ok") and probe.get("target_ok") and -60 <= age <= 1800)
+
+    def assigned_proxy_groups(self) -> list[dict[str, Any]]:
+        # The inventory owns credentials. Account profiles retain their original
+        # binding; only new allocations consult this current eligibility view.
+        return [{"id": str(item["id"]), "proxy_url": str(item["proxy"]), "template": "chrome_win_145", "capacity": 1,
+                 "preferred_node_id": "", "country": str((item.get("probe") or {}).get("country") or "")}
+                for item in self._load_items(PROXIES_FILE)
+                if item.get("assignment_enabled") and self._route_ready(item) and self._proxy_testable(str(item.get("proxy") or ""))]
+
+    def proxy_connection_state(self, proxy: str) -> dict[str, Any]:
+        identity = self.proxy_id(normalize_proxy_url(proxy))
+        item = next((item for item in self._load_items(PROXIES_FILE) if item.get("id") == identity), {})
+        return dict(item.get("probe") or {})
+
+    def invalidate_proxy_connection(self, proxy: str, reason: str) -> None:
+        identity = self.proxy_id(normalize_proxy_url(proxy))
+        with self._lock:
+            items = self._load_items(PROXIES_FILE)
+            item = next((item for item in items if item.get("id") == identity), None)
+            if item is None:
+                return
+            item["probe"] = {**(item.get("probe") or {}), "network_ok": False,
+                             "network_error": "connection_failed", "transport_reason": reason,
+                             "observed_at": _now()}
+            self._save_items(PROXIES_FILE, items)
+
+    def activate_proxies(self, ids: list[str], *, enabled: bool = True) -> dict[str, Any]:
+        requested = set(ids)
+        if not requested or len(requested) > MAX_PROXY_BATCH_SIZE:
+            raise ValueError(f"请选择 1–{MAX_PROXY_BATCH_SIZE} 条代理")
+        with self._lock:
+            items = self._load_items(PROXIES_FILE)
+            selected = [item for item in items if str(item.get("id")) in requested]
+            if len(selected) != len(requested):
+                raise ValueError("部分代理记录已不存在，请刷新列表")
+            if enabled and any(not self._route_ready(item) or item.get("protected") for item in selected):
+                raise ValueError("请先测试并筛选连接与目标访问均通过的代理（检查结果有效 30 分钟）")
+            for item in selected:
+                item.update(assignment_enabled=enabled, updated_at=_now())
+            self._save_items(PROXIES_FILE, items)
+        return {"updated": len(selected), "enabled": enabled, "capacity_per_proxy": 1}
+
+    def _apply_proxy_event(self, item: dict[str, Any], code: str, status_code: int | None) -> None:
         now = _now()
-        if code in {"success", "ok"}:
+        if code in {"success", "ok"} and (status_code is None or 200 <= status_code < 300):
             item["success"] = int(item.get("success") or 0) + 1
             item["last_success_at"] = now
         else:
@@ -600,27 +740,35 @@ class RiskControlService:
                 item["http_429"] = int(item.get("http_429") or 0) + 1
             if "timeout" in code:
                 item["timeout"] = int(item.get("timeout") or 0) + 1
-        total = int(item.get("success") or 0) + int(item.get("fail") or 0)
-        score = 100 if total == 0 else round(100 * int(item.get("success") or 0) / total, 1)
-        score -= min(50, int(item.get("http_403") or 0) * 10)
-        score -= min(40, int(item.get("http_429") or 0) * 8)
-        score -= min(30, int(item.get("timeout") or 0) * 4)
-        item["score"] = max(0, score)
-        item["status"] = "healthy" if item["score"] >= 70 else "cooldown" if item["score"] >= 30 else "dead"
-        self.upsert_proxy(proxy, **{k: v for k, v in item.items() if k not in {"id", "proxy"}})
-        return item
+        item["updated_at"] = now
+        self._update_proxy_score(item)
+
+    def report_proxy_event(self, proxy: str, code: str, status_code: int | None = None, *, proxy_id: str = "") -> dict[str, Any] | None:
+        if not proxy and not proxy_id:
+            return None
+        with self._lock:
+            if not proxy_id:
+                proxy_id = self.upsert_proxy(proxy)["id"]
+            items = self._load_items(PROXIES_FILE)
+            item = next((candidate for candidate in items if candidate.get("id") == proxy_id), None)
+            if item is None:
+                raise KeyError("proxy not found")
+            self._apply_proxy_event(item, code, status_code)
+            self._save_items(PROXIES_FILE, items)
+            return self._public_proxy(item)
 
     def delete_proxies(self, ids: list[str] | None = None, statuses: list[str] | None = None) -> dict[str, Any]:
         idset = {str(item or "").strip() for item in (ids or []) if str(item or "").strip()}
         status_set = {str(item or "").strip().lower() for item in (statuses or []) if str(item or "").strip()}
         with self._lock:
+            bound = {str((profile.get("proxy_policy") or {}).get("group") or "") for profile in runtime_profile_service.list_profiles() if profile.get("status") in {"", "active", None}}
             items = self._ensure_runtime_proxies_locked(self._load_items(PROXIES_FILE))
             runtime_proxies = _runtime_aggregate_proxy_urls()
             kept: list[dict[str, Any]] = []
             removed = 0
             for item in items:
                 proxy_url = normalize_proxy_url(str(item.get("proxy") or ""))
-                if proxy_url in runtime_proxies:
+                if proxy_url in runtime_proxies or item.get("assignment_enabled") or str(item.get("id")) in bound:
                     kept.append(item)
                     continue
                 match = False
@@ -639,13 +787,14 @@ class RiskControlService:
 
     def prune_proxies(self, *, min_score: float = 30.0, min_failures: int = 3, include_cooldown: bool = False) -> dict[str, Any]:
         with self._lock:
+            bound = {str((profile.get("proxy_policy") or {}).get("group") or "") for profile in runtime_profile_service.list_profiles() if profile.get("status") in {"", "active", None}}
             items = self._ensure_runtime_proxies_locked(self._load_items(PROXIES_FILE))
             runtime_proxies = _runtime_aggregate_proxy_urls()
             kept: list[dict[str, Any]] = []
             removed_items: list[dict[str, Any]] = []
             for item in items:
                 proxy_url = normalize_proxy_url(str(item.get("proxy") or ""))
-                if proxy_url in runtime_proxies:
+                if proxy_url in runtime_proxies or item.get("assignment_enabled") or str(item.get("id")) in bound:
                     kept.append(item)
                     continue
                 status = str(item.get("status") or "").lower()
@@ -666,48 +815,104 @@ class RiskControlService:
                 "removed_ids": [str(item.get("id") or "") for item in removed_items],
             }
 
-    def test_proxy_pool(self, *, limit: int = 50, include_dead: bool = False) -> dict[str, Any]:
-        from services.proxy_service import test_proxy
+    def test_proxy_pool(self, *, limit: int = 50, include_dead: bool = False, ids: list[str] | None = None) -> dict[str, Any]:
+        if not self._proxy_test_lock.acquire(blocking=False):
+            raise ValueError("已有代理测试正在执行，请等待当前测试结束")
+        try:
+            from services.proxy_service import test_proxy
+            from services.proxy_service import probe_proxy_route
 
-        candidates = self.list_proxies()
-        if not include_dead:
-            candidates = [item for item in candidates if item.get("status") != "dead"]
-        candidates = sorted(candidates, key=lambda item: (str(item.get("status") or ""), -float(item.get("score") or 0)))[: max(1, min(limit, 200))]
-        tested = ok = failed = 0
-        results: list[dict[str, Any]] = []
-        for item in candidates:
-            proxy = str(item.get("proxy") or "")
-            result = test_proxy(proxy, timeout=12.0)
-            tested += 1
-            status_code = int(result.get("status") or 0)
-            if result.get("ok"):
-                ok += 1
-                self.report_proxy_event(proxy, "success", status_code=status_code or None)
-            else:
-                failed += 1
-                code = "network_timeout" if "timeout" in str(result.get("error") or "").lower() else "proxy_or_challenge_blocked"
-                self.report_proxy_event(proxy, code, status_code=status_code or None)
-            results.append({"id": item.get("id"), "proxy": item.get("proxy"), "result": result})
-        return {"tested": tested, "ok": ok, "failed": failed, "items": results}
+            with self._lock:
+                candidates = self._ensure_runtime_proxies_locked(self._load_items(PROXIES_FILE))
+                self._save_items(PROXIES_FILE, candidates)
+            if not include_dead:
+                candidates = [item for item in candidates if item.get("status") != "dead"]
+            if ids is not None:
+                selected_ids = set(ids)
+                candidates = [item for item in candidates if str(item.get("id")) in selected_ids]
+            candidates = sorted(candidates, key=lambda item: (str(item.get("status") or ""), -float(item.get("score") or 0)))[: max(1, min(limit, 200))]
+            tested = ok = failed = skipped = 0
+            results: list[dict[str, Any]] = []
+            def check(item):
+                if not self._proxy_testable(str(item.get("proxy") or "")):
+                    return None
+                return probe_proxy_route(str(item["proxy"]), timeout=8.0) if ids is not None else test_proxy(str(item["proxy"]), timeout=12.0)
+            with ThreadPoolExecutor(max_workers=PROXY_TEST_WORKERS) as executor:
+                observations = list(executor.map(check, candidates))
+            with self._lock:
+                current = self._load_items(PROXIES_FILE)
+                by_id = {entry["id"]: entry for entry in current}
+                for item, result in zip(candidates, observations):
+                    proxy = str(item.get("proxy") or "")
+                    if result is None:
+                        skipped += 1
+                        results.append({"id": item.get("id"), "proxy": self._redact_proxy(proxy), "result": {"ok": False, "skipped": True, "error": "saved_proxy_credentials_unavailable"}})
+                        continue
+                    stored = by_id.get(item["id"])
+                    if ids is not None:
+                        if stored is not None and stored.get("proxy") == proxy:
+                            stored.update(probe=result, country=result.get("country") or stored.get("country", ""), updated_at=_now())
+                        result = {**result, "ok": bool(result.get("network_ok") and result.get("target_ok")), "status": result.get("target_status", 0)}
+                    tested += 1
+                    status_code = int(result.get("status") or 0)
+                    if result.get("ok"):
+                        ok += 1
+                        code = "success"
+                    else:
+                        failed += 1
+                        code = "network_timeout" if "timeout" in str(result.get("error") or "").lower() else "connection_failed"
+                    if stored is not None and stored.get("proxy") == proxy:
+                        self._apply_proxy_event(stored, code, status_code or None)
+                    safe_result = dict(result)
+                    if safe_result.get("error"):
+                        safe_result["error"] = str(safe_result["error"]).replace(proxy, self._redact_proxy(proxy))
+                    results.append({"id": item.get("id"), "proxy": self._redact_proxy(proxy), "result": safe_result})
+                self._save_items(PROXIES_FILE, current)
+            return {"tested": tested, "ok": ok, "failed": failed, "skipped": skipped, "items": results}
+        finally:
+            self._proxy_test_lock.release()
+
+    def recheck_enabled_proxies(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        due = []
+        for item in self._load_items(PROXIES_FILE):
+            if not item.get("assignment_enabled") or item.get("protected"):
+                continue
+            try:
+                at = datetime.fromisoformat(str((item.get("probe") or {}).get("observed_at")))
+                age = (now - at).total_seconds()
+            except (TypeError, ValueError):
+                age = float("inf")
+            if age >= 600:
+                due.append((age, str(item["id"])))
+        enabled_count = sum(bool(item.get("assignment_enabled")) for item in self._load_items(PROXIES_FILE))
+        batch_size = min(200, max(10, (enabled_count + 9) // 10))
+        ids = [identity for _, identity in sorted(due, reverse=True)[:batch_size]]
+        return self.test_proxy_pool(ids=ids, limit=batch_size, include_dead=True) if ids else {"tested": 0}
+
+    def start_proxy_monitor(self, stop_event: threading.Event) -> threading.Thread:
+        def monitor():
+            delay = 60.0
+            while not stop_event.wait(delay):
+                started = time.monotonic()
+                try:
+                    self.recheck_enabled_proxies()
+                    account_service.reconcile_proxy_bindings()
+                except Exception as failure:
+                    print("[proxy-monitor] check_failed=" + type(failure).__name__)
+                delay = max(1.0, 60.0 - (time.monotonic() - started))
+        thread = threading.Thread(target=monitor, name="proxy-pool-monitor", daemon=True)
+        thread.start()
+        return thread
 
     def rebuild_proxy_scores(self) -> dict[str, Any]:
-        """Rebuild proxy score file from persisted risk events using current policy."""
+        """Recalculate derived scores without deleting inventory or observations."""
         with self._lock:
-            self._save_items(PROXIES_FILE, [])
-            count = 0
-            for event in self._load_items(RISK_EVENTS_FILE):
-                proxy = str(event.get("proxy") or "")
-                code = str(event.get("code") or "")
-                status_code = event.get("status_code")
-                try:
-                    status_int = int(status_code or 0)
-                except Exception:
-                    status_int = 0
-                if not proxy or (code not in PROXY_SCORING_EVENT_CODES and status_int not in {403, 429}):
-                    continue
-                self.report_proxy_event(proxy, code, status_code=status_int or None)
-                count += 1
-            return {"rebuilt": count, "total": len(self.list_proxies())}
+            items = self._ensure_runtime_proxies_locked(self._load_items(PROXIES_FILE))
+            for item in items:
+                self._update_proxy_score(item)
+            self._save_items(PROXIES_FILE, items)
+            return {"rebuilt": len(items), "total": len(items)}
 
     def sync_task_center(self) -> dict[str, Any]:
         # PATCH_MARKER conversation_status_repair_r28
@@ -1003,10 +1208,11 @@ def record_runtime_risk(
     except Exception:
         pass
     try:
-        from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+        from services.proxy_platform import report_proxy_denial
 
-        report_dynamic_proxy_denial(
+        report_proxy_denial(
             proxy,
+            scenario=scope if scope in {"api", "sse", "image", "video", "browser", "download"} else "api",
             target="chatgpt.com:443",
             status_code=int(status_code or 0),
             reason=code or "runtime_upstream_denial",

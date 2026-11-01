@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 from services import image_account_pool
 from services.config import config
-from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+from services.proxy_platform import report_proxy_denial
 from services import log_service as log_service_module
 from services.storage.base import StorageBackend
 from services.runtime_profile_service import runtime_profile_service
@@ -68,7 +68,8 @@ class AccountService:
         self._lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
-        self._text_index = 0
+        self._text_last_assigned: dict[str, int] = {}
+        self._image_last_assigned: dict[str, int] = {}
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._image_inflight_meta: dict[str, list[float]] = {}
@@ -755,7 +756,7 @@ class AccountService:
         return due_at if due_at <= now else None
 
     def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
-        from curl_cffi import requests
+        from services.proxy_service import AccountProxySession
 
         normalized_account, _profile = runtime_profile_service.ensure_account_profile(dict(account or {}))
         oauth_token_url = str(
@@ -764,7 +765,7 @@ class AccountService:
         oauth_client_id = str(
             normalized_account.get("oauth_client_id") or self._OAUTH_CLIENT_ID
         ).strip()
-        session = requests.Session(**self._profile_session_kwargs(normalized_account))
+        session = AccountProxySession(account=normalized_account, **self._profile_session_kwargs(normalized_account))
         try:
             response = session.post(
                 oauth_token_url,
@@ -837,6 +838,9 @@ class AccountService:
             if rotated:
                 self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
+                for assignments in (self._text_last_assigned, self._image_last_assigned):
+                    if old_token in assignments:
+                        assignments[new_token] = assignments.pop(old_token)
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
@@ -996,7 +1000,8 @@ class AccountService:
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
         try:
-            result = self._login_with_password(email, password)
+            account = self.get_account(access_token)
+            result = self._login_with_password(email, password, account=account)
             if result.get("ok"):
                 # 登录成功，更新账号
                 new_access_token = result.get("access_token", "")
@@ -1183,9 +1188,15 @@ class AccountService:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
         self._sync_risk_control_capabilities()
 
-    def _login_with_password(self, email: str, password: str) -> dict:
+    def _login_with_password(
+        self,
+        email: str,
+        password: str,
+        *,
+        account: dict | None = None,
+    ) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
-        from curl_cffi import requests
+        from services.proxy_service import AccountProxySession
 
         # 常量
         auth_base = "https://auth.openai.com"
@@ -1193,14 +1204,17 @@ class AccountService:
         platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
         platform_oauth_client_id = self._OAUTH_CLIENT_ID
         platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
-        user_agent = self._OAUTH_USER_AGENT
+        fp = self._profile_fp(account)
+        user_agent = fp.get("user-agent", self._OAUTH_USER_AGENT)
+        sec_ch_ua = fp.get("sec-ch-ua", '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"')
+        sec_ch_ua_mobile = fp.get("sec-ch-ua-mobile", "?0")
+        sec_ch_ua_platform = fp.get("sec-ch-ua-platform", '"Windows"')
 
         # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
-        session = requests.Session(**session_kwargs)
+        session_kwargs = self._profile_session_kwargs(account)
+        session_kwargs["verify"] = False
+        proxy = str(session_kwargs.get("proxy") or "")
+        session = AccountProxySession(account=account, **session_kwargs)
 
         try:
             device_id = str(uuid.uuid4())
@@ -1239,9 +1253,9 @@ class AccountService:
                     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "user-agent": user_agent,
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua": sec_ch_ua,
+                    "sec-ch-ua-mobile": sec_ch_ua_mobile,
+                    "sec-ch-ua-platform": sec_ch_ua_platform,
                     "sec-fetch-dest": "document",
                     "sec-fetch-mode": "navigate",
                     "sec-fetch-site": "cross-site",
@@ -1281,9 +1295,9 @@ class AccountService:
                 "origin": auth_base,
                 "priority": "u=1, i",
                 "user-agent": user_agent,
-                "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                "sec-ch-ua": sec_ch_ua,
+                "sec-ch-ua-mobile": sec_ch_ua_mobile,
+                "sec-ch-ua-platform": sec_ch_ua_platform,
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
@@ -1318,8 +1332,9 @@ class AccountService:
                 error_code = login_data.get("error", {}).get("code", "")
                 error_msg = login_data.get("error", {}).get("message", "")
                 if login_resp.status_code == 403 or error_code == "unsupported_country_region_territory":
-                    report_dynamic_proxy_denial(
+                    report_proxy_denial(
                         proxy,
+                        scenario="browser",
                         target="auth.openai.com:443",
                         status_code=login_resp.status_code,
                         reason=error_code or f"password_verify_http_{login_resp.status_code}",
@@ -1442,9 +1457,9 @@ class AccountService:
                     "pragma": "no-cache",
                     "priority": "u=1, i",
                     "referer": f"{platform_base}/",
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua": sec_ch_ua,
+                    "sec-ch-ua-mobile": sec_ch_ua_mobile,
+                    "sec-ch-ua-platform": sec_ch_ua_platform,
                     "sec-fetch-dest": "empty",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-site": "same-site",
@@ -1724,13 +1739,14 @@ class AccountService:
                 probe_rank = 2
             # sort ascending: smaller is better
             return (
-                *pool_score,
+                pool_score[0],
                 status_rank,
                 token_dead,
                 refresh_err,
                 image_inflight,
-                probe_rank,
                 min(consecutive_failures, 3),
+                probe_rank,
+                self._image_last_assigned.get(tok, 0),
                 1.0 - probe_success_ema,
                 1.0 - image_success_ema,
                 probe_latency,
@@ -1794,6 +1810,7 @@ class AccountService:
                     # and latency. Concurrency filtering naturally falls through to the next
                     # account when the best candidate has no free slot.
                     access_token = tokens[0]
+                    self._image_last_assigned[access_token] = time.monotonic_ns()
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     self._image_inflight_meta.setdefault(access_token, []).append(time.time())
                     return access_token
@@ -1904,37 +1921,60 @@ class AccountService:
         # PATCH_MARKER sticky_userinfo_clear_r26
         refresh_error_penalty = 0 if (not sticky or self._is_soft_sticky_refresh_error(sticky)) else 1
         invalid_count = int(account.get("invalid_count") or 0)
-        fail_count = int(account.get("fail") or 0)
-        success_bonus = -int(account.get("success") or 0)
+        token = str(account.get("access_token") or "")
         created = AccountService._parse_time(account.get("created_at"))
         created_ts = created.timestamp() if created else 0.0
-        # 越小越好；新号优先（-created_ts）
-        return (status_penalty, refresh_error_penalty, invalid_count, fail_count, success_bonus, -created_ts)
+        # Image success/failure counters must not bias text traffic. Health first,
+        # then least recently assigned; changing candidate membership stays fair.
+        return (status_penalty, refresh_error_penalty, invalid_count, self._text_last_assigned.get(token, 0), -created_ts)
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def _text_candidates_locked(self, excluded_tokens: set[str]) -> list[dict]:
+        candidates = []
+        for account in self._accounts.values():
+            status = str(account.get("status") or "").strip()
+            token = str(account.get("access_token") or "").strip()
+            if not token or token in excluded_tokens or status != "正常":
+                continue
+            if self._access_token_hard_dead(account):
+                continue
+            if self._auth_recovery_active(account):
+                continue
+            if not self._capability_allows(account, "chat"):
+                continue
+            candidates.append(account)
+        return candidates
+
+    def has_available_text_accounts(self) -> bool:
+        """Check the same native health rules without refreshing tokens or calling upstream."""
+        with self._lock:
+            return bool(self._text_candidates_locked(set()))
+
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None, model: str = "auto") -> str:
         """Pick a non-terminal token for chat/text requests."""
         excluded = set(excluded_tokens or set())
+        requested_model = str(model or "auto").strip() or "auto"
         with self._lock:
-            candidates = []
-            for account in self._accounts.values():
-                status = str(account.get("status") or "").strip()
-                token = str(account.get("access_token") or "").strip()
-                if not token or token in excluded:
-                    continue
-                # Chat strictly uses healthy accounts. Soft 异常 free keep image only.
-                if status != "正常":
-                    continue
-                if self._access_token_hard_dead(account):
-                    continue
-                if not self._capability_allows(account, "chat"):
-                    continue
-                candidates.append(account)
+            if not self._text_candidates_locked(excluded):
+                return ""
+        route = None
+        if requested_model != "auto":
+            from services.model_service import model_catalog_service
+
+            route = model_catalog_service.route_for_model(requested_model)
+        with self._lock:
+            candidates = self._text_candidates_locked(excluded)
+            if route is not None:
+                candidates = [account for account in candidates if self._normalize_account_type(account.get("type")) in route.account_types]
             if not candidates:
+                if route is not None and not route.allow_anonymous:
+                    from services.model_service import ModelUnavailableError
+
+                    raise ModelUnavailableError(f"model {requested_model!r} is not available to any healthy account")
                 return ""
             candidates.sort(key=self._text_candidate_score)
-            account = candidates[self._text_index % len(candidates)]
-            self._text_index += 1
+            account = candidates[0]
             access_token = str(account.get("access_token") or "").strip()
+            self._text_last_assigned[access_token] = time.monotonic_ns()
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
     def mark_text_used(self, access_token: str) -> None:
@@ -2138,16 +2178,56 @@ class AccountService:
         image_inflight 为内存态并发计数(账号正在生成、尚未结束的图片数)。号池空闲时
         若某账号该值持续 > 0，说明其并发槽位泄漏、已被静默排除出调度，可借此在 UI 上诊断。
         """
+        from services.account_health import health_view
+
         with self._lock:
             result = []
             now_epoch = time.time()
+            text_candidates = {item.get("access_token") for item in self._text_candidates_locked(set())}
+            image_candidates = set(self._list_ready_candidate_tokens())
             for item in self._accounts.values():
                 account = normalize_image_pool_fields(item, now_epoch=now_epoch)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 account["image_probe_inflight"] = token in self._image_probe_inflight
+                account["health_check"] = health_view(account, now=now_epoch)
+                account["text_schedulable"] = token in text_candidates
+                account["image_schedulable"] = (
+                    token in image_candidates
+                    and account["image_inflight"] < max(1, int(config.image_account_concurrency or 1))
+                    and not account["image_probe_inflight"]
+                )
                 result.append(account)
             return result
+
+    def health_snapshot(self, token: str) -> dict | None:
+        """Skip media/probe activity; capture without refreshing or resolving aliases."""
+        import copy
+
+        with self._lock:
+            if self._image_inflight.get(token, 0) or token in self._image_probe_inflight:
+                return None
+            account = self._accounts.get(token)
+            return copy.deepcopy(account) if account else None
+
+    def save_health_check(self, token: str, context: str, result: dict) -> bool:
+        from services.account_health import health_context
+
+        with self._lock:
+            account = self._accounts.get(token)
+            if not account or health_context(account) != context:
+                return False
+            previous = account.get("health_check")
+            account["health_check"] = {**result, "context_hash": context}
+            try:
+                self._save_accounts()
+            except Exception:
+                if previous is None:
+                    account.pop("health_check", None)
+                else:
+                    account["health_check"] = previous
+                raise
+            return True
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -2272,16 +2352,14 @@ class AccountService:
             for token in target_set:
                 self._image_inflight.pop(token, None)
                 self._image_inflight_meta.pop(token, None)
+                self._image_last_assigned.pop(token, None)
+                self._text_last_assigned.pop(token, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
                 if old not in target_set and new not in target_set
             }
             if removed:
-                if self._accounts:
-                    self._text_index %= len(self._accounts)
-                else:
-                    self._text_index = 0
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
@@ -2322,6 +2400,72 @@ class AccountService:
         if sync_capabilities:
             self._sync_risk_control_capabilities()
         return updated_account
+
+    def handle_proxy_failure(self, access_token: str, failed_proxy: str, reason: str) -> dict | None:
+        if reason not in {"connection_failed", "proxy_auth_required", "network_timeout", "monitor_connection_failed"} or not failed_proxy:
+            return None
+        from services.risk_control_service import risk_control_service
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(token)
+            if not current:
+                return None
+            if current.get("proxy") != failed_proxy:
+                return dict(current) if current.get("proxy") else None
+            state = risk_control_service.proxy_connection_state(failed_proxy)
+            if reason != "monitor_connection_failed":
+                risk_control_service.invalidate_proxy_connection(failed_proxy, reason)
+            previous = runtime_profile_service.get(str(current.get("runtime_profile_id") or ""))
+            replacement = runtime_profile_service.failover_proxy(current, failed_proxy, reason, country=str(state.get("country") or ""))
+            if not replacement:
+                return None
+            self._accounts[token] = replacement
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts[token] = current
+                if previous:
+                    runtime_profile_service.restore_proxy_profile(previous)
+                raise
+        log_service.add(LOG_TYPE_ACCOUNT, "代理故障后自动切换", {
+            "profile_id": replacement.get("runtime_profile_id"), "reason": reason,
+            "group": replacement["proxy_policy"].get("group"),
+            "count": replacement["proxy_policy"].get("failover_count"),
+        })
+        return dict(replacement)
+
+    def reconcile_proxy_bindings(self) -> dict[str, int]:
+        from services.risk_control_service import risk_control_service
+        accounts = self.list_accounts()
+        switched = 0
+        for account in accounts:
+            proxy = str(account.get("proxy") or "")
+            state = risk_control_service.proxy_connection_state(proxy) if proxy else {}
+            observed = self._parse_time(state.get("observed_at"))
+            fresh = observed is not None and 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 1800
+            if fresh and state.get("network_ok") is False and state.get("network_error") == "connection_failed" and state.get("target_error") == "connection_failed" and not state.get("target_status"):
+                switched += bool(self.handle_proxy_failure(str(account.get("access_token") or ""), proxy, "monitor_connection_failed"))
+        return {"checked": len(accounts), "switched": switched}
+
+    def set_proxy_failover(self, profile_id: str, enabled: bool) -> dict | None:
+        with self._lock:
+            previous = runtime_profile_service.get(profile_id)
+            profile = runtime_profile_service.set_proxy_failover(profile_id, enabled)
+            if profile is None:
+                return None
+            previous_accounts = dict(self._accounts)
+            for token, account in self._accounts.items():
+                if account.get("runtime_profile_id") == profile_id:
+                    self._accounts[token] = {**account, "proxy_policy": dict(profile["proxy_policy"]),
+                                             "profile_snapshot": {**account.get("profile_snapshot", {}), "proxy_policy": dict(profile["proxy_policy"])}}
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts = previous_accounts
+                if previous:
+                    runtime_profile_service.restore_proxy_profile(previous)
+                raise
+        return runtime_profile_service.public_profile(profile)
 
     def get_runtime_profile(self, profile_id: str) -> dict | None:
         profile = runtime_profile_service.get(profile_id)

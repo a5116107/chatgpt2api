@@ -64,6 +64,41 @@ class AccountTokenLifecycleTests(unittest.TestCase):
     def service(self, *accounts: dict) -> AccountService:
         return AccountService(MemoryStorage(list(accounts)))
 
+    def test_image_assignments_share_equivalent_accounts_without_sticky_ranking(self) -> None:
+        service = self.service(account("first"), account("second"), account("third"))
+        assigned = []
+        for _ in range(6):
+            token = service._acquire_next_candidate_token()
+            assigned.append(token)
+            service.release_image_slot(token)
+        self.assertEqual(set(assigned[:3]), {"first", "second", "third"})
+        self.assertEqual(assigned[:3], assigned[3:])
+
+    def test_text_selection_excludes_auth_recovery_even_with_normal_status(self) -> None:
+        service = self.service(account("cooling"))
+        service._accounts["cooling"].update({
+            "auth_state": "cooldown",
+            "auth_recovery_at": "2099-01-01T00:00:00+00:00",
+        })
+        with mock.patch.object(service, "refresh_access_token") as refresh:
+            self.assertFalse(service.has_available_text_accounts())
+            self.assertEqual(service.get_text_access_token(), "")
+        refresh.assert_not_called()
+
+    def test_text_selection_keeps_health_priority_before_fairness(self) -> None:
+        service = self.service(account("healthy"), account("refresh-error"))
+        service._accounts["refresh-error"]["last_token_refresh_error"] = "oauth_refresh_http_401"
+        with mock.patch.object(service, "refresh_access_token", side_effect=lambda token, **kw: token):
+            self.assertEqual([service.get_text_access_token() for _ in range(4)], ["healthy"] * 4)
+
+    def test_text_assignments_are_fair_when_candidate_membership_changes(self) -> None:
+        service = self.service(account("first"), account("second"), account("third"))
+        with mock.patch.object(service, "refresh_access_token", side_effect=lambda token, **kw: token):
+            first = service.get_text_access_token()
+            second = service.get_text_access_token(excluded_tokens={first})
+            third = service.get_text_access_token()
+        self.assertEqual(len({first, second, third}), 3)
+
     def test_chat_only_revocation_is_recoverable_but_image_revocation_is_terminal(self) -> None:
         self.assertFalse(
             AccountService._access_token_hard_dead(
@@ -251,7 +286,7 @@ class AccountTokenLifecycleTests(unittest.TestCase):
         session = mock.Mock()
         session.post.return_value = response
 
-        with mock.patch("curl_cffi.requests.Session", return_value=session):
+        with mock.patch("services.proxy_service.AccountProxySession", return_value=session):
             result = service._request_access_token_refresh(
                 "refresh-token",
                 service.get_account("access-token"),

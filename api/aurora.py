@@ -31,7 +31,7 @@ def _chatgpt_sse(body: dict[str, Any]) -> Iterator[str]:
     conversation_id = str(body.get("conversation_id") or "")
     message_id = f"msg_{int(time.time() * 1000)}"
     full_text = ""
-    backend = OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+    backend = OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model))
     try:
         for delta in stream_text_deltas(backend, request):
             if not delta:

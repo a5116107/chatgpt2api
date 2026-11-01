@@ -16,6 +16,11 @@ class RuntimeProfileAccountRequest(BaseModel):
     profile_id: str = ""
 
 
+class ProxyFailoverRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=200)
+    enabled: bool
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -66,6 +71,14 @@ def create_router() -> APIRouter:
     async def cleanup_runtime_profiles(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return account_service.cleanup_orphan_runtime_profiles()
+
+    @router.post("/api/runtime-profiles/proxy-policy")
+    def set_proxy_policy(body: ProxyFailoverRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        profile = account_service.set_proxy_failover(body.profile_id, body.enabled)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="profile not found")
+        return {"profile": profile}
 
     @router.get("/api/runtime-profiles/{profile_id}")
     async def get_runtime_profile(profile_id: str, authorization: str | None = Header(default=None)):

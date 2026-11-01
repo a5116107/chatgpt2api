@@ -46,6 +46,7 @@ class ImageGenerationError(Exception):
         param: str | None = None,
         account_email: str = "",
         conversation_id: str = "",
+        account_hash: str = "",
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -54,6 +55,7 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.account_hash = account_hash
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -109,17 +111,6 @@ def is_chat_requirements_transient_error(message: str) -> bool:
     )
 
 
-def is_empty_conversation_access_error(message: str) -> bool:
-    """Detect the proxy/upstream empty-body 403 seen before image output."""
-    text = str(message or "").lower()
-    return bool(
-        re.search(
-            r"backend-api/f/conversation failed:\s*status=403,\s*body=\s*$",
-            text,
-        )
-    )
-
-
 def is_tls_connection_error(message: str) -> bool:
     """检测 TLS/SSL/代理隧道类瞬时错误，这类错误通常可以通过重试解决。"""
     text = str(message or "").lower()
@@ -168,6 +159,9 @@ def _exception_status_code(exc: BaseException) -> int | None:
         code = int(getattr(exc, "status_code", 0) or 0)
     except Exception:
         code = 0
+    if not code:
+        match = re.search(r"(?:\bstatus(?:_code)?\s*[=:]\s*|\bHTTP\s+|\bresponse\s+)([45]\d{2})", str(exc), re.IGNORECASE)
+        code = int(match.group(1)) if match else 0
     return code or None
 
 
@@ -500,8 +494,7 @@ def sanitize_output_text(text: str) -> str:
                 return value
         return ""
 
-    def replace_annotation(match: re.Match[str]) -> str:
-        payload = match.group(1)
+    def annotation_text(payload: str) -> str:
         parts = [part.strip() for part in payload.split("\ue202")]
         kind = (parts[0] if parts else "").lower()
         data = parts[1:]
@@ -515,13 +508,48 @@ def sanitize_output_text(text: str) -> str:
             return readable_annotation_part(data)
         return readable_annotation_part(data)
 
+    def replace_annotation(match: re.Match[str]) -> str:
+        return annotation_text(match.group(1))
+
+    def replace_annotation_before_punctuation(match: re.Match[str]) -> str:
+        leading_space = match.group(1)
+        replacement = annotation_text(match.group(2))
+        return f"{leading_space}{replacement}" if replacement else ""
+
     # ChatGPT web sometimes returns rich annotation markers using private-use
     # characters. API clients cannot render those. Preserve readable labels
     # from entity/link annotations, while removing internal citation pointers.
+    text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     return text
+
+
+def is_visible_assistant_message(message: dict[str, Any]) -> bool:
+    """Return whether an upstream assistant message is intended for the user."""
+    author = message.get("author")
+    if not isinstance(author, dict):
+        return False
+    role = str(author.get("role") or "").strip().lower()
+    if role != "assistant":
+        return False
+
+    metadata = message.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("is_visually_hidden_from_conversation") is True:
+        return False
+
+    # Tool commands are emitted as assistant messages addressed to recipients
+    # such as "web". Only messages addressed to everyone are user-visible.
+    recipient = str(message.get("recipient") or "").strip().lower()
+    if recipient and recipient != "all":
+        return False
+
+    # Reasoning and other internal channels must not leak into API text output.
+    channel = str(message.get("channel") or "").strip().lower()
+    if channel and channel != "final":
+        return False
+
+    return True
 
 
 def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -529,10 +557,7 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if not isinstance(message, dict):
-            continue
-        role = str((message.get("author") or {}).get("role") or "").strip().lower()
-        if role != "assistant":
+        if not isinstance(message, dict) or not is_visible_assistant_message(message):
             continue
         text = assistant_message_text(message)
         if text:
@@ -549,7 +574,7 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
+        if isinstance(message, dict) and is_visible_assistant_message(message):
             return strip_history(assistant_message_text(message), history_text)
     return ""
 
@@ -767,20 +792,24 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
-def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+def text_backend(model: str = "auto") -> OpenAIBackendAPI:
+    token = account_service.get_text_access_token(model=model)
+    if not token:
+        raise RuntimeError("no available text account")
+    return OpenAIBackendAPI(access_token=token)
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "") or ""
-    if backend is not None:
+    provided_backend = backend if token else None
+    if backend is not None and not token:
         try:
             backend.close()
         except Exception:
             pass
     if not token:
-        token = account_service.get_text_access_token(attempted_tokens) or ""
+        token = account_service.get_text_access_token(excluded_tokens=attempted_tokens, model=request.model) or ""
     emitted = False
     chat_runtime = config.get_chat_runtime_settings()
     max_rotates = int(chat_runtime["max_account_rotates"])
@@ -791,14 +820,17 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise RuntimeError("no available text account")
         if token in attempted_tokens:
             # 已尝试过该 token，换下一个
-            token = account_service.get_text_access_token(attempted_tokens) or ""
+            token = account_service.get_text_access_token(excluded_tokens=attempted_tokens, model=request.model) or ""
             if not token:
                 raise RuntimeError("no available text account")
             continue
         attempted_tokens.add(token)
         active_backend = None
         try:
-            active_backend = OpenAIBackendAPI(access_token=token)
+            active_backend = provided_backend
+            provided_backend = None
+            if active_backend is None:
+                active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
                 if event.get("type") != "conversation.delta":
                     continue
@@ -812,10 +844,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         except Exception as exc:
             error_message = str(exc)
             # 未产出内容前，token 失效/代理 requirements 抖动都允许换号
-            can_rotate = (not emitted) and (
+            can_rotate = (not emitted) and _exception_status_code(exc) not in {403, 429} and (
                 is_token_invalid_error(error_message)
                 or is_chat_requirements_transient_error(error_message)
-                or is_empty_conversation_access_error(error_message)
                 or is_tls_connection_error(error_message)
                 # PATCH_MARKER chat_timeout_rotate_r34
                 or (rotate_on_timeout and is_connection_timeout_error(error_message))
@@ -857,7 +888,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                             })
                     if not next_token:
                         account_service.remove_invalid_token(token, "text_stream:token_revoked")
-                        next_token = account_service.get_text_access_token(attempted_tokens) or ""
+                        next_token = account_service.get_text_access_token(excluded_tokens=attempted_tokens, model=request.model) or ""
                         logger.warning({
                             "event": "text_stream_token_invalid_fast_rotate",
                             "attempt": rotate_count,
@@ -867,7 +898,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         })
                 else:
                     # requirements/tls 瞬时：排除当前号换下一个
-                    next_token = account_service.get_text_access_token(attempted_tokens) or ""
+                    next_token = account_service.get_text_access_token(excluded_tokens=attempted_tokens, model=request.model) or ""
                     logger.warning({
                         "event": "text_stream_transient_rotate",
                         "attempt": rotate_count,
@@ -1014,7 +1045,7 @@ def stream_image_outputs(
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    should_poll_for_image = bool(request.images or file_ids or sediment_ids) or last.get("turn_use_case") == "image gen"
     if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1360,21 +1391,27 @@ def stream_image_outputs(
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return
 
-        # 重试后仍然失败，yield 错误消息
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total,
-                          text="Image generation completed upstream but the result could not be retrieved. "
-                               "The image may still be processing. Please try again in a moment.",
-                          conversation_id=conversation_id)
+        # Retrieval failures are transport errors, not moderation messages.
+        raise ImageGenerationError(
+            "Image generation completed upstream but the result could not be retrieved.",
+            status_code=502,
+            error_type="server_error",
+            code="image_result_unavailable",
+            conversation_id=conversation_id,
+        )
     elif message:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
     else:
         # conversation_id 也为空时（SSE 流极短、未捕获到会话 ID），
         # 仍然 yield 一条消息，避免 stream_image_outputs_with_pool 产生
         # "upstream completed without generating images" 模糊报错
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total,
-                          text="Image generation started upstream but the response was incomplete. "
-                               "Please try again.",
-                          conversation_id=conversation_id)
+        raise ImageGenerationError(
+            "Image generation response was incomplete; no usable image result was received.",
+            status_code=502,
+            error_type="server_error",
+            code="upstream_incomplete_response",
+            conversation_id=conversation_id,
+        )
 
 
 def _codex_response_images(value: Any) -> list[str]:
@@ -1448,9 +1485,8 @@ def _generate_single_image(
     poll_timeout_retry_count = 0
     requirements_rotate_count = 0
     MAX_REQUIREMENTS_ROTATES = 4
-    conversation_access_retry_count = 0
-    MAX_CONVERSATION_ACCESS_RETRIES = 2
     account_email = ""
+    account_hash = ""
     excluded_image_tokens: set[str] = set()
     # loop-safe defaults so except never sees stale/unbound state
     emitted_for_token = False
@@ -1508,7 +1544,7 @@ def _generate_single_image(
             if not token:
                 raise RuntimeError(str(last_acquire_err or "no available image quota"))
         except RuntimeError as exc:
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email, account_hash=account_hash) from exc
 
         account = account_service.get_account(token) or {}
         attempts_started += 1
@@ -1566,7 +1602,7 @@ def _generate_single_image(
                         status_code=400,
                         error_type="invalid_request_error",
                         code="content_policy_violation",
-                        account_email=account_email,
+                        account_email=account_email, account_hash=account_hash,
                         conversation_id=output.conversation_id,
                     )
                 # progress 不算“已产出有效结果”，避免 SSE 进度后连接抖动无法 TLS 重试
@@ -1601,7 +1637,7 @@ def _generate_single_image(
                         status_code=400,
                         error_type="invalid_request_error",
                         code="no_image_generated",
-                        account_email=account_email,
+                        account_email=account_email, account_hash=account_hash,
                         conversation_id=conv_id,
                     )
                 return outputs
@@ -1615,6 +1651,7 @@ def _generate_single_image(
             _record_runtime_success(backend)
             return outputs
         except ImagePollTimeoutError as exc:
+            setattr(exc, "account_hash", account_hash)
             rate_limited = isinstance(exc, ImagePollRateLimitError)
             account_service.mark_image_result(
                 token,
@@ -1683,13 +1720,14 @@ def _generate_single_image(
                 status_code=400,
                 error_type="invalid_request_error",
                 code="content_policy_violation",
-                account_email=account_email,
+                account_email=account_email, account_hash=account_hash,
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
+            exc.account_hash = exc.account_hash or account_hash
             error_text = str(exc)
             # 连接/代理抖动可能被包装成 ImageGenerationError，按瞬时错误重试，不记硬失败
-            if (is_tls_connection_error(error_text) or is_connection_timeout_error(error_text) or is_chat_requirements_transient_error(error_text)) and not returned_result:
+            if (is_tls_connection_error(error_text) or is_connection_timeout_error(error_text) or is_chat_requirements_transient_error(error_text)) and not returned_result and _exception_status_code(exc) not in {403, 429}:
                 if is_tls_connection_error(error_text):
                     tls_retry_count += 1
                     if tls_retry_count <= MAX_TLS_RETRIES:
@@ -1792,7 +1830,7 @@ def _generate_single_image(
                     status_code=502,
                     error_type="server_error",
                     code="upstream_text_reply",
-                    account_email=account_email,
+                    account_email=account_email, account_hash=account_hash,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
             logger.warning({
@@ -1811,20 +1849,15 @@ def _generate_single_image(
             tls_hit = is_tls_connection_error(last_error)
             req_hit = is_chat_requirements_transient_error(last_error)
             timeout_hit = is_connection_timeout_error(last_error)
-            conversation_access_hit = (
-                no_final
-                and alternative_available
-                and is_empty_conversation_access_error(last_error)
-            )
+            denied = _exception_status_code(exc) in {403, 429}
             # 只要还没拿到最终 result，就允许连接类重试；避免 progress/message 中间态误杀
-            requirements_transient = no_final and req_hit
-            tls_transient = (not returned_result) and tls_hit
-            conn_timeout = (not returned_result) and timeout_hit
+            requirements_transient = no_final and req_hit and not denied
+            tls_transient = (not returned_result) and tls_hit and not denied
+            conn_timeout = (not returned_result) and timeout_hit and not denied
             if not (
                 requirements_transient
                 or tls_transient
                 or conn_timeout
-                or conversation_access_hit
             ):
                 account_service.mark_image_result(
                     token,
@@ -1856,12 +1889,33 @@ def _generate_single_image(
                 "tls_hit": tls_hit,
                 "req_hit": req_hit,
                 "timeout_hit": timeout_hit,
-                "conversation_access_hit": conversation_access_hit,
                 "returned_message": returned_message,
                 "returned_result": returned_result,
                 "emitted_for_token": emitted_for_token,
             })
+            if denied:
+                code = (
+                    "upstream_browser_verification_required"
+                    if "upstream_browser_verification_required" in last_error
+                    else "upstream_access_denied" if _exception_status_code(exc) == 403
+                    else "upstream_rate_limited"
+                )
+                raise ImageGenerationError(
+                    code, status_code=_exception_status_code(exc), code=code,
+                    account_email=account_email, account_hash=account_hash,
+                    conversation_id=getattr(exc, "conversation_id", ""),
+                ) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
+                if getattr(exc, "conversation_id", ""):
+                    account_service.remove_invalid_token(token, "image_download:token_revoked")
+                    raise ImageGenerationError(
+                        "Image was generated upstream, but its download token was revoked. Sign in again before retrieving the result.",
+                        status_code=401,
+                        error_type="authentication_error",
+                        code="token_revoked",
+                        account_email=account_email, account_hash=account_hash,
+                        conversation_id=exc.conversation_id,
+                    ) from exc
                 # 本请求内排除坏 token，避免 requirements 抖动路径把它当瞬时错误反复重试
                 if token:
                     excluded_image_tokens.add(token)
@@ -1917,30 +1971,8 @@ def _generate_single_image(
                     status_code=429,
                     error_type="insufficient_quota",
                     code="insufficient_quota",
-                    account_email=account_email,
+                    account_email=account_email, account_hash=account_hash,
                 )
-            # An empty-body 403 from the conversation endpoint is intermittent
-            # on the proxy path. Exclude this account for the current request
-            # and use the normal pool selector when another account is ready.
-            if conversation_access_hit:
-                conversation_access_retry_count += 1
-                if token:
-                    excluded_image_tokens.add(token)
-                logger.warning({
-                    "event": "image_stream_conversation_access_retry",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "retry_count": conversation_access_retry_count,
-                    "excluded": len(excluded_image_tokens),
-                    "index": index,
-                    "error": last_error[:240],
-                })
-                if conversation_access_retry_count <= MAX_CONVERSATION_ACCESS_RETRIES:
-                    _sleep_with_image_deadline(
-                        request,
-                        min(1.0 * conversation_access_retry_count, 3.0),
-                    )
-                    continue
             # TLS/SSL 连接错误：自动重试
             if tls_transient:
                 tls_retry_count += 1
@@ -1977,7 +2009,7 @@ def _generate_single_image(
                     status_code=502,
                     error_type="server_error",
                     code="upstream_error",
-                    account_email=account_email,
+                    account_email=account_email, account_hash=account_hash,
                 )
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
@@ -1995,7 +2027,7 @@ def _generate_single_image(
                     })
                     _sleep_with_image_deadline(request, wait_secs)
                     continue
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, account_hash=account_hash, conversation_id="") from exc
         finally:
             if backend is not None:
                 try:

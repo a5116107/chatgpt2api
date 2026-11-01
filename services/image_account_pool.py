@@ -509,6 +509,19 @@ def apply_probe_result(
     updated["image_last_probe_at"] = _iso_time(now_epoch)
     updated["image_last_probe_error"] = None if success else str(error or "probe failed")[:240]
 
+    # A light connectivity probe is not proof that a rejected generation can
+    # resume. In-flight probes must not erase a newer runtime cooldown/disable.
+    state = updated["image_pool_state"]
+    cooldown_active = (
+        state == ImagePoolState.COOLDOWN
+        and (_timestamp(updated.get("image_cooldown_until")) or 0) > now_epoch
+    )
+    if state in {ImagePoolState.DISABLED, ImagePoolState.QUARANTINED}:
+        return updated
+    if success and cooldown_active:
+        updated["image_next_probe_at"] = updated["image_cooldown_until"]
+        return updated
+
     if success:
         if updated["image_pool_state"] == ImagePoolState.EXHAUSTED:
             updated["image_next_probe_at"] = _quota_recheck_at(
@@ -575,6 +588,9 @@ def apply_probe_result(
         updated["image_pool_reason"] = "rate_limited"
         updated["image_cooldown_until"] = int(now_epoch + cooldown)
         updated["image_next_probe_at"] = int(now_epoch + cooldown)
+    elif cooldown_active or state == ImagePoolState.EXHAUSTED:
+        # Keep the existing admission state on an unrelated probe failure.
+        return updated
     else:
         updated["image_pool_state"] = ImagePoolState.PROBATION
         updated["image_pool_reason"] = resolved_outcome

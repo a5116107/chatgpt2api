@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 import time
+from urllib.parse import urlparse
 
 from services.storage.base import StorageBackend
 
@@ -63,6 +64,7 @@ DEFAULT_PROXY_RUNTIME_USER_AGENT = (
 )
 
 DEFAULT_PROXY_RUNTIME = {
+    "platform_url": "",
     "enabled": False,
     "egress_mode": "direct",
     "proxy_url": "",
@@ -119,7 +121,6 @@ DEFAULT_ACCOUNT_WATCHER_SETTINGS = {
     "initial_delay_seconds": 120,
     "require_proxy_ready": True,
     "proxy_ready_timeout_secs": 8,
-    "proxy_status_url": "http://dynamic-proxy:17286/_dynamic_proxy/status",
     "min_proxy_available": 8,
     "dynamic_batch_by_proxy": True,
 }
@@ -282,6 +283,33 @@ def _normalize_status_codes(value: object) -> list[int]:
     return normalized
 
 
+def _public_proxy_url(value: object) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+        if not (parsed.username or parsed.password):
+            return value
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://***:***@{host}{port}"
+    except ValueError:
+        return "[invalid proxy]"
+
+
+def _restore_proxy_url(value: object, previous: object) -> str:
+    candidate = str(value or "").strip()
+    if "***" not in candidate:
+        return candidate
+    original = str(previous or "").strip()
+    if "***" in original or candidate != _public_proxy_url(original):
+        raise ValueError("re-enter original proxy credentials when changing a masked URL")
+    return original
+
+
 def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     default_clearance = DEFAULT_PROXY_RUNTIME["clearance"]
@@ -312,6 +340,7 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
         "egress_mode": egress_mode,
         "proxy_url": str(source.get("proxy_url") or "").strip(),
         "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
+        "platform_url": str(source.get("platform_url") or "").strip().rstrip("/"),
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
             bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),
@@ -390,9 +419,6 @@ def _normalize_video_settings(value: object) -> dict[str, object]:
 
 def _normalize_account_watcher_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    proxy_status_url = source.get("proxy_status_url")
-    if proxy_status_url is None:
-        proxy_status_url = DEFAULT_ACCOUNT_WATCHER_SETTINGS["proxy_status_url"]
     return {
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["enabled"])),
         "check_limited": _normalize_bool(source.get("check_limited"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["check_limited"])),
@@ -403,7 +429,6 @@ def _normalize_account_watcher_settings(value: object) -> dict[str, object]:
         "initial_delay_seconds": _normalize_positive_int(source.get("initial_delay_seconds"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["initial_delay_seconds"]), 0),
         "require_proxy_ready": _normalize_bool(source.get("require_proxy_ready"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["require_proxy_ready"])),
         "proxy_ready_timeout_secs": _normalize_positive_int(source.get("proxy_ready_timeout_secs"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["proxy_ready_timeout_secs"]), 1),
-        "proxy_status_url": str(proxy_status_url).strip(),
         "min_proxy_available": _normalize_positive_int(source.get("min_proxy_available"), int(DEFAULT_ACCOUNT_WATCHER_SETTINGS["min_proxy_available"]), 1),
         "dynamic_batch_by_proxy": _normalize_bool(source.get("dynamic_batch_by_proxy"), bool(DEFAULT_ACCOUNT_WATCHER_SETTINGS["dynamic_batch_by_proxy"])),
     }
@@ -881,6 +906,7 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data["proxy"] = _public_proxy_url(self.get_proxy_settings())
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
@@ -939,11 +965,23 @@ class ConfigStore:
     def get_proxy_settings(self) -> str:
         return str(self.data.get("proxy") or "").strip()
 
+    def resolve_proxy_test_url(self, value: str) -> str:
+        if "***" not in value:
+            return value
+        runtime = self.get_proxy_runtime_settings()
+        candidates = {self.get_proxy_settings(), str(runtime.get("proxy_url") or ""), str(runtime.get("resource_proxy_url") or "")}
+        matches = {item for item in candidates if item and "***" not in item and _public_proxy_url(item) == value}
+        if len(matches) != 1:
+            raise ValueError("re-enter proxy credentials before testing an unknown or ambiguous masked URL")
+        return matches.pop()
+
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
         runtime = copy.deepcopy(self.get_proxy_runtime_settings())
+        for key in ("proxy_url", "resource_proxy_url"):
+            runtime[key] = _public_proxy_url(runtime.get(key))
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
         if isinstance(clearance, dict):
             cf_cookies = str(clearance.get("cf_cookies") or "").strip()
@@ -960,6 +998,8 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        if "proxy" in data:
+            next_data["proxy"] = _restore_proxy_url(data["proxy"], self.get_proxy_settings())
         next_data.pop("auto_remove_rate_limited_accounts", None)
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
@@ -983,7 +1023,12 @@ class ConfigStore:
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
+                incoming_runtime = dict(incoming_runtime)
+                previous_runtime = self.get_proxy_runtime_settings()
+                for key in ("proxy_url", "resource_proxy_url"):
+                    if key in incoming_runtime:
+                        incoming_runtime[key] = _restore_proxy_url(incoming_runtime[key], previous_runtime.get(key))
+                previous_clearance = previous_runtime.get("clearance")
                 if isinstance(previous_clearance, dict):
                     incoming_runtime = dict(incoming_runtime)
                     incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")

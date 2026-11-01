@@ -364,6 +364,31 @@ class ConversationStore:
                 created = self.create(identity, title=_title_from_text(request_preview), model=model, source="chat")
                 conversation_id = str(created["id"])
                 item = self._items[conversation_id]
+            # Full-context clients resend prior turns for inference. Persist only
+            # the new suffix, without changing the payload forwarded upstream.
+            # Single-message clients keep append semantics, including repeats.
+            if len(new_messages) > 1 and item["messages"]:
+                incoming = [(m["role"], m["content"]) for m in new_messages]
+                saved = [
+                    (m["role"], m["content"]) for m in item["messages"]
+                    if m.get("metadata", {}).get("status") != "failed"
+                ]
+                # KMP keeps suffix/prefix matching linear for long conversations.
+                prefix = [0] * len(incoming)
+                matched = 0
+                for index in range(1, len(incoming)):
+                    while matched and incoming[index] != incoming[matched]:
+                        matched = prefix[matched - 1]
+                    if incoming[index] == incoming[matched]:
+                        matched += 1
+                    prefix[index] = matched
+                matched = 0
+                for message in saved:
+                    while matched and (matched == len(incoming) or message != incoming[matched]):
+                        matched = prefix[matched - 1]
+                    if message == incoming[matched]:
+                        matched += 1
+                new_messages = new_messages[matched:]
             item["messages"].extend(new_messages)
             item["model"] = model
             item["status"] = "running"

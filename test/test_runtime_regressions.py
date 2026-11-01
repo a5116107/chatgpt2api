@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import tempfile
 import threading
@@ -20,6 +21,35 @@ from services.proxy_service import (
     FlareSolverrClearanceProvider,
     _apply_dynamic_proxy_session,
 )
+
+
+class RegisterEventLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_reads_run_off_the_event_loop(self):
+        from api import register as module
+
+        loop_thread = threading.get_ident()
+        observed = []
+        def read_progress():
+            observed.append(threading.get_ident())
+            return {"enabled": False, "stats": {"running": 0}}
+
+        with (
+            mock.patch.object(module, "require_admin"),
+            mock.patch.object(module.register_service, "get", side_effect=read_progress),
+        ):
+            routes = module.create_router().routes
+            for route in routes:
+                if route.path != "/api/register/events":
+                    self.assertFalse(inspect.iscoroutinefunction(route.endpoint), route.path)
+            events = next(route for route in routes if route.path == "/api/register/events")
+            response = await events.endpoint(token="fixture")
+            try:
+                payload = await anext(response.body_iterator)
+                self.assertIn('"running": 0', payload)
+            finally:
+                await response.body_iterator.aclose()
+        self.assertEqual(len(observed), 1)
+        self.assertNotEqual(observed[0], loop_thread)
 
 
 class UserInfoSessionTests(unittest.TestCase):
@@ -62,23 +92,17 @@ class AccountWatcherSchedulingTests(unittest.TestCase):
 
         self.assertEqual(result, ["keepalive"])
 
-    def test_explicit_empty_proxy_status_url_is_preserved(self) -> None:
+    def test_explicit_platform_origin_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            path.write_text(
-                '{"auth-key":"test-auth-key","account_watcher":{"proxy_status_url":""}}',
-                encoding="utf-8",
-            )
-
-            watcher = ConfigStore(path).get_account_watcher_settings()
-
-        self.assertEqual(watcher["proxy_status_url"], "")
+            path.write_text('{"auth-key":"test-auth-key","proxy_runtime":{"platform_url":"https://proxy.example.test"}}', encoding="utf-8")
+            runtime = ConfigStore(path).get_proxy_runtime_settings()
+        self.assertEqual(runtime["platform_url"], "https://proxy.example.test")
 
     def test_single_proxy_mode_skips_dynamic_pool_status_lookup(self) -> None:
         watcher = {
             "require_proxy_ready": True,
             "proxy_ready_timeout_secs": 8,
-            "proxy_status_url": "",
             "max_batch": 4,
         }
         with (
@@ -93,6 +117,33 @@ class AccountWatcherSchedulingTests(unittest.TestCase):
 
 
 class CapabilitySyncTests(unittest.TestCase):
+    def test_sync_and_manual_update_never_hold_risk_lock_when_reading_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = risk_module.RiskControlService()
+            capability_file = Path(directory) / "capabilities.json"
+
+            def read_accounts():
+                # Model the live account -> risk lock order from another thread.
+                acquired = threading.Event()
+                def read_capabilities():
+                    with service._lock:
+                        acquired.set()
+                thread = threading.Thread(target=read_capabilities, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(acquired.wait(1), "risk lock held while waiting for accounts")
+                finally:
+                    thread.join(timeout=0.01)
+                return [{"email": "fixture@example.test", "status": "正常", "quota": 1}]
+
+            with (
+                mock.patch.object(risk_module, "CAPABILITIES_FILE", capability_file),
+                mock.patch.object(risk_module.account_service, "list_accounts", side_effect=read_accounts),
+            ):
+                self.assertEqual(service.sync_account_capabilities()["total"], 1)
+                item = service.update_capability("fixture@example.test", {"image": False, "source": "manual"})
+                self.assertFalse(item["image"])
+
     def _sync(self, old_item: dict[str, object]) -> dict[str, object]:
         account = {
             "email": "user@example.com",

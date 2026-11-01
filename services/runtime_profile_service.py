@@ -14,10 +14,33 @@ from services.config import DATA_DIR
 
 
 PROFILE_FILE = DATA_DIR / "runtime_profiles.json"
+ACCOUNT_PROXY_POOL_FILE = DATA_DIR / "account_proxy_pool.json"
 
 DEFAULT_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
 
 PROFILE_TEMPLATES: dict[str, dict[str, Any]] = {
+    "chrome_win_136": {
+        "tls": {"impersonate": "chrome136"},
+        "headers": {
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-arch": '"x86"',
+            "sec-ch-ua-bitness": '"64"',
+            "sec-ch-ua-full-version": '"136.0.0.0"',
+            "sec-ch-ua-full-version-list": (
+                '"Chromium";v="136.0.0.0", "Google Chrome";v="136.0.0.0", '
+                '"Not.A/Brand";v="99.0.0.0"'
+            ),
+            "accept-language": DEFAULT_ACCEPT_LANGUAGE,
+        },
+        "locale": {"timezone": "Asia/Shanghai", "language": "zh-CN"},
+    },
     "chrome_win_146": {
         "tls": {"impersonate": "chrome146"},
         "headers": {
@@ -238,6 +261,7 @@ def _profile_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": profile.get("id"),
         "account_key": profile.get("account_key"),
+        "template": profile.get("template"),
         "tls": deepcopy(profile.get("tls") or {}),
         "headers": deepcopy(profile.get("headers") or {}),
         "openai": deepcopy(profile.get("openai") or {}),
@@ -285,6 +309,102 @@ class RuntimeProfileService:
         tmp = self.path.with_suffix(self.path.suffix + f".tmp.{uuid.uuid4().hex}")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(self.path)
+
+    def _load_account_proxy_pool(self) -> tuple[list[dict[str, Any]], bool]:
+        from services.risk_control_service import risk_control_service
+        imported = risk_control_service.assigned_proxy_groups()
+        try:
+            raw = json.loads(ACCOUNT_PROXY_POOL_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return imported, bool(imported)
+        except Exception as exc:
+            raise RuntimeError("account proxy pool configuration is invalid") from exc
+        if not isinstance(raw, dict) or not bool(raw.get("enabled", True)):
+            return imported, bool(imported)
+        groups = raw.get("groups")
+        if not isinstance(groups, list):
+            raise RuntimeError("account proxy pool groups are missing")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in groups:
+            if not isinstance(item, dict) or not bool(item.get("enabled", True)):
+                continue
+            group_id = _clean(item.get("id"))
+            proxy_url = _clean(item.get("proxy_url"))
+            template = _clean(item.get("template"))
+            if not group_id or group_id in seen or not proxy_url:
+                raise RuntimeError("account proxy pool contains an invalid group")
+            if template not in PROFILE_TEMPLATES:
+                raise RuntimeError(f"account proxy group {group_id} has an unknown template")
+            try:
+                capacity = max(1, int(item.get("capacity") or 1))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(f"account proxy group {group_id} has invalid capacity") from exc
+            seen.add(group_id)
+            normalized.append(
+                {
+                    "id": group_id,
+                    "proxy_url": proxy_url,
+                    "template": template,
+                    "capacity": capacity,
+                    "preferred_node_id": _clean(item.get("preferred_node_id")),
+                }
+            )
+        normalized = imported + normalized
+        if not normalized:
+            raise RuntimeError("account proxy pool has no enabled groups")
+        return normalized, bool(raw.get("strict_capacity", True))
+
+    def binding_capacity_status(self) -> dict[str, Any]:
+        """Observe configured binding limits without allocation or admission."""
+        with self._lock:
+            groups, strict = self._load_account_proxy_pool()
+            counts = self._account_proxy_group_counts_locked(groups)
+            total = sum(int(group["capacity"]) for group in groups)
+            used = sum(counts.values())
+            return {"unit": "profile_binding", "enabled": bool(groups), "strict": strict, "limit": total, "used": used, "remaining": sum(max(0, int(group["capacity"]) - counts[str(group["id"])]) for group in groups), "groups": len(groups)}
+
+    def _allocate_account_proxy_group_locked(self) -> dict[str, Any] | None:
+        groups, strict_capacity = self._load_account_proxy_pool()
+        if not groups:
+            return None
+        counts = self._account_proxy_group_counts_locked(groups)
+        candidates = [
+            (counts[str(group["id"])], index, group)
+            for index, group in enumerate(groups)
+            if counts[str(group["id"])] < int(group["capacity"])
+        ]
+        if not candidates:
+            if strict_capacity:
+                raise RuntimeError(
+                    "account proxy pool capacity is exhausted; registration is blocked by the configured capacity limit"
+                )
+            candidates = [
+                (counts[str(group["id"])], index, group)
+                for index, group in enumerate(groups)
+            ]
+        return dict(min(candidates, key=lambda item: (item[0], item[1]))[2])
+
+    def _account_proxy_group_counts_locked(self, groups: list[dict[str, Any]]) -> dict[str, int]:
+        counts = {str(group["id"]): 0 for group in groups}
+        for profile in self._profiles.values():
+            if _clean(profile.get("status")) not in {"", "active"}:
+                continue
+            policy = profile.get("proxy_policy") if isinstance(profile.get("proxy_policy"), dict) else {}
+            group_id = _clean(policy.get("group"))
+            if group_id in counts:
+                counts[group_id] += 1
+        return counts
+
+    def registration_preflight(self) -> dict[str, Any]:
+        """Read-only admission check; never reserve or relax proxy capacity."""
+        with self._lock:
+            groups, strict = self._load_account_proxy_pool()
+            if not groups:
+                return {"enabled": False, "remaining": None}
+            self._allocate_account_proxy_group_locked()
+            counts = self._account_proxy_group_counts_locked(groups)
+            return {"enabled": True, "strict": strict, "remaining": sum(max(0, int(group["capacity"]) - counts[str(group["id"])]) for group in groups)}
 
     def _cleanup_stale_tmp_files_locked(self) -> int:
         removed = 0
@@ -345,9 +465,16 @@ class RuntimeProfileService:
             "proxy_policy": {
                 "mode": _clean(proxy_policy.get("mode")) or "account_or_runtime",
                 "group": _clean(proxy_policy.get("group")),
+                "preferred_node_id": _clean(proxy_policy.get("preferred_node_id")),
                 "register_proxy": _clean(proxy_policy.get("register_proxy")),
                 "runtime_proxy": _clean(proxy_policy.get("runtime_proxy")),
                 "allow_rotate": bool(proxy_policy.get("allow_rotate", True)),
+                "failover_enabled": bool(proxy_policy.get("failover_enabled", True)),
+                "country": _clean(proxy_policy.get("country")),
+                "failover_count": int(proxy_policy.get("failover_count") or 0),
+                "last_failover_at": proxy_policy.get("last_failover_at") or None,
+                "last_failover_reason": _clean(proxy_policy.get("last_failover_reason")),
+                "previous_group": _clean(proxy_policy.get("previous_group")),
             },
             "clearance": {
                 "scope": _clean(clearance.get("scope")) or "profile",
@@ -369,29 +496,35 @@ class RuntimeProfileService:
         profile_id: str = "",
         save: bool = True,
     ) -> dict[str, Any]:
-        account_key = _account_key(account, fallback=f"{source}:{uuid.uuid4().hex}")
-        template_name = template or _template_name(account_key)
-        base = deepcopy(PROFILE_TEMPLATES.get(template_name) or PROFILE_TEMPLATES["chrome_win_145"])
-        profile = {
-            **base,
-            "id": _clean(profile_id) or _profile_id(account_key),
-            "account_key": account_key,
-            "template": template_name,
-            "status": "active",
-            "proxy_policy": {
-                "mode": "account_or_runtime",
-                "group": "",
-                "register_proxy": _clean(proxy or (account or {}).get("proxy")),
-                "runtime_proxy": _clean((account or {}).get("proxy")),
-                "allow_rotate": True,
-            },
-            "clearance": {"scope": "profile", "last_refresh_at": None},
-            "source": source,
-        }
-        normalized = self.normalize_profile(profile)
-        assert normalized is not None
-        if save:
-            with self._lock:
+        with self._lock:
+            account_key = _account_key(account, fallback=f"{source}:{uuid.uuid4().hex}")
+            group = self._allocate_account_proxy_group_locked() if source == "register" else None
+            assigned_proxy = _clean(proxy or (account or {}).get("proxy"))
+            if group:
+                assigned_proxy = str(group["proxy_url"])
+            template_name = template or (str(group["template"]) if group else _template_name(account_key))
+            base = deepcopy(PROFILE_TEMPLATES.get(template_name) or PROFILE_TEMPLATES["chrome_win_145"])
+            profile = {
+                **base,
+                "id": _clean(profile_id) or _profile_id(account_key),
+                "account_key": account_key,
+                "template": template_name,
+                "status": "active",
+                "proxy_policy": {
+                    "mode": ("account_sticky" if str(group["id"]).startswith("px_") else "account_sticky_us") if group else "account_or_runtime",
+                    "group": str(group["id"]) if group else "",
+                    "preferred_node_id": str(group["preferred_node_id"]) if group else "",
+                    "register_proxy": assigned_proxy,
+                    "runtime_proxy": assigned_proxy,
+                    "allow_rotate": False if group else True,
+                    "country": str(group.get("country") or ("US" if not str(group["id"]).startswith("px_") else "")) if group else "",
+                },
+                "clearance": {"scope": "profile", "last_refresh_at": None},
+                "source": source,
+            }
+            normalized = self.normalize_profile(profile)
+            assert normalized is not None
+            if save:
                 self._profiles[str(normalized["id"])] = normalized
                 self._save_locked()
         return normalized
@@ -542,6 +675,71 @@ class RuntimeProfileService:
             return self.bind_account(profile_id, account)
         return self.ensure_account_profile(account)
 
+    def set_proxy_failover(self, profile_id: str, enabled: bool) -> dict[str, Any] | None:
+        with self._lock:
+            profile = self._profiles.get(profile_id)
+            if profile is None:
+                return None
+            previous = deepcopy(profile)
+            profile["proxy_policy"]["failover_enabled"] = enabled
+            profile["updated_at"] = _now()
+            try:
+                self._save_locked()
+            except Exception:
+                self._profiles[profile_id] = previous
+                raise
+            return deepcopy(profile)
+
+    def failover_proxy(self, account: dict[str, Any], failed_proxy: str, reason: str, country: str = "") -> dict[str, Any] | None:
+        """Reserve a healthy same-country replacement without replaying business calls."""
+        from services.risk_control_service import risk_control_service
+        with self._lock:
+            profile = self._profiles.get(str(account.get("runtime_profile_id") or ""))
+            if not profile:
+                return None
+            policy = dict(profile.get("proxy_policy") or {})
+            if not policy.get("failover_enabled", True) or str(policy.get("runtime_proxy") or account.get("proxy") or "") != failed_proxy:
+                return None
+            if policy.get("last_failover_at"):
+                try:
+                    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(policy["last_failover_at"])).total_seconds()
+                except (ValueError, TypeError):
+                    return None
+                if elapsed < 300:
+                    return None
+            country = str(policy.get("country") or country or ("US" if policy.get("mode") == "account_sticky_us" else "")).upper()
+            if not country:
+                return None
+            groups = risk_control_service.assigned_proxy_groups()
+            counts = self._account_proxy_group_counts_locked(groups)
+            candidates = [group for group in groups if group["proxy_url"] != failed_proxy
+                          and (not country or group.get("country") == country)
+                          and counts[group["id"]] < group["capacity"]]
+            if not candidates:
+                return None
+            selected = min(candidates, key=lambda group: (counts[group["id"]], group["id"]))
+            previous = deepcopy(profile)
+            updated = deepcopy(profile)
+            updated["proxy_policy"] = {**policy, "group": selected["id"], "runtime_proxy": selected["proxy_url"],
+                                       "country": selected.get("country") or country, "preferred_node_id": "",
+                                       "previous_group": policy.get("group") or "", "last_failover_at": _now(),
+                                       "last_failover_reason": reason, "failover_count": int(policy.get("failover_count") or 0) + 1}
+            updated["updated_at"] = _now()
+            updated["clearance"] = {**updated.get("clearance", {}), "last_refresh_at": None}
+            self._profiles[updated["id"]] = updated
+            try:
+                self._save_locked()
+            except Exception:
+                self._profiles[previous["id"]] = previous
+                raise
+            return {**account, "proxy": selected["proxy_url"], "proxy_policy": deepcopy(updated["proxy_policy"]),
+                    "profile_snapshot": _profile_snapshot(updated), "fp": _fp_from_profile(updated)}
+
+    def restore_proxy_profile(self, profile: dict[str, Any]) -> None:
+        with self._lock:
+            self._profiles[profile["id"]] = deepcopy(profile)
+            self._save_locked()
+
     def get(self, profile_id: str) -> dict[str, Any] | None:
         with self._lock:
             profile = self._profiles.get(_clean(profile_id))
@@ -622,7 +820,7 @@ class RuntimeProfileService:
         warnings: list[str] = []
         if account_proxy and runtime_proxy and account_proxy != runtime_proxy:
             warnings.append("account proxy differs from runtime profile proxy policy")
-        if register_proxy and account_proxy and register_proxy != account_proxy and not bool(proxy_policy.get("allow_rotate", True)):
+        if register_proxy and account_proxy and register_proxy != account_proxy and not bool(proxy_policy.get("allow_rotate", True)) and not proxy_policy.get("last_failover_at"):
             warnings.append("register proxy differs from account proxy while rotate is disabled")
         return {
             "account_key": profile.get("account_key"),
@@ -648,6 +846,10 @@ class RuntimeProfileService:
         ua = _clean(headers.get("user-agent"))
         if ua:
             headers["user-agent_preview"] = ua[:32] + ("..." if len(ua) > 32 else "")
+        from services.config import _public_proxy_url
+        policy = item.get("proxy_policy") or {}
+        for key in ("register_proxy", "runtime_proxy"):
+            policy[key] = _public_proxy_url(policy.get(key))
         return item
 
 

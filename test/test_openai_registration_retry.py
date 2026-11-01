@@ -556,6 +556,19 @@ class PlatformRegistrationStateMachineTests(unittest.TestCase):
 
 
 class RegistrationRetryTests(unittest.TestCase):
+    def test_constructor_failure_is_fatal_and_never_retried(self):
+        with (
+            patch.object(openai_register, "PlatformRegistrar", side_effect=RuntimeError("capacity exhausted")) as factory,
+            patch.dict(openai_register.stats, {"done": 0, "success": 0, "fail": 0}, clear=True),
+            patch.dict(openai_register.config, {"max_attempts": 20}),
+        ):
+            result = openai_register.worker(1)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["fatal"])
+            self.assertEqual(result["error_code"], "initialization_failed")
+            self.assertEqual(openai_register.stats["fail"], 1)
+            factory.assert_called_once()
+
     def test_registration_attempt_budget_is_clamped_to_supported_bounds(self):
         self.assertEqual(openai_signup_primitives.registration_max_attempts(None), 6)
         self.assertEqual(openai_signup_primitives.registration_max_attempts("invalid"), 6)

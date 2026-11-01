@@ -9,6 +9,23 @@ from services.image_task_service import ImageTaskService
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_failed_task_keeps_the_assigned_account_hash_without_credentials(self) -> None:
+        from services.protocol.conversation import ImageGenerationError
+
+        def failed(payload: dict) -> dict:
+            raise ImageGenerationError(
+                "bootstrap failed: status=403, body=upstream_browser_verification_required",
+                account_hash="token:fixture-hash",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImageTaskService(Path(directory) / "tasks.json", generation_handler=failed)
+            service.submit_generation({"id": "user-1"}, client_task_id="failed", prompt="draw", model="gpt-image-2", size="1024x1024")
+            task = self.wait_for_task(service, "failed")
+            self.assertEqual(task["status"], "error")
+            self.assertEqual(task["account_hash"], "token:fixture-hash")
+            self.assertNotIn("access_token", task)
+
     def wait_for_task(self, service: ImageTaskService, task_id: str) -> dict:
         deadline = time.time() + 2.0
         while time.time() < deadline:

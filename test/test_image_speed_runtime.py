@@ -490,6 +490,31 @@ class ImageRaceTests(unittest.TestCase):
 
 
 class ImageAccountFailoverTests(unittest.TestCase):
+    def test_revoked_token_after_generation_does_not_submit_a_duplicate(self) -> None:
+        request = conversation_module.ConversationRequest(model="gpt-image-2", prompt="a red circle")
+        error = UpstreamHTTPError("download", 401, {"error": {"code": "token_revoked", "message": "Encountered invalidated oauth token for user"}})
+        error.conversation_id = "already-generated"
+        backend = mock.Mock()
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", return_value="fixture-token") as acquire,
+            mock.patch.object(conversation_module.account_service, "get_account", return_value={"type": "free"}),
+            mock.patch.object(conversation_module.account_service, "has_alternative_image_account", return_value=True),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "remove_invalid_token") as remove,
+            mock.patch.object(conversation_module.account_service, "release_image_slot"),
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(conversation_module, "stream_image_outputs", side_effect=error) as generate,
+            mock.patch.object(conversation_module, "_record_runtime_risk"),
+        ):
+            with self.assertRaises(conversation_module.ImageGenerationError) as caught:
+                conversation_module._generate_single_image(request, 1, 1)
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.code, "token_revoked")
+        self.assertEqual(caught.exception.conversation_id, "already-generated")
+        acquire.assert_called_once()
+        generate.assert_called_once()
+        remove.assert_called_once()
+
     def test_exhausted_transient_retries_do_not_release_the_final_slot_twice(self) -> None:
         started = time.monotonic()
         request = conversation_module.ConversationRequest(
@@ -812,11 +837,13 @@ class ImageAccountFailoverTests(unittest.TestCase):
 class ImageTaskLifecycleTests(unittest.TestCase):
     def test_stage_metrics_heartbeat_and_account_hash_are_persisted(self) -> None:
         release_handler = threading.Event()
+        handler_started = threading.Event()
 
         def handler(payload: dict) -> dict:
             payload["progress_callback"]("getting_account")
             payload["progress_callback"]("starting_generation")
-            release_handler.wait(1)
+            handler_started.set()
+            release_handler.wait(5)
             return {"data": [{"url": "https://example.test/image.png"}], "_account_hash": "token:abc123"}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -833,6 +860,7 @@ class ImageTaskLifecycleTests(unittest.TestCase):
                 model="gpt-image-2",
                 size="1024x1024",
             )
+            self.assertTrue(handler_started.wait(2), "generation worker did not start")
             heartbeat_deadline = time.time() + 1.0
             while True:
                 with service._lock:
@@ -960,6 +988,8 @@ class ImageAccountScoreTests(unittest.TestCase):
         service._lock = threading.Lock()
         service._image_slot_condition = threading.Condition(service._lock)
         service._image_inflight = {}
+        service._image_last_assigned = {}
+        service._text_last_assigned = {}
         service._accounts = {
             "slow": {
                 "access_token": "slow",
@@ -998,6 +1028,8 @@ class ImageAccountScoreTests(unittest.TestCase):
         service._lock = threading.Lock()
         service._image_slot_condition = threading.Condition(service._lock)
         service._image_inflight = {}
+        service._image_last_assigned = {}
+        service._text_last_assigned = {}
         service._accounts = {
             "probed": {
                 "access_token": "probed",
@@ -1029,6 +1061,8 @@ class ImageAccountScoreTests(unittest.TestCase):
         service._lock = threading.Lock()
         service._image_slot_condition = threading.Condition(service._lock)
         service._image_inflight = {}
+        service._image_last_assigned = {}
+        service._text_last_assigned = {}
         service._accounts = {
             "recent": {
                 "access_token": "recent", "status": "normal", "quota": 1, "type": "free",
@@ -1055,6 +1089,8 @@ class ImageAccountScoreTests(unittest.TestCase):
         service._lock = threading.Lock()
         service._image_slot_condition = threading.Condition(service._lock)
         service._image_inflight = {}
+        service._image_last_assigned = {}
+        service._text_last_assigned = {}
         service._image_inflight_meta = {}
         service._index = 2
         service._accounts = {

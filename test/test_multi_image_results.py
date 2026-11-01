@@ -8,6 +8,7 @@ from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import ImageOutput, extract_conversation_ids
 from services.protocol.openai_v1_response import stream_image_response
+from utils.helper import UpstreamHTTPError
 
 
 def _conversation(file_ids: list[str], sediment_ids: list[str] | None = None) -> dict:
@@ -53,6 +54,36 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_revoked_download_token_is_preserved_instead_of_empty_result(self) -> None:
+        backend = FakeBackend()
+        revoked = UpstreamHTTPError("download", 401, {"error": {"code": "token_revoked"}})
+        backend._get_file_download_url = mock.Mock(side_effect=revoked)
+        backend._get_attachment_download_url = mock.Mock(side_effect=revoked)
+        with self.assertRaises(UpstreamHTTPError) as caught:
+            backend.resolve_conversation_image_urls("conv-1", ["file-one"], ["file-one"])
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.conversation_id, "conv-1")
+
+    def test_attachment_fallback_can_resolve_after_file_lookup_failure(self) -> None:
+        backend = FakeBackend()
+        backend._get_file_download_url = mock.Mock(side_effect=UpstreamHTTPError("download", 404, {}))
+        backend.sediment_urls = {"file-one": "https://attachments.test/one.png"}
+        self.assertEqual(backend._resolve_image_urls("conv-1", ["file-one"], ["file-one"]), ["https://attachments.test/one.png"])
+
+    def test_attachment_not_found_does_not_hide_revoked_file_token(self) -> None:
+        backend = FakeBackend()
+        backend._get_file_download_url = mock.Mock(side_effect=UpstreamHTTPError("download", 401, {"error": {"code": "token_revoked"}}))
+        backend._get_attachment_download_url = mock.Mock(side_effect=UpstreamHTTPError("attachment", 404, {}))
+        with self.assertRaises(UpstreamHTTPError) as caught:
+            backend._resolve_image_urls("conv-1", ["file-one"], ["file-one"])
+        self.assertEqual(caught.exception.status_code, 401)
+
+    def test_url_ready_progress_is_not_emitted_for_empty_resolution(self) -> None:
+        backend = FakeBackend()
+        backend.progress_callback = mock.Mock()
+        self.assertEqual(backend._resolve_image_urls("conv-1", ["file-one"], []), [])
+        self.assertNotIn(mock.call("image_url_ready"), backend.progress_callback.call_args_list)
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '

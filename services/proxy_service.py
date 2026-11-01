@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -13,6 +14,7 @@ from urllib import request as urllib_request
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from curl_cffi.requests import Session
+from curl_cffi.requests.exceptions import RequestException
 
 from services.config import config
 
@@ -41,6 +43,51 @@ def normalize_proxy_url(url: str) -> str:
     if lowered.startswith("socks5://"):
         return "socks5h://" + candidate[len("socks5://") :]
     return candidate
+
+
+class AccountProxySession(Session):
+    """Observe transport failures and update the binding for subsequent calls."""
+
+    def __init__(self, *, account: dict | None = None, on_proxy_change=None, **kwargs):
+        self.bound_account = dict(account or {})
+        self.on_proxy_change = on_proxy_change
+        super().__init__(**kwargs)
+
+    def _proxy_failed(self, reason: str) -> bool:
+        account = self.bound_account
+        if not account.get("access_token") or not account.get("proxy"):
+            return False
+        try:
+            from services.account_service import account_service
+            replacement = account_service.handle_proxy_failure(str(account["access_token"]), str(account["proxy"]), reason)
+            if replacement is not None:
+                self.bound_account = replacement
+                self.proxies = {"all": proxy_settings.get_profile(account=replacement, upstream=True).proxy_url}
+                self.cookies.delete("cf_clearance")
+                if self.on_proxy_change:
+                    self.on_proxy_change(replacement)
+                return True
+        except Exception as failure:
+            # Preserve the original network error, without exposing credentials.
+            print("[proxy-failover] update_failed=" + type(failure).__name__)
+        return False
+
+    def request(self, method, url, *args, **kwargs):
+        replayable = str(method).upper() in {"GET", "HEAD"} and not kwargs.get("stream")
+        for attempt in range(2):
+            try:
+                response = super().request(method, url, *args, **kwargs)
+            except RequestException as failure:
+                code = int(getattr(failure, "code", 0) or 0)
+                denied = bool(re.search(r"(?:response|status|HTTP[/\d.]*)[ :=]+(?:401|403|429)\b", str(failure), re.I))
+                changed = not denied and code in {5, 7, 28, 52, 55, 56, 97} and self._proxy_failed("network_timeout" if code == 28 else "connection_failed")
+                if changed and replayable and attempt == 0:
+                    continue
+                raise
+            changed = response.status_code == 407 and self._proxy_failed("proxy_auth_required")
+            if changed and replayable and attempt == 0:
+                continue
+            return response
 
 
 @dataclass(frozen=True)
@@ -152,7 +199,14 @@ class FlareSolverrClearanceProvider:
                 continue
             cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
             user_agent = str(solution.get("userAgent") or "").strip()
-            if "cf_clearance" not in cookies:
+            try:
+                solution_status = int(solution.get("status") or 0)
+            except (TypeError, ValueError):
+                solution_status = 0
+            # Match the existing production browser response contract.
+            if "cf_clearance" not in cookies and not (
+                200 <= solution_status < 300 and user_agent
+            ):
                 continue
             bundle = ClearanceBundle(
                 target_host=target_host,
@@ -663,7 +717,10 @@ def _redact_url_credentials(text: str) -> str:
 
 
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
-    candidate = normalize_proxy_url(_clean(url))
+    try:
+        candidate = normalize_proxy_url(config.resolve_proxy_test_url(_clean(url)))
+    except ValueError as exc:
+        return {"ok": False, "status": 0, "latency_ms": 0, "error": str(exc), "proxy_source": "input", "has_proxy": bool(url)}
     proxy_source = "input"
     if not candidate:
         profile = proxy_settings.get_profile(upstream=True)
@@ -696,10 +753,13 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         return {
-            "ok": response.status_code < 500,
+            "ok": 200 <= response.status_code < 300,
+            "scope": "project_target",
+            "transport_ok": response.status_code != 407,
+            "error_code": ("" if 200 <= response.status_code < 300 else "proxy_auth_required" if response.status_code == 407 else "target_rate_limited" if response.status_code == 429 else "target_access_denied" if response.status_code in (401, 403) else "target_http_error"),
             "status": int(response.status_code),
             "latency_ms": latency_ms,
-            "error": None if response.status_code < 500 else f"HTTP {response.status_code}",
+            "error": None if 200 <= response.status_code < 300 else f"HTTP {response.status_code}",
             **result_base,
         }
     except Exception as exc:
@@ -709,10 +769,37 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             "status": 0,
             "latency_ms": latency_ms,
             "error": _redact_url_credentials(str(exc) or exc.__class__.__name__),
+            "error_code": "target_access_denied" if re.search(r"(?:response|status|HTTP[/\d.]*)[ :=]+(?:401|403|429)\b", str(exc), re.I) else "connection_failed",
             **result_base,
         }
     finally:
         session.close()
+
+
+def probe_proxy_route(url: str, *, timeout: float = 8.0) -> dict:
+    """Check transport/exit separately from the configured business target."""
+    candidate = normalize_proxy_url(url)
+    observed = datetime.now(timezone.utc).isoformat()
+    result = {"observed_at": observed, "network_ok": False, "target_ok": False,
+              "exit_ip": "", "country": "", "latency_ms": None, "target_status": 0}
+    started = time.perf_counter()
+    try:
+        with Session(proxy=candidate, trust_env=False, verify=True) as session:
+            response = session.get("https://ipwho.is/", timeout=timeout, allow_redirects=False)
+            if response.status_code == 200:
+                data = response.json()
+                import ipaddress
+                address = str(ipaddress.ip_address(data.get("ip", "")))
+                result.update(network_ok=True, exit_ip=address, country=str(data.get("country_code") or "").upper(),
+                              latency_ms=int((time.perf_counter() - started) * 1000))
+            else:
+                result["network_error"] = "exit_lookup_http_" + str(response.status_code)
+    except Exception:
+        result["network_error"] = "connection_failed"
+    target = test_proxy(candidate, timeout=timeout)
+    result.update(target_ok=bool(target.get("ok")), target_status=int(target.get("status") or 0),
+                  target_error=str(target.get("error_code") or ("connection_failed" if not target.get("ok") else "")))
+    return result
 
 
 def test_clearance(target_url: str = "https://chatgpt.com") -> dict:

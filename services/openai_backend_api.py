@@ -22,8 +22,8 @@ from PIL import Image
 from services.account_service import account_service
 from services.runtime_profile_service import runtime_profile_service
 from services.config import config
-from services.proxy_service import proxy_settings
-from services.dynamic_proxy_feedback import report_dynamic_proxy_denial
+from services.proxy_service import AccountProxySession, proxy_settings
+from services.proxy_platform import report_proxy_denial
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -161,7 +161,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", *, diagnostic_account: dict | None = None) -> None:
         """初始化后端客户端。
 
         参数：
@@ -171,12 +171,13 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
-        self.account = account_service.get_account(self.access_token) if self.access_token else {}
+        self.account = (dict(diagnostic_account) if diagnostic_account is not None
+                        else account_service.get_account(self.access_token) if self.access_token else {})
         self.account = self.account if isinstance(self.account, dict) else {}
-        if self.account:
+        if self.account and diagnostic_account is None:
             self.account, self.profile = runtime_profile_service.ensure_account_profile(self.account)
         else:
-            self.profile = {}
+            self.profile = dict(self.account.get("profile_snapshot") or {})
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
@@ -194,7 +195,12 @@ class OpenAIBackendAPI:
             verify=True,
         )
         self.proxy_url = str(self.session_kwargs.get("proxy") or "")
-        self.session = requests.Session(**self.session_kwargs)
+        if diagnostic_account is not None:
+            # Diagnostics use the existing route without binding recovery or replays.
+            self.session_kwargs["verify"] = True
+            self.session = requests.Session(**self.session_kwargs)
+        else:
+            self.session = AccountProxySession(account=self.account, on_proxy_change=self._proxy_changed, **self.session_kwargs)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -241,6 +247,12 @@ class OpenAIBackendAPI:
             pass
         finally:
             self.session = None
+
+    def _proxy_changed(self, account: dict) -> None:
+        self.account = account
+        self.profile = runtime_profile_service.get(str(account.get("runtime_profile_id") or "")) or self.profile
+        self.proxy_url = proxy_settings.get_profile(account=account, upstream=True).proxy_url
+        self.session_kwargs["proxy"] = self.proxy_url
 
     def set_image_request_context(self, request_id: str, deadline_monotonic: float | None) -> None:
         self.image_request_id = str(request_id or "").strip()
@@ -319,8 +331,10 @@ class OpenAIBackendAPI:
             body = str(response.json())[:500]
         except Exception:
             body = str(getattr(response, "text", "") or "")[:500]
-        report_dynamic_proxy_denial(
+        report_proxy_denial(
             self.proxy_url,
+            scenario="image" if self.image_request_id else "api",
+            stage="submit" if self.image_request_id else "request",
             target="chatgpt.com:443",
             status_code=status_code,
             reason=f"backend_http_{status_code}",
@@ -2575,6 +2589,7 @@ class OpenAIBackendAPI:
     ) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls: list[str] = []
+        resolution_errors: list[Exception] = []
         resolved_reference_ids: set[str] = set()
         max_results = max(1, int(limit)) if limit is not None else None
         self._report_progress("resolving_image_url")
@@ -2583,7 +2598,15 @@ class OpenAIBackendAPI:
             return max_results is not None and len(urls) >= max_results
 
         def finish() -> list[str]:
-            self._report_progress("image_url_ready")
+            if not urls and resolution_errors:
+                error = next(
+                    (item for item in resolution_errors if getattr(item, "status_code", None) == 401),
+                    next((item for item in resolution_errors if getattr(item, "status_code", None) == 403), resolution_errors[-1]),
+                )
+                error.conversation_id = conversation_id
+                raise error
+            if urls:
+                self._report_progress("image_url_ready")
             logger.debug({
                 "event": "image_urls_resolved",
                 "conversation_id": conversation_id,
@@ -2607,6 +2630,7 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_file_download_url(file_id)
             except Exception as exc:
+                resolution_errors.append(exc)
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "file",
@@ -2636,6 +2660,7 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
+                resolution_errors.append(exc)
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "sediment",
@@ -3139,98 +3164,38 @@ class OpenAIBackendAPI:
                 close_thread = self._start_image_response_close(response, request_label)
                 close_thread.join(timeout=config.image_stream_close_timeout_secs)
 
-    def _bootstrap(self) -> None:
-        """预热首页，并提取 PoW 相关脚本引用。"""
-        response = None
+    def _get_homepage(self, *, timeout=(10, 25), allow_redirects=False):
+        """Read the public page without leaking API credentials or changing route."""
+        # The homepage is a public Cloudflare/browser bootstrap, not an API
+        # credential check.  curl_cffi merges session defaults into every
+        # request, so passing a header dict without Authorization is not enough:
+        # remove the inherited Bearer for this request and restore it before
+        # authenticated endpoints run.  This is the same request boundary used
+        # by the maintained upstream implementations.
+        authorization = self.session.headers.pop("Authorization", None)
         try:
-            logger.debug({"event": "bootstrap_start", "proxy": bool(self.proxy_url)})
-            response = self.session.get(
-                self.base_url + "/",
-                headers=self._bootstrap_headers(),
-                timeout=(10, 25),
+            bootstrap_headers = self._bootstrap_headers()
+            bootstrap_headers.pop("Authorization", None)
+            return self.session.get(
+                self.base_url + "/", headers=bootstrap_headers, timeout=timeout,
+                allow_redirects=allow_redirects,
             )
-            ensure_ok(response, "bootstrap")
-            logger.debug({"event": "bootstrap_ok", "status": getattr(response, "status_code", None)})
-        except Exception as primary_error:
-            if self.access_token and not getattr(self, "_direct_bootstrap_fallback_used", False):
-                try:
-                    self._direct_bootstrap_fallback_used = True
-                    session_headers = dict(getattr(self.session, "headers", {}) or {})
-                    fallback_account = dict(self.account or {})
-                    fallback_account.pop("proxy", None)
-                    try:
-                        self.session.close()
-                    except Exception:
-                        pass
-                    self.proxy_url = ""
-                    self.session_kwargs = {"impersonate": self.fp["impersonate"], "verify": False}
-                    self.session = requests.Session(**self.session_kwargs)
-                    self.session.headers.update(session_headers)
-                    self.session.headers["User-Agent"] = self.user_agent
-                    self.session.headers["Origin"] = self.base_url
-                    self.session.headers["Referer"] = self.base_url + "/"
-                    self.session.headers["Accept-Language"] = self.fp.get("accept-language") or "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
-                    self.session.headers["Sec-Ch-Ua"] = self.fp["sec-ch-ua"]
-                    self.session.headers["Sec-Ch-Ua-Mobile"] = self.fp["sec-ch-ua-mobile"]
-                    self.session.headers["Sec-Ch-Ua-Platform"] = self.fp["sec-ch-ua-platform"]
-                    self.session.headers["OAI-Device-Id"] = self.device_id
-                    self.session.headers["OAI-Session-Id"] = self.session_id
-                    self.session.headers["OAI-Language"] = "zh-CN"
-                    self.session.headers["OAI-Client-Version"] = self.client_version
-                    self.session.headers["OAI-Client-Build-Number"] = self.client_build_number
-                    self.session.headers["Authorization"] = f"Bearer {self.access_token}"
-                    refresh_bundle = proxy_settings.refresh_clearance(
-                        target_url=self.base_url,
-                        account=fallback_account,
-                        proxy="",
-                        force=True,
-                        upstream=False,
-                    )
-                    if refresh_bundle and refresh_bundle.cookies:
-                        merged_headers = proxy_settings.build_headers(
-                            self._bootstrap_headers(),
-                            target_url=self.base_url,
-                            account=fallback_account,
-                            proxy="",
-                            upstream=False,
-                        )
-                        response = self.session.get(
-                            self.base_url + "/",
-                            headers=merged_headers,
-                            timeout=(10, 25),
-                        )
-                        ensure_ok(response, "bootstrap")
-                    else:
-                        self.session.close()
-                        self.session_kwargs = {"impersonate": self.fp["impersonate"], "verify": False}
-                        self.session = requests.Session(**self.session_kwargs)
-                        self.session.headers.update(session_headers)
-                        self.session.headers["User-Agent"] = self.user_agent
-                        self.session.headers["Origin"] = self.base_url
-                        self.session.headers["Referer"] = self.base_url + "/"
-                        self.session.headers["Accept-Language"] = self.fp.get("accept-language") or "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
-                        self.session.headers["Sec-Ch-Ua"] = self.fp["sec-ch-ua"]
-                        self.session.headers["Sec-Ch-Ua-Mobile"] = self.fp["sec-ch-ua-mobile"]
-                        self.session.headers["Sec-Ch-Ua-Platform"] = self.fp["sec-ch-ua-platform"]
-                        self.session.headers["OAI-Device-Id"] = self.device_id
-                        self.session.headers["OAI-Session-Id"] = self.session_id
-                        self.session.headers["OAI-Language"] = "zh-CN"
-                        self.session.headers["OAI-Client-Version"] = self.client_version
-                        self.session.headers["OAI-Client-Build-Number"] = self.client_build_number
-                        self.session.headers["Authorization"] = f"Bearer {self.access_token}"
-                        response = self.session.get(
-                            self.base_url + "/",
-                            headers=self._bootstrap_headers(),
-                            timeout=(10, 25),
-                        )
-                        ensure_ok(response, "bootstrap")
-                except Exception:
-                    raise primary_error
-            else:
-                raise
+        finally:
+            if authorization:
+                self.session.headers["Authorization"] = authorization
+
+    def _bootstrap(self) -> None:
+        """Warm the home page through the account's current proxy binding."""
+        response = self._get_homepage()
+        if response.status_code == 403 and "enable javascript and cookies" in response.text.lower():
+            # Preserve the rejection and its stage without persisting an HTML
+            # challenge page or retrying it through a different account/exit.
+            raise UpstreamHTTPError("bootstrap", 403, "upstream_browser_verification_required")
+        ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"

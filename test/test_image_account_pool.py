@@ -24,6 +24,31 @@ NOW = 2_000_000_000.0
 
 
 class ImageAccountPoolPolicyTests(unittest.TestCase):
+    def test_light_probe_never_cancels_a_runtime_cooldown(self) -> None:
+        cooling = apply_image_outcome(
+            {"status": "正常", "quota": 5}, ImagePoolOutcome.RATE_LIMITED,
+            now_epoch=NOW, rate_limit_base_secs=600,
+        )
+        for success in (True, False):
+            with self.subTest(success=success):
+                updated = apply_probe_result(
+                    cooling, success=success, now_epoch=NOW + 10,
+                    duration_ms=50, error="HTTP 403" if not success else "",
+                )
+                self.assertEqual(updated["image_pool_state"], ImagePoolState.COOLDOWN)
+                self.assertEqual(updated["image_cooldown_until"], int(NOW + 600))
+                self.assertFalse(is_image_pool_schedulable(updated, now_epoch=NOW + 10))
+
+    def test_failed_light_probe_cannot_reenable_a_disabled_or_exhausted_account(self) -> None:
+        for status, state in [("禁用", ImagePoolState.DISABLED), ("限流", ImagePoolState.EXHAUSTED)]:
+            with self.subTest(state=state):
+                updated = apply_probe_result(
+                    {"status": status, "quota": 0, "image_pool_state": state},
+                    success=False, now_epoch=NOW, duration_ms=50, error="HTTP 403",
+                )
+                self.assertEqual(updated["image_pool_state"], state)
+                self.assertFalse(is_image_pool_schedulable(updated, now_epoch=NOW))
+
     def test_normalizes_legacy_accounts_without_breaking_status_compatibility(self) -> None:
         quarantined = normalize_image_pool_fields(
             {"status": "禁用", "token_status": "revoked", "quota": 0},

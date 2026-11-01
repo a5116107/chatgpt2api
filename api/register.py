@@ -50,18 +50,21 @@ def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/register")
-    async def get_register_config(authorization: str | None = Header(default=None)):
+    def get_register_config(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.get()}
 
     @router.post("/api/register")
-    async def update_register_config(body: RegisterConfigRequest, authorization: str | None = Header(default=None)):
+    def update_register_config(body: RegisterConfigRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         require_feature("register")
-        return {"register": register_service.update(body.model_dump(exclude_none=True))}
+        try:
+            return {"register": register_service.update(body.model_dump(exclude_none=True))}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/register/start")
-    async def start_register(body: RegisterStartRequest | None = None, authorization: str | None = Header(default=None)):
+    def start_register(body: RegisterStartRequest | None = None, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         require_feature("register")
         if body is None or not body.confirm:
@@ -69,29 +72,29 @@ def create_router() -> APIRouter:
         return {"register": register_service.start()}
 
     @router.post("/api/register/stop")
-    async def stop_register(authorization: str | None = Header(default=None)):
+    def stop_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.stop()}
 
     @router.post("/api/register/reset")
-    async def reset_register(authorization: str | None = Header(default=None)):
+    def reset_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset()}
 
     @router.post("/api/register/outlook-pool/reset")
-    async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
+    def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset_outlook_pool(body.scope or "all")}
 
     @router.get("/api/register/route-stats")
-    async def get_register_route_stats(authorization: str | None = Header(default=None)):
+    def get_register_route_stats(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"route_stats": register_service.route_stats()}
 
     
 
     @router.post("/api/register/route-stats/retire")
-    async def apply_register_route_retirement(body: RouteRetireApplyRequest | None = None, authorization: str | None = Header(default=None)):
+    def apply_register_route_retirement(body: RouteRetireApplyRequest | None = None, authorization: str | None = Header(default=None)):
         # PATCH_MARKER register_route_retire_apply_r31
         require_admin(authorization)
         payload = body or RouteRetireApplyRequest()
@@ -114,7 +117,8 @@ def create_router() -> APIRouter:
         async def stream():
             last = ""
             while True:
-                payload = json.dumps(register_service.get(), ensure_ascii=False)
+                snapshot = await asyncio.to_thread(register_service.get)
+                payload = json.dumps(snapshot, ensure_ascii=False)
                 if payload != last:
                     last = payload
                     yield f"data: {payload}\n\n"

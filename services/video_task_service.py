@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import base64
 import threading
 import time
 import uuid
@@ -18,20 +17,6 @@ from services.log_service import LOG_TYPE_CALL, log_service
 VIDEO_TASKS_FILE = DATA_DIR / "video_tasks.json"
 VIDEO_DIR = DATA_DIR / "videos"
 TERMINAL = {"success", "failed", "error", "cancelled"}
-LOCAL_SAMPLE_MP4_B64 = (
-    "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAGbW9vdgAAAGxtdmhkAAAAANrZ"
-    "8rfa2fK3AAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAA"
-    "AAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAnh0cmFrAAAAXHRr"
-    "aGQAAAAD2tnyt9rZ8rcAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA"
-    "AAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAQAAAAEAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAA"
-    "AQAAA+gAAAAAAAEAAAAAAAGdbWRpYQAAACBtZGhkAAAAANrZ8rfa2fK3AAAAGQAAABkAVcQA"
-    "AAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABQG1pbmYA"
-    "AAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAA"
-    "AQAAAPxzdGJsAAAAsHN0c2QAAAAAAAAAAQAAAKBhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAA"
-    "AAAAAAAAAAAAAAABAAEASAAAAEgAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-    "AAAAAAAAGP//AAAANmF2Y0MBAWQACv/hABlnZAAKreKQDwBE/LgIgAAADACAAAAMAUeJEVQ/"
-    "AQAGaO48gA=="
-)
 
 
 def _now() -> str:
@@ -51,7 +36,12 @@ def _task_key(owner_id: str, task_id: str) -> str:
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in task.items() if key not in {"owner_id", "key"}}
+    item = {key: value for key, value in task.items() if key not in {"owner_id", "key"}}
+    providers = {_clean(task.get("provider")).lower()}
+    providers.update(_clean(data.get("provider")).lower() for data in task.get("data") or [] if isinstance(data, dict))
+    if task.get("status") == "success" and providers & {"local", "mock"}:
+        item.update(source_status="success", status="failed", error_code="invalid_demo_media", error="历史任务返回的是本地演示媒体，未生成有效视频；原始记录保留供审计。")
+    return item
 
 
 def _sync_unified_task(task_id: str, *, status: str, owner_id: str = "", progress: object = None, error: object = "", duration_ms: int | None = None, **updates: Any) -> None:
@@ -71,17 +61,6 @@ def _sync_unified_task(task_id: str, *, status: str, owner_id: str = "", progres
         )
     except Exception:
         pass
-
-
-def _write_local_sample_video(task: dict[str, Any]) -> dict[str, Any]:
-    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    task_id = _clean(task.get("id"))
-    path = VIDEO_DIR / f"{task_id}.mp4"
-    if not path.exists():
-        path.write_bytes(base64.b64decode(LOCAL_SAMPLE_MP4_B64))
-    base_url = _clean(task.get("base_url")).rstrip("/")
-    url = f"{base_url}/v1/videos/{task_id}/content" if base_url else f"/v1/videos/{task_id}/content"
-    return {"data": [{"url": url, "mime_type": "video/mp4", "provider": "local", "bytes": path.stat().st_size}]}
 
 
 class VideoTaskService:
@@ -242,7 +221,7 @@ class VideoTaskService:
         if task_key:
             self._update_task(task_key, progress=f"{provider}:generating")
         if provider in {"local", "mock"}:
-            return provider, _write_local_sample_video(task)
+            raise RuntimeError("video backend not configured: local/mock is not a real video generation provider")
         if provider in {"openai_compatible", "openai", "sora_compatible"}:
             return provider, self._generate_openai_compatible(task, video_settings)
         return provider, None

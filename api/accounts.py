@@ -25,6 +25,7 @@ from api.support import (
 )
 from services import cpa_service, sub2api_service
 from services.account_service import account_service
+from services.account_health import AccountHealthService
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 
 
@@ -50,6 +51,10 @@ class AccountDeleteRequest(BaseModel):
 
 class AccountRefreshRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+
+
+class AccountHealthRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list, max_length=2000)
 
 
 class ImagePoolProbeRequest(BaseModel):
@@ -157,6 +162,28 @@ def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
 
 def create_router() -> APIRouter:
     router = APIRouter()
+    health_service = AccountHealthService(account_service)
+
+    @router.post("/api/accounts/health-check")
+    async def check_account_health(body: AccountHealthRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return health_service.start(_unique_tokens(body.access_tokens))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/accounts/health-check/current")
+    async def current_account_health(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"job": health_service.current()}
+
+    @router.get("/api/accounts/health-check/{progress_id}")
+    async def account_health_progress(progress_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = health_service.progress(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "检测记录已过期，请刷新账号列表"})
+        return progress
 
     @router.get("/api/auth/users")
     async def list_user_keys(authorization: str | None = Header(default=None)):

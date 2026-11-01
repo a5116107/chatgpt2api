@@ -4,7 +4,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.support import require_admin
-from services.risk_control_service import risk_control_service
+from services.risk_control_service import MAX_PROXY_BATCH_SIZE, MAX_PROXY_IMPORT_CHARS, risk_control_service
 
 
 class RiskEventRequest(BaseModel):
@@ -44,7 +44,8 @@ class ProxyUpsertRequest(BaseModel):
 
 
 class ProxyEventRequest(BaseModel):
-    proxy: str = Field(..., min_length=1)
+    proxy: str = ""
+    proxy_id: str = ""
     code: str = "success"
     status_code: int | None = None
 
@@ -61,8 +62,19 @@ class ProxyPruneRequest(BaseModel):
 
 
 class ProxyPoolTestRequest(BaseModel):
-    limit: int = 50
+    limit: int = Field(default=50, ge=1, le=200)
     include_dead: bool = False
+    ids: list[str] | None = Field(default=None, max_length=200)
+
+
+class ProxyImportRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_PROXY_IMPORT_CHARS)
+    provider: str = Field(default="imported", max_length=80)
+
+
+class ProxyActivateRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=MAX_PROXY_BATCH_SIZE)
+    enabled: bool = True
 
 
 class TaskDeleteRequest(BaseModel):
@@ -119,15 +131,55 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"items": risk_control_service.list_proxies()}
 
+    @router.get("/api/proxies/platform")
+    def proxy_platform_status(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        from services.proxy_platform import proxy_platform
+        from services.runtime_profile_service import runtime_profile_service
+        from datetime import datetime, timedelta, timezone
+        direct = [item for item in risk_control_service.list_proxies() if not item.get("protected")]
+        usable = [item for item in direct if item.get("assignment_enabled") and item.get("assignment_ready")]
+        return {**proxy_platform.status(), "bindings": runtime_profile_service.binding_capacity_status(),
+                "direct_pool": {"total": len(direct), "ready": sum(bool(item.get("assignment_ready")) for item in direct),
+                                "enabled": sum(bool(item.get("assignment_enabled")) for item in direct), "assignable": len(usable),
+                                "countries": sorted({str((item.get("probe") or {}).get("country")) for item in usable if (item.get("probe") or {}).get("country")}),
+                                "valid_until": (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()}}
+
     @router.post("/api/proxies")
     async def upsert_proxy(body: ProxyUpsertRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"item": risk_control_service.upsert_proxy(body.proxy, country=body.country or "", provider=body.provider or "manual", asn=body.asn or "")}
+        try:
+            return {"item": risk_control_service.upsert_proxy(body.proxy, country=body.country or "", provider=body.provider or "manual", asn=body.asn or "")}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/proxies/events")
     async def proxy_event(body: ProxyEventRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"item": risk_control_service.report_proxy_event(body.proxy, body.code, body.status_code)}
+        if not body.proxy and not body.proxy_id:
+            raise HTTPException(status_code=400, detail="proxy_id is required")
+        try:
+            return {"item": risk_control_service.report_proxy_event(body.proxy, body.code, body.status_code, proxy_id=body.proxy_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="proxy not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/proxies/import")
+    def import_proxies(body: ProxyImportRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return risk_control_service.import_proxies(body.text, provider=body.provider)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/proxies/activate")
+    def activate_proxies(body: ProxyActivateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return risk_control_service.activate_proxies(body.ids, enabled=body.enabled)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/proxies/rebuild")
     async def rebuild_proxies(authorization: str | None = Header(default=None)):
@@ -145,9 +197,12 @@ def create_router() -> APIRouter:
         return risk_control_service.prune_proxies(min_score=body.min_score, min_failures=body.min_failures, include_cooldown=body.include_cooldown)
 
     @router.post("/api/proxies/test-pool")
-    async def test_proxy_pool(body: ProxyPoolTestRequest, authorization: str | None = Header(default=None)):
+    def test_proxy_pool(body: ProxyPoolTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return risk_control_service.test_proxy_pool(limit=body.limit, include_dead=body.include_dead)
+        try:
+            return risk_control_service.test_proxy_pool(limit=body.limit, include_dead=body.include_dead, ids=body.ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/api/tasks")
     async def list_tasks(limit: int = Query(default=200, ge=1, le=1000), type: str = "", status: str = "", authorization: str | None = Header(default=None)):

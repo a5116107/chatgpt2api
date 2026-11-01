@@ -14,6 +14,7 @@ from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
 from services.account_service import account_service
+from services.risk_control_service import risk_control_service
 
 
 def create_app() -> FastAPI:
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
         thread = start_limited_account_watcher(stop_event)
         image_probe_thread = start_image_account_probe(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
+        proxy_monitor = risk_control_service.start_proxy_monitor(stop_event)
         backup_service.start()
         config.cleanup_old_images()
         account_service.cleanup_orphan_runtime_profiles()
@@ -42,6 +44,7 @@ def create_app() -> FastAPI:
             thread.join(timeout=1)
             image_probe_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            proxy_monitor.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)

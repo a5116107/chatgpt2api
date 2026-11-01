@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import urllib.request
 from pathlib import Path
 from threading import Event, Thread
 
@@ -98,33 +96,25 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 
 def _account_watcher_proxy_status(watcher: dict) -> dict | None:
-    url = str(watcher.get("proxy_status_url") or "").strip()
-    if not url:
+    from services.proxy_platform import proxy_platform
+    from services.runtime_profile_service import runtime_profile_service
+
+    remote = proxy_platform.status()
+    if remote.get("status") != "ready":
         return None
-    timeout = max(1, int(watcher.get("proxy_ready_timeout_secs") or 8))
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        pool = payload.get("pool") if isinstance(payload, dict) else None
-        if not isinstance(pool, dict):
-            return None
-        return {
-            "available": int(pool.get("available") or 0),
-            "total": int(pool.get("total") or 0),
-            "banned": int(pool.get("banned") or 0),
-            "below_score": int(pool.get("below_score") or 0),
-        }
-    except Exception as exc:
-        print(f"[account-watcher] proxy status unavailable; skip this round error={exc}")
-        return {"available": 0, "total": 0, "banned": 0, "below_score": 0}
+    # A remote connection is not an account/profile binding. Never use remote
+    # connection limits as an automatic registration batch or expansion target.
+    binding = runtime_profile_service.binding_capacity_status()
+    batch = max(1, int(watcher.get("max_batch") or 1))
+    available = min(batch, int(binding["remaining"])) if binding.get("enabled") else batch
+    if available <= 0:
+        return None
+    return {"available": available, "total": int(binding.get("limit") or available),
+            "unit": "profile_binding", "mode": "shared_platform", "remote_status": remote["status"]}
+
 
 def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
-    """Proxy readiness for account-watcher.
-
-    Compatible with:
-    1) dynamic-proxy pool: use status URL available for batch sizing
-    2) single-proxy/glider: if status URL is unavailable, continue when test_proxy is ok
-    """
+    """Require actual target readiness; shared status never invents capacity."""
     if not watcher.get("require_proxy_ready"):
         return {"available": max(1, int(watcher.get("max_batch") or 1))}
     timeout = max(1, int(watcher.get("proxy_ready_timeout_secs") or 8))
@@ -136,38 +126,10 @@ def _account_watcher_proxy_ready(watcher: dict) -> dict | None:
             f"latency_ms={result.get('latency_ms')}"
         )
         return None
-    if not str(watcher.get("proxy_status_url") or "").strip():
-        available = max(1, int(watcher.get("max_batch") or 1))
-        return {
-            "available": available,
-            "total": available,
-            "banned": 0,
-            "below_score": 0,
-            "mode": "single_proxy",
-        }
-    pool_status = _account_watcher_proxy_status(watcher)
-    min_available = max(1, int(watcher.get("min_proxy_available") or 1))
-    available = int((pool_status or {}).get("available") or 0)
-    # When dynamic-proxy is down/unavailable, keep single-proxy path alive.
-    if available <= 0:
-        fallback = max(1, int(watcher.get("max_batch") or 1))
-        print(
-            "[account-watcher] proxy pool status unavailable; continue with single-proxy batch "
-            f"fallback_available={fallback} status={pool_status}"
-        )
-        return {
-            "available": fallback,
-            "total": fallback,
-            "banned": 0,
-            "below_score": 0,
-            "mode": "single_proxy",
-        }
-    if available < min_available:
-        print(
-            "[account-watcher] proxy pool below threshold; continuing with limited batch "
-            f"available={available} min={min_available} status={pool_status}"
-        )
-    return pool_status or {"available": available}
+    if str(config.get_proxy_runtime_settings().get("platform_url") or "").strip():
+        return _account_watcher_proxy_status(watcher)
+    return {"available": max(1, int(watcher.get("max_batch") or 1)), "mode": "single_proxy", "unit": "configured_batch"}
+
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60

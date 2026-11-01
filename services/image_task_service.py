@@ -452,6 +452,8 @@ class ImageTaskService:
             "_request_started_monotonic": started_monotonic,
             "_request_deadline_monotonic": deadline_monotonic,
         }
+        account_hash = ""
+        account_email = ""
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -500,10 +502,13 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                account_hash=account_hash,
+                request_id=task_id,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
-            account_email = _clean(getattr(exc, "account_email", ""))
+            account_email = _clean(getattr(exc, "account_email", "")) or account_email
+            account_hash = _clean(getattr(exc, "account_hash", "")) or account_hash
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
             if not self._transition_task(
@@ -515,6 +520,7 @@ class ImageTaskService:
                 data=[],
                 duration_ms=duration_ms,
                 stage_metrics=dict(stage_metrics),
+                account_hash=account_hash,
                 **({"conversation_id": conversation_id} if conversation_id else {}),
             ):
                 return
@@ -529,6 +535,8 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                account_hash=account_hash,
+                request_id=task_id,
             )
         finally:
             stop_heartbeat.set()
@@ -549,6 +557,8 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        account_hash: str = "",
+        request_id: str = "",
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -562,6 +572,8 @@ class ImageTaskService:
             "ended_at": _now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "status": status,
+            "request_id": request_id,
+            "account_hash": account_hash,
         }
         if request_preview:
             detail["request_text"] = request_preview
